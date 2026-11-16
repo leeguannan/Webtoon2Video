@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "webtoon2video"
+version = "0.1.0"
+description = "WEBTOON 漫画解说视频全链路自动化后端（Phase 1 骨架）"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.2",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "opencv-python-headless>=4.10",
+    "numpy>=1.26",
+    "pillow>=10.3",
+    "openai>=1.40",
+    "fastapi>=0.111",
+    "uvicorn>=0.30",
+    "sse-starlette>=2.1",
+]
+
+[project.scripts]
+w2v = "cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "respx>=0.21",
+]
+
+# src-layout：backend/src 为导入根，运行时以 `from core.schemas import ...` 形式引用。
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = ["cli"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"

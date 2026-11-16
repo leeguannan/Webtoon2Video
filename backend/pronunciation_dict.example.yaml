@@ -1,0 +1,11 @@
+# 多音字 / 同音字纠偏词典模板
+# 使用方式：cp pronunciation_dict.example.yaml pronunciation_dict.yaml 后按需修改。
+#
+# 铁律：替换只能进入 tts_text / spoken_text（送 TTS 的文本），
+#       严禁改写用于屏幕 ASS 字幕的 narration_text，否则字幕会出现读音标注。
+
+overrides:
+  # 例：同音字歧义 → 指定读音
+  "银行": "yín háng"
+  # 例：多音字固定读音
+  "重霄": "chóng xiāo"
