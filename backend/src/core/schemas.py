@@ -118,6 +118,9 @@ class CharacterProfile(BaseModel):
     current_status: str
     first_seen_ep: int
     last_seen_ep: int
+    #: Patch v3.2 Patch 12：角色性别。未登记时为 ``"unknown"``，
+    #: 下游据此给「未单独配置音色的角色」路由通用男声 / 通用女声。
+    gender: Literal["male", "female", "unknown"] = "unknown"
 
 
 class PlotThread(BaseModel):
@@ -163,7 +166,8 @@ class ScriptBeat(BaseModel):
     speaker_role: str = "narrator"
     target_panel_ids: list[str] = Field(..., min_length=1)
     motion: CameraMotion = CameraMotion.ZOOM_IN
-    pause_after_ms: int = Field(default=250, ge=0, le=2000)
+    #: Patch v3.2 Patch 12：默认停顿从 250ms 收紧到 150ms（提振整片节奏）。
+    pause_after_ms: int = Field(default=150, ge=0, le=2000)
     #: Patch v2.6-5：镜头焦点提示。一格多句时，第 1 句讲黑框内心独白用
     #: ``top``，第 2 句讲人物口头台词用 ``bottom``；``full`` 表示整格取景
     #: （默认值，向后兼容旧剧本）。
@@ -173,6 +177,9 @@ class ScriptBeat(BaseModel):
     #: ``phone_msg`` / ``footstep`` / ``crash``）；普通对话与叙述留空。
     #: Stage 6 会据此生成 :class:`SfxEvent`（全话最多 8 个、间隔 >= 6000ms）。
     sfx_cue: str | None = None
+    #: Patch v3.2 Patch 12：说话人性别。与 ``speaker_role`` 配套，
+    #: 用于把「未在作品词典里单独指定音色的角色」路由到通用男声 / 通用女声。
+    speaker_gender: Literal["male", "female", "unknown"] = "unknown"
 
 
 class NarrationScript(BaseModel):

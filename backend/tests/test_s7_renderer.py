@@ -372,16 +372,20 @@ def test_path_helpers(tmp_path: Path) -> None:
     assert out_dir_for(tmp_path, 7) == tmp_path / "episodes" / "ep_007" / "07_out"
 
 
-def test_sidechain_threshold_stays_below_speech_rms(monkeypatch, tmp_path: Path) -> None:
-    """闪避阈值必须低于人声 RMS。
+def test_sidechain_uses_gentle_v32_ducking(monkeypatch, tmp_path: Path) -> None:
+    """Patch v3.2 Patch 14：柔和漫评闪避参数被钉死。
 
-    百炼 TTS 的人声 RMS 实测约 -29.5 dBFS（≈0.033）。阈值一旦高过这个值，
-    就只有人声峰值才触发压缩，整段闪避几乎听不出来——这是典型的静默失效，
-    所以用一条断言把它钉住。
+    BGM 先经 ``loudnorm`` 统一到 -16 LUFS 再降 -11.5dB，基线已规范化，
+    侧链压缩改为 threshold=0.05 / ratio=2.8 / attack=25ms / release=320ms，
+    说话时温和退让 4~6dB、停顿时自然托底；旧的深压参数（0.01 / ratio=8）
+    会让配乐忽大忽小，不得回退。
     """
     from stages import s7_renderer
 
-    assert s7_renderer._SIDECHAIN_THRESHOLD < 0.033
+    assert s7_renderer._SIDECHAIN_THRESHOLD == 0.05
+    assert s7_renderer._SIDECHAIN_RATIO == 2.8
+    assert s7_renderer._SIDECHAIN_ATTACK_MS == 25
+    assert s7_renderer._SIDECHAIN_RELEASE_MS == 320
 
     captured: dict[str, list[str]] = {}
 
@@ -409,8 +413,10 @@ def test_sidechain_threshold_stays_below_speech_rms(monkeypatch, tmp_path: Path)
 
     joined = " ".join(captured["args"])
     assert "sidechaincompress=" in joined
-    assert f"threshold={s7_renderer._SIDECHAIN_THRESHOLD}" in joined
-    assert f"release={s7_renderer._SIDECHAIN_RELEASE_MS}" in joined
+    assert (
+        f"threshold={s7_renderer._SIDECHAIN_THRESHOLD}:ratio={s7_renderer._SIDECHAIN_RATIO}:"
+        f"attack={s7_renderer._SIDECHAIN_ATTACK_MS}:release={s7_renderer._SIDECHAIN_RELEASE_MS}"
+    ) in joined
     assert exports_dir_for(tmp_path) == tmp_path / "exports"
 
 

@@ -16,17 +16,20 @@ import re
 import sys
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from pathlib import Path
+from typing import Any
 
 from core.normalize import (
     MIN_NARRATION_CHARS,
     coerce_str,
     coerce_str_list,
+    normalize_dialogue_quotes,
     normalize_script_payload,
 )
 from core.memory import Stage4Context, StoryBibleManager
 from core.panel_ids import PanelIdResolver, panel_sort_key
 from core.schemas import (
     ArcSummary,
+    CharacterProfile,
     EpisodeStoryDraft,
     NarrationScript,
     PanelVisionInfo,
@@ -602,13 +605,309 @@ def _format_panel_ids(
 
     Patch v3.1 Patch 10：过渡空页 / 窄条（``is_transition_blank=True``）在这里
     再过滤一次，保证送给 4B 的候选清单里绝不出现「纯黑过渡页」这种废帧。
+
+    Patch v3.2 Patch 12：**纯字卡**（``is_pure_text_card=True``）在这里被硬剔除，
+    从源头杜绝「白底黑字 PPT 朗读」；整章只剩纯字卡时才兜底保留。
     """
     panels = [
         panel_map[panel_id]
         for panel_id in panel_ids
         if panel_id in panel_map and not panel_map[panel_id].is_transition_blank
     ]
-    return format_panel_list(panels)
+    return format_panel_list(exclude_pure_text_cards(panels))
+
+
+#: Patch v3.2 Patch 12：中文双引号对白（含引号内文本）。
+_QUOTED_SPEECH_RE = re.compile(r"“([^”]+)”")
+
+#: 角色槽位 → 性别（``speaker_role`` 填的是槽位名而不是人名时用）。
+_GENDER_BY_ROLE_SLOT: dict[str, str] = {
+    "male_lead": "male",
+    "male_antagonist": "male",
+    "male": "male",
+    "female_lead": "female",
+    "female_mature": "female",
+    "female": "female",
+}
+
+#: 说话引导动词（用于从引号外文本推断说话人）。
+_SPEECH_VERBS: tuple[str, ...] = (
+    "说",
+    "道",
+    "开口",
+    "低声",
+    "轻声",
+    "冷声",
+    "沉声",
+    "怒声",
+    "大喊",
+    "喊",
+    "问",
+    "答",
+    "念",
+    "哼",
+    "笑",
+    "叹",
+    "呼",
+    "嘀咕",
+    "嘟囔",
+    "呢喃",
+    "声音",
+    "嗓子",
+    "嗓音",
+    "骂",
+    "吼",
+    "吼叫",
+    "喊叫",
+    "嚷",
+    "斥",
+    "怒斥",
+    "反问",
+    "请求",
+    "惊呼",
+    "答应",
+    "呛",
+    "嘶",
+)
+
+#: 不能当人名的开头（避免把「她轻声说」里的「她轻」当成角色名）。
+_NON_NAME_PREFIXES: frozenset[str] = frozenset(
+    {"他", "她", "它", "我", "你", "咱", "众", "有人", "两人", "三人"}
+)
+
+#: 代词/泛指首字：以这些字开头的引导句说的是「某个人」，不是角色名
+#: （「他只留下一句冰冷判决：」里没有名字，不能硬猜）。
+_PRONOUN_LEADING_CHARS: frozenset[str] = frozenset("他她它我你咱众人")
+
+#: 视为「旁白」的 ``speaker_role`` 取值。
+_NARRATOR_ROLES: frozenset[str] = frozenset({"narrator", "旁白", "解说"})
+
+
+def exclude_pure_text_cards(
+    panels: Sequence[PanelVisionInfo],
+) -> list[PanelVisionInfo]:
+    """剔除纯字卡（``is_pure_text_card=True``）；整批都是纯字卡时兜底保留。
+
+    Patch v3.2 Patch 12：纯字卡是「白底黑字 PPT」，一旦被选进候选池就会被
+    念成 PPT 朗读。整批都是纯字卡时保留原样（否则这一章无处可挑）。
+    """
+    kept = [
+        panel for panel in panels if not getattr(panel, "is_pure_text_card", False)
+    ]
+    return kept or list(panels)
+
+
+def _character_gender_index(
+    characters: Sequence[CharacterProfile] | None,
+) -> dict[str, str]:
+    """角色姓名 / 别名 → 性别。"""
+    index: dict[str, str] = {}
+    for character in characters or ():
+        name = coerce_str(getattr(character, "name", ""))
+        gender = coerce_str(getattr(character, "gender", "unknown")) or "unknown"
+        if name:
+            index.setdefault(name, gender)
+        for alias in getattr(character, "aliases", None) or ():
+            alias_text = coerce_str(alias)
+            if alias_text:
+                index.setdefault(alias_text, gender)
+    return index
+
+
+def _infer_speaker(
+    lead_in: str, gender_index: dict[str, str]
+) -> tuple[str, str]:
+    """从引号外引导词推断说话人姓名与性别。
+
+    1) 已登记角色优先（``StoryBibleV2.characters`` 里的姓名 / 别名）；
+    2) 兜底启发式：引号外文本开头的 2 字 + 其后出现说话动词
+       （"道振平静说道：" → "道振"）。
+    """
+    if not lead_in:
+        return "", "unknown"
+    hits = [
+        (lead_in.find(name), name, gender)
+        for name, gender in gender_index.items()
+        if name and name in lead_in
+    ]
+    if hits:
+        hits.sort(key=lambda item: (item[0], -len(item[1])))
+        _, name, gender = hits[0]
+        return name, gender
+    head = lead_in.strip()
+    for size in (2, 3):
+        if len(head) <= size:
+            break
+        candidate = head[:size]
+        if candidate in _NON_NAME_PREFIXES:
+            continue
+        if candidate[0] in _PRONOUN_LEADING_CHARS:
+            # 「他只留下一句冰冷判决：」「她顺从地转身离开：」——引号外只是代词
+            # 引导，硬猜人名会造出「他只」「她顺」这种假角色。
+            continue
+        if not re.fullmatch(r"[\u4e00-\u9fff]+", candidate):
+            continue
+        if any(verb in head[size:] for verb in _SPEECH_VERBS):
+            return candidate, "unknown"
+    return "", "unknown"
+
+
+def _resolve_speaker_gender(
+    speaker_role: str,
+    gender_index: dict[str, str],
+    fallback: str = "unknown",
+) -> str:
+    """按姓名 → 角色槽位 → 兜底的顺序解析说话人性别。"""
+    if speaker_role:
+        gender = gender_index.get(speaker_role)
+        if gender:
+            return gender
+        slot = _GENDER_BY_ROLE_SLOT.get(speaker_role.strip().lower())
+        if slot:
+            return slot
+    return fallback if fallback in ("male", "female", "unknown") else "unknown"
+
+
+def _derive_tts_text(inner: str, original_tts: str | None) -> str:
+    """对白子 Beat 的送音文本：去掉外层双引号，保留句末语气标点。
+
+    送进 TTS 的文本若还带着 ``“…”``，合成会出现怪异停顿，所以这里剥掉。
+    """
+    if original_tts:
+        stripped = original_tts.strip().strip("“”")
+        if inner and inner in stripped:
+            start = stripped.index(inner)
+            return stripped[start : start + len(inner)]
+    return inner
+
+
+def _pick_speaker_role(
+    beat: dict[str, Any], lead_in: str, gender_index: dict[str, str]
+) -> str:
+    """确定对白子 Beat 的说话人：原 beat 的说话人优先，其次从引导词推断。"""
+    role = coerce_str(beat.get("speaker_role"))
+    if role and role.strip().lower() not in _NARRATOR_ROLES:
+        return role
+    name, _gender = _infer_speaker(lead_in, gender_index)
+    return name or role or "narrator"
+
+
+def split_mixed_quote_beats(
+    beats: Sequence[dict[str, Any]],
+    *,
+    characters: Sequence[CharacterProfile] | None = None,
+    default_pause_after_ms: int = 160,
+) -> list[dict[str, Any]]:
+    """确定性拆分「引号外旁白 + 引号内对白」混写的 Beat。
+
+    Patch v3.2 Patch 12：模型经常把 ``道振说：“……”`` 写成同一条 Beat，
+    结果要么「角色自己念引导词」，要么「旁白把台词念完」。这里在落盘前
+    100% 拆成两条连续 Beat：
+
+    * 引号外旁白 → ``speaker_role="narrator"``、``pause_after_ms=60``
+      （念完引导词立刻接角色声音）；
+    * 引号内对白 → 字幕保留 ``“…”``、送音文本剥掉外层引号，
+      ``speaker_role`` 填说话人姓名、``speaker_gender`` 自动补全。
+
+    整条本来就是纯引号对白时不做拆分，只归属角色并剥掉引号。
+    所有子 Beat 共享同一组 ``target_panel_ids``（画面稳住不跳），
+    并按新顺序重新编号 ``b1, b2, …``。
+    """
+    gender_index = _character_gender_index(characters)
+    result: list[dict[str, Any]] = []
+    for raw in beats:
+        if not isinstance(raw, dict):
+            continue
+        beat = dict(raw)
+        narration = normalize_dialogue_quotes(coerce_str(beat.get("narration_text")))
+        beat["narration_text"] = narration
+        matches = list(_QUOTED_SPEECH_RE.finditer(narration))
+        if not matches:
+            # 没有引号的普通 Beat：只补齐说话人性别（角色表里有名字就按表补）。
+            beat["speaker_gender"] = _resolve_speaker_gender(
+                coerce_str(beat.get("speaker_role")),
+                gender_index,
+                coerce_str(beat.get("speaker_gender")),
+            )
+            result.append(beat)
+            continue
+
+        # 按引号边界切段：(kind, text, lead_before)
+        # lead_before = 该引号段之前紧邻的引号外文本（没有则为 ""），
+        # 用来判断这段台词是不是有独立的引导词（「继母指着…骂：」）。
+        segments: list[tuple[str, str, str]] = []
+        cursor = 0
+        pending_lead = ""
+        for match in matches:
+            if match.start() > cursor:
+                text = narration[cursor : match.start()]
+                segments.append(("lead", text, ""))
+                pending_lead += text
+            segments.append(("quote", match.group(1), pending_lead))
+            pending_lead = ""
+            cursor = match.end()
+        if cursor < len(narration):
+            segments.append(("lead", narration[cursor:], ""))
+
+        lead_in = "".join(text for kind, text, _ in segments if kind == "lead")
+        original_tts = beat.get("tts_text")
+        original_tts_text = coerce_str(original_tts)
+        try:
+            pause = int(beat.get("pause_after_ms"))
+        except (TypeError, ValueError):
+            pause = default_pause_after_ms
+
+        if len(lead_in.strip()) < 2:
+            # 纯引号对白：整体归属对应角色，只剥外层引号 + 补角色信息。
+            inner = "".join(text for kind, text, _ in segments if kind == "quote").strip()
+            speaker_role = _pick_speaker_role(beat, lead_in, gender_index)
+            beat["speaker_role"] = speaker_role
+            beat["speaker_gender"] = _resolve_speaker_gender(
+                speaker_role, gender_index, coerce_str(beat.get("speaker_gender"))
+            )
+            if inner:
+                beat["tts_text"] = _derive_tts_text(inner, original_tts_text)
+            result.append(beat)
+            continue
+
+        speaker_role = _pick_speaker_role(beat, lead_in, gender_index)
+        prev_quote_role = ""
+        for kind, text, lead_before in segments:
+            if kind == "lead":
+                lead_text = text.strip()
+                if not lead_text:
+                    continue
+                child = dict(beat)
+                child["narration_text"] = lead_text
+                child["tts_text"] = lead_text
+                child["speaker_role"] = "narrator"
+                child["speaker_gender"] = "unknown"
+                child["pause_after_ms"] = 60
+                result.append(child)
+                continue
+            inner = text.strip()
+            if not inner:
+                continue
+            if lead_before.strip():
+                # 这段台词有独立引导词（「继母指着…骂：」）→ 按引导词认人。
+                role = _pick_speaker_role(beat, lead_before, gender_index)
+            else:
+                # 紧跟在另一段引号后面（「…！”“立刻带着…！”」）→ 同一人接着说。
+                role = prev_quote_role or speaker_role
+            prev_quote_role = role
+            child = dict(beat)
+            child["narration_text"] = f"“{inner}”"
+            child["tts_text"] = _derive_tts_text(inner, original_tts_text)
+            child["speaker_role"] = role
+            child["speaker_gender"] = _resolve_speaker_gender(
+                role, gender_index, coerce_str(beat.get("speaker_gender"))
+            )
+            child["pause_after_ms"] = pause
+            result.append(child)
+
+    for index, beat in enumerate(result, start=1):
+        beat["beat_id"] = f"b{index}"
+    return result
 
 
 def _format_character(character: object) -> str:
@@ -1220,11 +1519,15 @@ async def write_episode_script(
             file=sys.stderr,
         )
 
+    # Patch v3.2 Patch 12：纯字卡（白底黑字 PPT）从撰稿上下文里硬剔除，
+    # overview / 4A 故事反写 / 4B 候选池都看不到它，避免被念成 PPT 朗读。
+    story_panels = exclude_pure_text_cards(panels)
+
     overview = await _write_overview(
         client,
         model=model,
         context=context,
-        panels=panels,
+        panels=story_panels,
         episode_id=episode_id,
         series_title=series_title,
         template=overview_template,
@@ -1275,7 +1578,7 @@ async def write_episode_script(
                 client,
                 model=story_model or model,
                 context=context,
-                panels=panels,
+                panels=story_panels,
                 episode_id=episode_id,
                 series_title=series_title,
                 template=story_draft_template,
@@ -1375,6 +1678,12 @@ async def write_episode_script(
         # 模型/历史产物可能引用 panel_001 这类旧写法，先归一化成本话的规范 ID，
         # 顺位校验与后续 normalize_script_payload 才能认得它们。
         _canonicalize_beat_panel_ids(merged_beats, valid_panel_ids)
+
+        # Patch v3.2 Patch 12：确定性拆分「旁白 + 引号对白」混写的 Beat，
+        # 让角色原话由角色声线念出（拆分后会重新编号 b1, b2, …）。
+        merged_beats = split_mixed_quote_beats(
+            merged_beats, characters=context.characters
+        )
 
         errors = chapter_errors
         errors += validate_beat_alignment(

@@ -24,6 +24,7 @@ from core.config import (
     AppConfig,
     load_series_config,
     merge_pronunciation_overrides,
+    merge_series_tts,
     merge_voice_cast,
 )
 from core.manifest import STAGE_DIR_NAMES, ManifestManager
@@ -600,6 +601,10 @@ class JobRunner:
         voice_cast = merge_voice_cast(
             self.config.tts.voice_cast, series_config.voice_cast
         )
+        # Patch v3.2 Patch 13 B1/B2：作品级配音模板（讲解者 / 通用男女声 / 角色专属）
+        # + 角色性别表（未指定角色时按性别兜底）。
+        series_tts = merge_series_tts(self.config.tts, series_config.tts)
+        characters = s5_tts.load_bible_characters(series_dir)
         script_path = (
             series_dir
             / "episodes"
@@ -616,6 +621,8 @@ class JobRunner:
             overrides=overrides,
             default_voice=self.config.tts.default_voice,
             voice_cast=voice_cast,
+            series_tts=series_tts,
+            characters=characters,
             concurrency=self.config.concurrency.stage,
             ffmpeg_bin=self.config.render.ffmpeg_bin,
         )

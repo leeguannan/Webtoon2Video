@@ -215,6 +215,36 @@ def test_build_spoken_text_prefers_tts_text_then_falls_back() -> None:
     assert s5_tts.build_spoken_text(without_tts, {"银行": "yín háng"}) == "yín háng行长"
 
 
+def test_build_spoken_text_ignores_fragment_tts_text() -> None:
+    """``tts_text`` 只写了被替换的那个词时，必须回退字幕原句。
+
+    回归：wt_5081 ep_001 的 b33 —— 字幕 35 字、``tts_text`` 只有「混蛋」两个字，
+    合成后整条解说只剩 0.35s，时间轴塌缩成 0.96s，画面与字幕一闪而过。
+    """
+    narration = "他歇斯底里地喊出真相：“人都是金仁哲杀的！我知道是谁指使那个混蛋的！”"
+    fragment = _beat("b33", narration, tts_text="混蛋")
+    assert s5_tts.build_spoken_text(fragment, {}) == narration
+
+    # 脱敏字版本：``tts_text`` 只是片段、又不是字幕原句的子串，也不得独占整句
+    masked = _beat("b34", "他指使那个混X的！", tts_text="混蛋")
+    assert s5_tts.build_spoken_text(masked, {}) == "他指使那个混X的！"
+
+    # 回退后发音词典照旧只作用在送音文本上
+    assert s5_tts.build_spoken_text(fragment, {"混蛋": "hún dàn"}) == narration.replace(
+        "混蛋", "hún dàn"
+    )
+
+
+def test_build_spoken_text_uses_whole_sentence_tts_text() -> None:
+    """``tts_text`` 是整句送音文本（含替换后的标准汉字）时照常采用。"""
+    beat = _beat("b35", "他指使那个混X的！", tts_text="他指使那个混蛋的！")
+    assert s5_tts.build_spoken_text(beat, {}) == "他指使那个混蛋的！"
+
+    # 整句比字幕短一点点也仍然是整句（只替换了脱敏字）
+    beat2 = _beat("b36", "他指使那个混X的！", tts_text="他指使那个混蛋的")
+    assert s5_tts.build_spoken_text(beat2, {}) == "他指使那个混蛋的"
+
+
 @pytest.mark.anyio
 async def test_emotion_instruction_passed_verbatim(tmp_path) -> None:
     """``emotion_instruction`` 原样透传给合成器，不改写、不加情绪词。"""
@@ -337,7 +367,8 @@ async def test_audio_manifest_written_and_loaded_back(tmp_path) -> None:
         "word_timestamps",
     }
     assert payload[0]["pause_after_ms"] == 320
-    assert payload[1]["pause_after_ms"] == 250
+    # Patch v3.2 Patch 12：默认停顿由 250ms 收紧到 150ms。
+    assert payload[1]["pause_after_ms"] == 150
     assert payload[0]["word_timestamps"] == []
 
     metas = s5_tts.load_audio_manifest(manifest_path.parent)

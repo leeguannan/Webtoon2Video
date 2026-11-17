@@ -1568,12 +1568,12 @@ def _write_vision_with_pure_text_card(series_dir: Path, episode_no: int = 2) -> 
 
 @pytest.mark.anyio
 @respx.mock
-async def test_pure_text_card_is_marked_and_transition_blank_filtered(tmp_path) -> None:
-    """Patch v3.1 Patch 10 验收一。
+async def test_pure_text_card_never_enters_candidate_pool(tmp_path) -> None:
+    """Patch v3.2 Patch 12：纯字卡硬过滤 + 窄条过滤。
 
-    给 4B 的候选面板摘要必须给 ``is_pure_text_card=True`` 的分镜标上
-    ``[纯字卡]``（提示模型跳过这类白底黑字 PPT 格），同时
-    ``is_transition_blank=True`` 的窄条不得出现在任何一段请求里。
+    ``is_pure_text_card=True`` 的白底黑字 PPT 格不再进入任何一段请求体的
+    候选面板池（v3.1 Patch 10 时只是打 ``[纯字卡]`` 标签让模型自己跳过，
+    v3.2 起改为下游硬过滤）；``is_transition_blank=True`` 的窄条同样不得出现。
     """
     series_dir = _make_series(tmp_path)
     _write_vision_with_pure_text_card(series_dir)
@@ -1584,13 +1584,13 @@ async def test_pure_text_card_is_marked_and_transition_blank_filtered(tmp_path) 
             ],
             story=[
                 _script_response(
-                    json.dumps(_story_payload(["panel_001", "panel_002"]), ensure_ascii=False)
+                    json.dumps(_story_payload(["panel_001"]), ensure_ascii=False)
                 )
             ],
             beats=[
                 _script_response(
                     json.dumps(
-                        _beats_payload(["panel_001", "panel_002"]), ensure_ascii=False
+                        _beats_payload(["panel_001"]), ensure_ascii=False
                     )
                 )
             ],
@@ -1601,16 +1601,14 @@ async def test_pure_text_card_is_marked_and_transition_blank_filtered(tmp_path) 
             series_dir, 2, client, model="qwen-plus", episode_id="wt_test_ep_002"
         )
     assert route.call_count == 3
-    # 过渡窄条三段都看不到（write_episode_script 的硬过滤 + _format_panel_ids 兜底）。
+    # 过渡窄条与纯字卡三段都看不到（write_episode_script 的硬过滤 +
+    # _format_panel_ids 兜底）。
     prompts = [_prompt_of(call) for call in route.calls]
     for prompt in prompts:
         assert "panel_003" not in prompt
-    # 4B 的候选清单里，纯字卡分镜带 [纯字卡] 标记，普通格不带。
+        assert "panel_002" not in prompt
+    # 4B 的候选清单里只剩普通格。
     narrate_prompt = prompts[2]
-    card_line = next(
-        line for line in narrate_prompt.splitlines() if line.startswith("- panel_002：")
-    )
-    assert "[纯字卡]" in card_line
     plain_line = next(
         line for line in narrate_prompt.splitlines() if line.startswith("- panel_001：")
     )
@@ -1622,8 +1620,8 @@ async def test_pure_text_card_is_marked_and_transition_blank_filtered(tmp_path) 
     assert "panel_003" not in referenced
 
 
-def test_format_panel_ids_filters_transition_blank_and_marks_text_card() -> None:
-    """``_format_panel_ids`` 的兜底过滤：窄条剔除、纯字卡打标。"""
+def test_format_panel_ids_filters_transition_blank_and_pure_text_cards() -> None:
+    """``_format_panel_ids`` 的兜底过滤：窄条剔除、纯字卡剔除。"""
     panel_map = {
         "panel_001": PanelVisionInfo.model_validate(
             {"panel_id": "panel_001", "scene_summary": "雨夜街头", "dialogues": []}
@@ -1649,7 +1647,8 @@ def test_format_panel_ids_filters_transition_blank_and_marks_text_card() -> None
         ["panel_001", "panel_002", "panel_003"], panel_map
     )
     assert "- panel_001：" in rendered
-    assert "- panel_002： [纯字卡] 白底黑字卡" in rendered
+    # Patch v3.2 Patch 12：纯字卡直接剔除，不再打 [纯字卡] 标记。
+    assert "panel_002" not in rendered
     assert "panel_003" not in rendered
 
 

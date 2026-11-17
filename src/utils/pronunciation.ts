@@ -1,10 +1,29 @@
 import type { PronunciationRule, ScriptBeat } from '../types/studio';
 
+/**
+ * `tts_text` 相对 `narration_text` 的长度占比下限。
+ *
+ * `tts_text` 的契约是**整句送音文本**（与字幕等量级，仅个别脱敏字被换成标准汉字
+ * 同音词）。若它明显短于字幕原句，说明里面只写了「被替换的那一个词」（如「混蛋」），
+ * 直接拿来试听/合成会让整条解说只剩两三个字——此时一律回退字幕原句。
+ * 与后端 `backend/src/stages/s5_tts.py::build_spoken_text` 保持同一判定。
+ */
+const TTS_FRAGMENT_RATIO = 0.6;
+
 export function resolveSpokenText(
   beat: ScriptBeat,
   rules: PronunciationRule[]
 ): { spokenText: string; matchedRules: PronunciationRule[] } {
-  const base = beat.tts_text.trim() ? beat.tts_text : beat.narration_text;
+  const narration = beat.narration_text;
+  const ttsText = (beat.tts_text ?? '').trim();
+  let base = narration;
+  if (
+    ttsText &&
+    !narration.includes(ttsText) &&
+    ttsText.length >= narration.length * TTS_FRAGMENT_RATIO
+  ) {
+    base = ttsText;
+  }
   let result = base;
   const matchedRules: PronunciationRule[] = [];
 

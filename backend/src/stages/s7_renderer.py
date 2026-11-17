@@ -86,19 +86,18 @@ _AUDIO_LAYOUT = "stereo"
 #: ``amix`` 单次混合的最大输入数（超过就分组再混，避免滤镜 pad 上限）。
 _MIX_GROUP_SIZE = 16
 
-#: BGM 闪避（``sidechaincompress``）参数。
+#: BGM 闪避（``sidechaincompress``）参数（Patch v3.2 Patch 14：柔和自然的漫评闪避）。
 #:
-#: **threshold 为什么是 0.01 而不是 0.05**：阈值是线性幅度。百炼 TTS 的人声 RMS 实测约
-#: ``-29.5 dBFS``（≈0.033），阈值 0.05（≈-26 dBFS）比人声的**平均电平还高**，
-#: 于是只有人声峰值才触发压缩，整段闪避几乎失效（实测停顿段 BGM 只比人声段高 1.1 dB）。
-#: 0.01（≈-40 dBFS）低于人声 RMS，人声一开口就压住 BGM。
+#: **threshold=0.05 / ratio=2.8**：Patch 14 起 BGM 先经 ``loudnorm`` 统一到 -16 LUFS 再降
+#: -11.5dB，基线已规范化，不再需要深压。说话时 BGM 温和退让 4~6dB 即可，ratio=8 的深压
+#: 会让配乐忽大忽小。
 #:
-#: **release 为什么是 200ms**：句间停顿只有 250~400ms，release=300ms 时 BGM 在整段停顿里
-#: 都还没恢复，听起来像「背景音被永久压住」。200ms 能在停顿里回升一截。
-_SIDECHAIN_THRESHOLD = 0.01
-_SIDECHAIN_RATIO = 8
-_SIDECHAIN_ATTACK_MS = 10
-_SIDECHAIN_RELEASE_MS = 200
+#: **attack=25ms / release=320ms**：25ms 起压避免音节开头的泵感；320ms 释放让句间停顿
+#: （250~400ms）结束时 BGM 自然托底，不会像 200ms 那样在长句尾音里频繁起伏。
+_SIDECHAIN_THRESHOLD = 0.05
+_SIDECHAIN_RATIO = 2.8
+_SIDECHAIN_ATTACK_MS = 25
+_SIDECHAIN_RELEASE_MS = 320
 
 #: 错误信息里保留的 stderr 末尾长度（够定位问题，又不会把整份 ffmpeg 日志塞进异常）。
 _STDERR_TAIL_CHARS = 2000
@@ -116,9 +115,15 @@ BGM_DIR_NAME = "bgm"
 #: 音效子目录名。
 SFX_DIR_NAME = "sfx"
 
-#: 音效默认增益（dB）。与 ``core.schemas.SfxEvent.gain_db`` 的默认值保持一致，
-#: 便于区分「事件显式指定的音量」与「沿用默认」。
-DEFAULT_SFX_GAIN_DB = -10.0
+#: 音效默认增益（dB）。Patch v3.2 Patch 14 从 -10dB 提升到 -3.5dB：
+#: 旧值混入后心跳/甩门等音效几乎听不见；混入前另做 ``dynaudnorm`` 峰值归一防破音。
+DEFAULT_SFX_GAIN_DB = -3.5
+
+#: ``SfxEvent.gain_db`` 的 schema 默认值（``core/schemas.py`` 不在 Patch 14 的允许修改
+#: 清单内，不能直接改它）。事件增益等于该值视为「未显式指定」，沿用渲染配置的
+#: ``sfx_gain_db``；只有显式写成别的值才覆盖配置——否则 schema 默认的 -10.0 会让
+#: 配置里的新默认值 -3.5dB 永远不生效。
+_SFX_EVENT_SCHEMA_DEFAULT_GAIN = float(SfxEvent.model_fields["gain_db"].default)
 
 #: 文件名里不允许出现的字符（Windows/macOS 通用安全集）。
 _UNSAFE_NAME_CHARS = re.compile(r'[\\/:*?"<>|\r\n\t]')
@@ -690,12 +695,23 @@ def _prepare_audio(
                 continue
             gain = sfx_gain_db
             event_gain = getattr(event, "gain_db", None)
-            if event_gain is not None and float(event_gain) != DEFAULT_SFX_GAIN_DB:
-                # 事件显式给了别的音量就用它，否则以配置为准。
+            if (
+                event_gain is not None
+                and float(event_gain) != _SFX_EVENT_SCHEMA_DEFAULT_GAIN
+            ):
+                # 事件显式给了不同于 schema 默认值的音量就用它，否则以渲染配置为准。
                 gain = float(event_gain)
             sfx_inputs.append(
                 (asset, max(0, int(getattr(event, "start_ms", 0) or 0)), float(gain))
             )
+
+    # Patch 14：显性混音日志——bgm 文件名/增益与 sfx 实际可用数/事件总数一眼可查，
+    # 素材缺失或 enable_sfx=False 时 usable 会小于 total，配合上方警告定位漏播音效。
+    bgm_label = bgm_path.name if bgm_path is not None else "NONE"
+    print(
+        f"[s7] 音频混合：bgm={bgm_label} ({float(bgm_gain_db):.1f}dB), "
+        f"sfx={len(sfx_inputs)}/{len(tuple(sfx_events or ()))} 条"
+    )
 
     args: list[str] = ["-y", "-hide_banner"]
     for path, _ in usable:
@@ -727,18 +743,23 @@ def _prepare_audio(
         chains.append(f"anullsrc=r={_AUDIO_RATE}:cl={_AUDIO_LAYOUT}:d={total_s:.3f}[voice]")
 
     if bgm_path is not None:
-        # BGM 在这里就降音量：规范要求的「volume=bgm_gain_db → sidechaincompress」顺序。
+        # Patch 14：先 loudnorm 响度归一（统一各来源 BGM 的音量基线）再降增益，
+        # 顺序保持「loudnorm → volume=bgm_gain_db → sidechaincompress」。
         chains.append(
             f"[{bgm_index}:a]aformat=sample_fmts=fltp:sample_rates={_AUDIO_RATE}:"
-            f"channel_layouts={_AUDIO_LAYOUT},volume={float(bgm_gain_db):.1f}dB,"
+            f"channel_layouts={_AUDIO_LAYOUT},loudnorm=I=-16:TP=-1.5:LRA=11,"
+            f"volume={float(bgm_gain_db):.1f}dB,"
             f"apad,atrim=0:{total_s:.3f}[bgm]"
         )
 
     sfx_labels: list[str] = []
     for offset, (_path, start, gain) in enumerate(sfx_inputs):
+        # Patch 14：adelay 对齐事件时间点 → dynaudnorm 动态峰值归一（清晰且不爆音）
+        # → volume 施加配置/事件增益。
         chains.append(
             f"[{sfx_base + offset}:a]aformat=sample_fmts=fltp:sample_rates={_AUDIO_RATE}:"
-            f"channel_layouts={_AUDIO_LAYOUT},adelay={start}|{start},volume={gain:.1f}dB,"
+            f"channel_layouts={_AUDIO_LAYOUT},adelay={start}|{start},dynaudnorm,"
+            f"volume={gain:.1f}dB,"
             f"apad,atrim=0:{total_s:.3f}[sx{offset}]"
         )
         sfx_labels.append(f"sx{offset}")

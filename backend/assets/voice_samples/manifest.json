@@ -1,0 +1,124 @@
+{
+  "generated_at": "2026-11-17T07:22:12+00:00",
+  "text": "夜色落在窗台上，故事才刚刚开始。你听见了吗，风声里藏着的那句话。",
+  "instruction": "用自然、平稳、有代入感的语气朗读，不要夸张表演。",
+  "voices": {
+    "Elias": {
+      "id": "Elias",
+      "name": "墨讲师",
+      "gender": "male",
+      "traits": "磁性沉稳、有故事讲述感",
+      "use_case": "悬疑/剧情漫评主旁白（推荐默认）",
+      "file": "Elias.wav",
+      "duration_ms": 7191
+    },
+    "Ethan": {
+      "id": "Ethan",
+      "name": "晨煦",
+      "gender": "male",
+      "traits": "阳光温暖青年标准普通话",
+      "use_case": "现代男主 / 青春男旁白",
+      "file": "Ethan.wav",
+      "duration_ms": 6476
+    },
+    "Moon": {
+      "id": "Moon",
+      "name": "月白",
+      "gender": "male",
+      "traits": "清冷率性帅气男声",
+      "use_case": "高冷/腹黑男主",
+      "file": "Moon.wav",
+      "duration_ms": 11357
+    },
+    "Kai": {
+      "id": "Kai",
+      "name": "凯",
+      "gender": "male",
+      "traits": "温柔低沉有质感男声",
+      "use_case": "深情男主 / 情感故事旁白",
+      "file": "Kai.wav",
+      "duration_ms": 7344
+    },
+    "Ryan": {
+      "id": "Ryan",
+      "name": "甜茶",
+      "gender": "male",
+      "traits": "富有戏剧张力与情绪起伏男声",
+      "use_case": "冲突反派 / 激烈台词",
+      "file": "Ryan.wav",
+      "duration_ms": 6717
+    },
+    "Marcus": {
+      "id": "Marcus",
+      "name": "秦川",
+      "gender": "male",
+      "traits": "沉稳硬汉男声（略带地方硬朗韵味）",
+      "use_case": "霸道长辈 / 硬派反派",
+      "file": "Marcus.wav",
+      "duration_ms": 6958
+    },
+    "Cherry": {
+      "id": "Cherry",
+      "name": "芊悦",
+      "gender": "female",
+      "traits": "明亮亲切年轻女声",
+      "use_case": "年轻女主",
+      "file": "Cherry.wav",
+      "duration_ms": 7432
+    },
+    "Serena": {
+      "id": "Serena",
+      "name": "苏瑶",
+      "gender": "female",
+      "traits": "温柔细腻小姐姐声",
+      "use_case": "温柔女主 / 抒情女旁白",
+      "file": "Serena.wav",
+      "duration_ms": 7589
+    },
+    "Maia": {
+      "id": "Maia",
+      "name": "四月",
+      "gender": "female",
+      "traits": "知性优雅女声",
+      "use_case": "理性女配 / 叙事旁白",
+      "file": "Maia.wav",
+      "duration_ms": 6872
+    },
+    "Katerina": {
+      "id": "Katerina",
+      "name": "卡捷琳娜",
+      "gender": "female",
+      "traits": "成熟富有韵味女声",
+      "use_case": "继母 / 御姐反派",
+      "file": "Katerina.wav",
+      "duration_ms": 8141
+    },
+    "Vivian": {
+      "id": "Vivian",
+      "name": "十三",
+      "gender": "female",
+      "traits": "率性可爱略带小脾气",
+      "use_case": "傲娇女配 / 闺蜜",
+      "file": "Vivian.wav",
+      "duration_ms": 6791
+    },
+    "Chelsie": {
+      "id": "Chelsie",
+      "name": "千雪",
+      "gender": "female",
+      "traits": "甜美少女感",
+      "use_case": "软萌/少女角色",
+      "file": "Chelsie.wav",
+      "duration_ms": 7660
+    },
+    "Bella": {
+      "id": "Bella",
+      "name": "萌宝",
+      "gender": "female",
+      "traits": "萝莉/孩童声线",
+      "use_case": "幼年主角 / 儿童角色",
+      "file": "Bella.wav",
+      "duration_ms": 9276
+    }
+  }
+}

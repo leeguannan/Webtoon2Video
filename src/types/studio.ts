@@ -59,6 +59,52 @@ export interface ScriptBeat {
   motion: CameraMotion;
   pause_after_ms: number;
   audio_duration_ms: number;
+  /** Stage 4 产出的角色标注（narrator / female_lead / male_lead / female_mature / male_antagonist，或具体人名）。 */
+  speaker_role?: string;
+  /** Stage 4 产出的说话人性别（male / female / unknown），Patch v3.2 Patch 12。 */
+  speaker_gender?: 'male' | 'female' | 'unknown';
+  /** Stage 4 产出的可选音效提示（heart_thump / door_slam / whoosh / gasp / phone_msg / footstep / crash）。 */
+  sfx_cue?: string | null;
+  /** 取景提示（full / top / bottom / center）。 */
+  focus_hint?: string;
+}
+
+/** 百炼官方音色的一条配音规格（Patch v3.2 Patch 13）。 */
+export interface VoiceSpec {
+  voice: string;
+  speed: number;
+}
+
+/** 作品级配音设置（讲解者 / 通用男声 / 通用女声 / 角色专属音色）。 */
+export interface SeriesTtsConfig {
+  narrator: VoiceSpec;
+  default_male: VoiceSpec;
+  default_female: VoiceSpec;
+  character_voices: Record<string, VoiceSpec>;
+}
+
+/** GET /api/tts/voices 返回的单个音色元数据。 */
+export interface VoiceOption {
+  id: string;
+  label: string;
+  name: string;
+  gender: string;
+  traits: string;
+  use_case: string;
+  sample_url: string;
+  sample_ready: boolean;
+}
+
+/** GET /api/series/{id}/tts-config 的完整响应。 */
+export interface SeriesTtsConfigResponse extends SeriesTtsConfig {
+  series_id: string;
+  characters: Array<{
+    name: string;
+    aliases: string[];
+    gender: 'male' | 'female' | 'unknown';
+    traits: string;
+  }>;
+  voices: VoiceOption[];
 }
 
 export interface EpisodeItem {
@@ -85,6 +131,8 @@ export interface CharacterProfile {
   current_status: string;
   first_seen_ep: number;
   last_seen_ep: number;
+  /** 角色性别（male / female / unknown），Patch v3.2 Patch 12。 */
+  gender?: 'male' | 'female' | 'unknown';
 }
 
 export interface PlotThread {

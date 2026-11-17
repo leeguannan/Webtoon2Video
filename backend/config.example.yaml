@@ -36,15 +36,17 @@ render:
   ffmpeg_bin: ffmpeg
   background_blur: 40
   background_darken: 0.55
-  bgm_gain_db: -18.0
+  # Patch 14：BGM 先 loudnorm 响度归一（I=-16:TP=-1.5:LRA=11）再降增益，
+  # -11.5dB 叠加侧链闪避后仍能听见；旧值 -18dB 实测会被压到 -45dB 以下
+  bgm_gain_db: -11.5
   # 没有显式 BGM 时，自动挂载 assets/bgm/ 下的默认氛围音乐
   auto_bgm: true
   # 默认氛围音乐名（对应 assets/bgm/{default_bgm}.*）
   default_bgm: suspense
   # 是否把时间轴里的音效事件（sfx_events）混进音轨
   enable_sfx: true
-  # 音效相对人声的增益（dB）
-  sfx_gain_db: -10.0
+  # 音效相对人声的增益（dB）；Patch 14 起混入前先做 dynaudnorm 峰值归一
+  sfx_gain_db: -3.5
 
 tts:
   # 主旁白音色（百炼系统音色 ID）
@@ -59,6 +61,23 @@ tts:
     female_mature: Katerina
     male: Ethan
     female: Cherry
+  # 讲解者（旁白）的音色与语速；作品级 series_config.yaml 的 tts 段可逐项覆盖
+  narrator:
+    voice: Elias
+    speed: 1.18
+  # 未识别角色的通用男声
+  default_male:
+    voice: Ethan
+    speed: 1.15
+  # 未识别角色的通用女声
+  default_female:
+    voice: Cherry
+    speed: 1.15
+  # 已识别角色的专属音色（键是角色名，如「继母」）；作品级可逐角色覆盖
+  character_voices: {}
+  #   继母:
+  #     voice: Katerina
+  #     speed: 1.05
 
 concurrency:
   # 跨作品并发度

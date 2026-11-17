@@ -29,6 +29,7 @@ from core.config import (
     load_config,
     load_env_file,
     load_series_config,
+    merge_series_tts,
     merge_voice_cast,
 )
 from core.http_client import build_client, local_path_from_url
@@ -519,6 +520,10 @@ async def _produce_media_from_scripts(
     # Patch v3.1 Patch 11 A2/A3：角色音色表（作品级覆盖全局）。
     voice_cast = merge_voice_cast(config.tts.voice_cast, series_config.voice_cast)
     default_voice = config.tts.default_voice
+    # Patch v3.2 Patch 13 B1/B2：作品级配音模板（讲解者 / 通用男女声 / 角色专属）
+    # + 角色性别表（用于未指定角色时按性别兜底）。
+    series_tts = merge_series_tts(config.tts, series_config.tts)
+    characters = s5_tts.load_bible_characters(series_dir)
 
     # Stage 5：配音（每话独立合成，同部内并发）。
     factory = tts_factory or _tts_factory(config, voice)
@@ -541,6 +546,8 @@ async def _produce_media_from_scripts(
                     voice=voice,
                     default_voice=default_voice,
                     voice_cast=voice_cast,
+                    series_tts=series_tts,
+                    characters=characters,
                     concurrency=concurrency,
                     ffmpeg_bin=config.render.ffmpeg_bin,
                 )

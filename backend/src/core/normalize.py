@@ -50,6 +50,9 @@ SFX_CUE_KEYS: tuple[str, ...] = (
 MAX_NARRATION_CHARS = 120
 MIN_NARRATION_CHARS = 2
 
+#: Patch v3.2 Patch 12：说话人性别合法值。与 ``core.schemas.ScriptBeat`` 一致。
+SPEAKER_GENDERS: tuple[str, ...] = ("male", "female", "unknown")
+
 
 def normalize_enum(value: Any, allowed: Sequence[str], default: str) -> str:
     """把模型返回的枚举值收敛到契约允许的取值。
@@ -252,6 +255,65 @@ def sanitize_narration_and_tts(text: str, *, for_tts: bool = False) -> str:
     return cleaned
 
 
+#: Patch v3.2 Patch 12：对话引号归一化。
+#:
+#: 模型偶尔会把对话写成单引号（``‘…’`` / ``'…'``）或英文直引号（``"…"``），
+#: 下游的「引号对白拆分」只认中文双引号，所以落盘前统一收敛成 ``“…”``。
+#: 英文缩写（``I'm`` / ``don't``）前后都是 ASCII 字母，不会命中任何规则。
+_DIALOGUE_QUOTE_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
+    # 中文冒号 + 中文单引号：道振说：‘别怕，有我在。’
+    (re.compile(r"：‘([^’\n]{2,120})’"), "：“\\1”"),
+    # 中文冒号 + 英文单引号：道振说：'别怕，有我在。'
+    (re.compile(r"：'([^'\n]{2,120})'"), "：“\\1”"),
+    # 半角冒号 + 英文双引号：道振说:"别怕"
+    (re.compile(r":\"([^\"\n]{2,120})\""), "：“\\1”"),
+    # 中文冒号 + 英文双引号：道振说："别怕"
+    (re.compile(r"：\"([^\"\n]{2,120})\""), "：“\\1”"),
+    # 紧跟在汉字后的单引号对白：他说‘别怕’，然后走了
+    (re.compile(r"(?<=[\u4e00-\u9fff])‘([^’\n]{2,120})’"), "“\\1”"),
+    (re.compile(r"(?<=[\u4e00-\u9fff])'([^'\n]{2,120})'"), "“\\1”"),
+)
+
+#: 整段被单引号包裹的独立台词（前后是空白或标点）。
+_STANDALONE_QUOTE_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(
+            r"(?:^|(?<=[\s，。！？：；、,!?;]))‘([^’\n]{2,120})’"
+            r"(?=$|[\s，。！？：；、,!?;])"
+        ),
+        "“\\1”",
+    ),
+    (
+        re.compile(
+            r"(?:^|(?<=[\s，。！？：；、,!?;]))'([^'\n]{2,120})'"
+            r"(?=$|[\s，。！？：；、,!?;])"
+        ),
+        "“\\1”",
+    ),
+)
+
+
+def normalize_dialogue_quotes(text: str) -> str:
+    """把对话里的单引号 / 英文直引号统一成中文双引号 ``“…”``。
+
+    Patch v3.2 Patch 12：大模型偶尔把对白写成 ``‘…’`` 或 ``"…"``，
+    而 Stage 4B 的「旁白 + 引号对白」确定性拆分只认中文双引号，
+    所以在归一化阶段先把引号形态收敛掉。
+
+    * ``道振说：‘别怕，有我在。’`` → ``道振说：“别怕，有我在。”``
+    * ``"别怕"`` → ``“别怕”``
+    * 英文缩写（``I'm`` / ``don't``）前后都是 ASCII 字母，不会被误替换。
+    """
+    if not text:
+        return ""
+    cleaned = text
+    for pattern, replacement in _DIALOGUE_QUOTE_RULES:
+        cleaned = pattern.sub(replacement, cleaned)
+    for pattern, replacement in _STANDALONE_QUOTE_RULES:
+        cleaned = pattern.sub(replacement, cleaned)
+    return cleaned
+
+
 def normalize_script_payload(
     payload: dict[str, Any],
     *,
@@ -273,6 +335,8 @@ def normalize_script_payload(
         if not isinstance(item, dict):
             continue
         narration = coerce_str(item.get("narration_text") or item.get("text"))
+        # Patch v3.2 Patch 12：对白引号统一成中文双引号（拆对白的前置条件）。
+        narration = normalize_dialogue_quotes(narration)
         # Patch v3.1 Patch 9：进字幕 / TTS 之前先净化，杜绝「☒」方块与吞字。
         narration = sanitize_narration_and_tts(narration)
         if len(narration) < MIN_NARRATION_CHARS:
@@ -288,6 +352,7 @@ def normalize_script_payload(
         tts_raw = item.get("tts_text")
         tts_text = coerce_str(tts_raw) if tts_raw is not None else None
         if tts_text is not None:
+            tts_text = normalize_dialogue_quotes(tts_text)
             tts_text = sanitize_narration_and_tts(tts_text, for_tts=True)
             tts_text = clip_text(tts_text, MAX_NARRATION_CHARS) or None
         # Patch v3.1 Patch 10：可选音效标签（白名单收敛，非法值 / "none" 丢弃）。
@@ -295,6 +360,10 @@ def normalize_script_payload(
         sfx_cue = coerce_str(sfx_cue_raw).lower() if sfx_cue_raw is not None else ""
         if sfx_cue not in SFX_CUE_KEYS:
             sfx_cue = None
+        # Patch v3.2 Patch 12：说话人性别（male / female / unknown）。
+        speaker_gender = coerce_str(item.get("speaker_gender")).lower()
+        if speaker_gender not in SPEAKER_GENDERS:
+            speaker_gender = "unknown"
         beats.append(
             {
                 "beat_id": coerce_str(item.get("beat_id")) or f"b{index}",
@@ -303,9 +372,10 @@ def normalize_script_payload(
                 "emotion_instruction": coerce_str(item.get("emotion_instruction"))
                 or "用自然、流畅且有代入感的漫评解说语气说出",
                 "speaker_role": coerce_str(item.get("speaker_role")) or "narrator",
+                "speaker_gender": speaker_gender,
                 "target_panel_ids": panel_ids,
                 "motion": normalize_enum(item.get("motion"), MOTION_VALUES, "zoom_in"),
-                "pause_after_ms": coerce_int(item.get("pause_after_ms"), 250, low=0, high=2000),
+                "pause_after_ms": coerce_int(item.get("pause_after_ms"), 150, low=0, high=2000),
                 "sfx_cue": sfx_cue,
             }
         )
@@ -333,6 +403,9 @@ def normalize_script_payload(
             continue
         first_seen = coerce_int(item.get("first_seen_ep"), episode_no, low=1)
         last_seen = coerce_int(item.get("last_seen_ep"), episode_no, low=1)
+        gender = coerce_str(item.get("gender")).lower()
+        if gender not in SPEAKER_GENDERS:
+            gender = "unknown"
         character_updates.append(
             {
                 "name": name,
@@ -341,6 +414,8 @@ def normalize_script_payload(
                 "current_status": coerce_str(item.get("current_status")),
                 "first_seen_ep": min(first_seen, last_seen),
                 "last_seen_ep": max(first_seen, last_seen),
+                # Patch v3.2 Patch 12：角色性别（角色表靠它做男女声路由）。
+                "gender": gender,
             }
         )
 

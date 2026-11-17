@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import type { EpisodeItem, RunMode, SeriesItem } from '../types/studio';
 import { formatMs, parseEpisodeRangeExpression } from '../utils/pronunciation';
+import { SeriesTtsPanel } from './SeriesTtsPanel';
 
 interface CatalogViewProps {
   series: SeriesItem;
@@ -117,6 +118,9 @@ export const CatalogView: React.FC<CatalogViewProps> = ({
 
   return (
     <div className="space-y-6">
+      {/* Patch v3.2 Patch 13：作品级配音设置（音色 / 语速 / 静态试听） */}
+      <SeriesTtsPanel seriesId={series.series_id} />
+
       {/* Stage 0 URL Capture Bar */}
       <section className="bg-white border border-slate-200 rounded-xl p-5">
         <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4">

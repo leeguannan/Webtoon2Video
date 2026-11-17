@@ -42,10 +42,12 @@ from core.config import (
     AppConfig,
     ConfigError,
     WorkspaceConfig,
+    assets_root,
     find_config_path,
     load_config,
     load_env_file,
     load_series_config,
+    merge_series_tts,
 )
 from core.manifest import ManifestManager, infer_stage_artifacts, infer_stage_status
 from core.schemas import (
@@ -61,7 +63,7 @@ from core.schemas import (
     load_model,
     save_model,
 )
-from providers.tts_qwen import DEFAULT_VOICE
+from providers.tts_qwen import BAILIAN_VOICE_CATALOG, BAILIAN_VOICE_IDS, DEFAULT_VOICE
 from stages import s0_catalog, s6_timeline, s7_renderer
 from web.job_runner import STAGE_DEFS, EpisodeState, JobError, JobRunner
 
@@ -75,13 +77,50 @@ DEFAULT_MAX_IMAGE_LONG_EDGE = 1280
 
 #: 可选音色清单（前端下拉展示用）：音色 ID → 中文说明。
 #: Patch v3.1 Patch 11 A1：与 ``core.config.TTSConfig.voice_cast`` 的五个主音色一致。
-TTS_VOICE_OPTIONS: tuple[dict[str, str], ...] = (
-    {"id": "Elias", "label": "墨讲师（男声旁白）"},
-    {"id": "Ethan", "label": "晨煦（年轻男主）"},
-    {"id": "Ryan", "label": "甜茶（戏剧男声）"},
-    {"id": "Cherry", "label": "芊悦（年轻女主）"},
-    {"id": "Katerina", "label": "卡捷琳娜（成熟女声）"},
+#: Patch v3.2 Patch 13 C2：升级为百炼官方 13 个音色（说明取自音色表）。
+TTS_VOICE_OPTIONS: tuple[dict[str, str], ...] = tuple(
+    {
+        "id": str(item["id"]),
+        "label": f"{item['name']}（{item['traits']}）",
+    }
+    for item in BAILIAN_VOICE_CATALOG
 )
+
+#: 试听样例目录名（相对 ``backend/assets/``）。
+VOICE_SAMPLES_DIR_NAME = "voice_samples"
+
+
+def voice_sample_dir() -> Path:
+    """试听样例目录：``backend/assets/voice_samples/``。"""
+    return assets_root() / VOICE_SAMPLES_DIR_NAME
+
+
+def voice_sample_path(voice_id: str) -> Path | None:
+    """某个音色的试听样例路径；音色 ID 非法时返回 ``None``。"""
+    if voice_id not in set(BAILIAN_VOICE_IDS):
+        return None
+    return voice_sample_dir() / f"{voice_id}.wav"
+
+
+def voice_options_payload() -> list[dict[str, Any]]:
+    """音色清单（前端下拉 + 试听按钮用）。"""
+    payload: list[dict[str, Any]] = []
+    for item in BAILIAN_VOICE_CATALOG:
+        voice_id = str(item["id"])
+        payload.append(
+            {
+                "id": voice_id,
+                "label": f"{item['name']}（{item['traits']}）",
+                "name": str(item["name"]),
+                "gender": str(item["gender"]),
+                "traits": str(item["traits"]),
+                "use_case": str(item["use_case"]),
+                "sample_url": f"/api/tts/samples/{voice_id}",
+                "sample_ready": voice_sample_path(voice_id) is not None
+                and voice_sample_path(voice_id).is_file(),
+            }
+        )
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -127,10 +166,67 @@ class ScriptUpdateRequest(BaseModel):
     mode: str = "full_video"
 
 
+#: 前端保存脚本时不会回传这些字段（由 Stage 4 产出、前端只读展示）。
+#: 客户端未提交时按 ``beat_id`` 从旧剧本继承，避免人工改一句字幕就把角色与音效标注抹掉。
+PRESERVED_BEAT_FIELDS: tuple[str, ...] = (
+    "speaker_role",
+    "sfx_cue",
+    "focus_hint",
+    # Patch v3.2 Patch 12：说话人性别（前端还没回传该字段，别被前端保存抹掉）
+    "speaker_gender",
+)
+
+#: 上面这些字段里允许显式置 ``None``（清空）的，其余字段 ``None`` 非法，按「未提供」处理。
+NULLABLE_BEAT_FIELDS: frozenset[str] = frozenset({"sfx_cue"})
+
+_MISSING = object()
+
+
+def _merge_script_beats(
+    existing: list[ScriptBeat], incoming: list[dict[str, Any]]
+) -> list[ScriptBeat]:
+    """把前端提交的 beats 合并进旧剧本，保留客户端未回传的只读字段。
+
+    规则：请求体里**缺少**该键 → 继承旧值；显式传 ``null`` 且该字段允许为空 → 清空；
+    显式传 ``null`` 但字段不允许为空（如 ``focus_hint``）→ 当作未提供并继承旧值，
+    免得整个请求因为一个非法值被 422 拒掉。
+    """
+    by_id = {beat.beat_id: beat for beat in existing}
+    merged: list[ScriptBeat] = []
+    for item in incoming:
+        raw = dict(item)
+        old = by_id.get(str(raw.get("beat_id") or ""))
+        if old is not None:
+            for field in PRESERVED_BEAT_FIELDS:
+                value = raw.get(field, _MISSING)
+                if value is _MISSING or (
+                    value is None and field not in NULLABLE_BEAT_FIELDS
+                ):
+                    raw[field] = getattr(old, field)
+        merged.append(ScriptBeat.model_validate(raw))
+    return merged
+
+
 class PanelFlagRequest(BaseModel):
     """``PATCH /api/episodes/{ep_id}/panels/{panel_id}`` 请求体。"""
 
     is_transition_blank: bool = False
+
+
+class VoiceSpecRequest(BaseModel):
+    """作品级配音设置里的一项（音色 + 语速）。"""
+
+    voice: str = "Elias"
+    speed: float = 1.18
+
+
+class SeriesTTSConfigRequest(BaseModel):
+    """``PUT /api/series/{sid}/tts-config`` 请求体（字段均可选）。"""
+
+    narrator: VoiceSpecRequest | None = None
+    default_male: VoiceSpecRequest | None = None
+    default_female: VoiceSpecRequest | None = None
+    character_voices: dict[str, VoiceSpecRequest] | None = None
 
 
 class ConfigUpdateRequest(BaseModel):
@@ -439,6 +535,9 @@ class WorkspaceView:
                     "motion": getattr(beat.motion, "value", beat.motion),
                     "pause_after_ms": beat.pause_after_ms,
                     "audio_duration_ms": durations.get(beat.beat_id, 0),
+                    "speaker_role": beat.speaker_role,
+                    "sfx_cue": beat.sfx_cue,
+                    "focus_hint": beat.focus_hint,
                 }
             )
         return result
@@ -589,6 +688,63 @@ def create_app(
     async def get_series(series_id: str) -> dict[str, Any]:
         return view.series_item(series_id)
 
+    # ------------------------------------------------------------------
+    # 配音设置（Patch v3.2 Patch 13 C2）
+    # ------------------------------------------------------------------
+    @app.get("/api/tts/voices")
+    async def list_tts_voices() -> dict[str, Any]:
+        """百炼 13 个官方音色 + 试听样例是否就绪。"""
+        return {"voices": voice_options_payload()}
+
+    @app.get("/api/tts/samples/{voice_id}")
+    async def get_tts_sample(voice_id: str) -> FileResponse:
+        """试听样例音频（静态文件，浏览器用 ``playbackRate`` 变速播放）。"""
+        path = voice_sample_path(voice_id)
+        if path is None:
+            raise HTTPException(status_code=404, detail=f"未知音色：{voice_id}")
+        if not path.is_file():
+            raise HTTPException(
+                status_code=404,
+                detail=f"音色 {voice_id} 还没有试听样例，请先运行 backend/scripts/init_voice_samples.py",
+            )
+        return FileResponse(path, media_type="audio/wav", filename=f"{voice_id}.wav")
+
+    @app.get("/api/series/{series_id}/tts-config")
+    async def get_series_tts_config(series_id: str) -> dict[str, Any]:
+        """作品级配音设置 + 已识别角色清单。"""
+        return _series_tts_payload(app.state.config, view, series_id)
+
+    @app.put("/api/series/{series_id}/tts-config")
+    async def put_series_tts_config(
+        series_id: str, payload: SeriesTTSConfigRequest
+    ) -> dict[str, Any]:
+        """保存作品级配音设置（写 ``series_config.yaml``）。"""
+        series_dir = view.registry.series_dir(series_id)
+        series_dir.mkdir(parents=True, exist_ok=True)
+        path = series_dir / "series_config.yaml"
+        data: dict[str, Any] = {}
+        if path.is_file():
+            loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        tts: dict[str, Any] = {}
+        if payload.narrator is not None:
+            tts["narrator"] = payload.narrator.model_dump()
+        if payload.default_male is not None:
+            tts["default_male"] = payload.default_male.model_dump()
+        if payload.default_female is not None:
+            tts["default_female"] = payload.default_female.model_dump()
+        if payload.character_voices is not None:
+            tts["character_voices"] = {
+                str(name): spec.model_dump() for name, spec in payload.character_voices.items()
+            }
+        if tts:
+            data["tts"] = tts
+        path.write_text(
+            yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8"
+        )
+        return _series_tts_payload(app.state.config, view, series_id)
+
     @app.put("/api/series/{series_id}/memory")
     async def update_memory(series_id: str, payload: MemoryUpdateRequest) -> dict[str, Any]:
         series_dir = view.registry.series_dir(series_id)
@@ -656,7 +812,7 @@ def create_app(
         if not script_path.is_file():
             raise HTTPException(status_code=404, detail="该话还没有 Stage 4 剧本")
         script = load_model(NarrationScript, script_path)
-        beats = [ScriptBeat.model_validate(item) for item in payload.beats]
+        beats = _merge_script_beats(script.beats, payload.beats)
         script = script.model_copy(update={"beats": beats})
         save_model(script, script_path)
         readable = view.episode_dir(series_id, episode_no) / "04_script" / "script_readable.md"
@@ -924,6 +1080,47 @@ def _config_payload(config: AppConfig) -> dict[str, Any]:
         "timeoutS": config.api.timeout_s,
         "maxRetries": config.api.max_retries,
         "workspaceRoot": str(config.workspace_root()),
+    }
+
+
+def _series_tts_payload(
+    config: AppConfig, view: WorkspaceView, series_id: str
+) -> dict[str, Any]:
+    """作品级配音设置 + 已识别角色清单（前端设置页用）。"""
+    if view.catalog(series_id) is None:
+        raise HTTPException(status_code=404, detail=f"作品未登记：{series_id}")
+    series_dir = view.registry.series_dir(series_id)
+    series_config = load_series_config(series_dir)
+    merged = merge_series_tts(config.tts, series_config.tts)
+
+    characters: list[dict[str, Any]] = []
+    bible_path = series_dir / "story_bible.json"
+    if bible_path.is_file():
+        try:
+            bible = load_model(StoryBibleV2, bible_path)
+        except Exception:  # noqa: BLE001 - 记忆体损坏时按「没有角色」处理
+            bible = None
+        if bible is not None:
+            for character in bible.characters:
+                characters.append(
+                    {
+                        "name": character.name,
+                        "aliases": list(character.aliases or []),
+                        "gender": character.gender or "unknown",
+                        "traits": character.visual_traits,
+                    }
+                )
+
+    return {
+        "series_id": series_id,
+        "narrator": merged.narrator.model_dump(),
+        "default_male": merged.default_male.model_dump(),
+        "default_female": merged.default_female.model_dump(),
+        "character_voices": {
+            name: spec.model_dump() for name, spec in merged.character_voices.items()
+        },
+        "characters": characters,
+        "voices": voice_options_payload(),
     }
 
 

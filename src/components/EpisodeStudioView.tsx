@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   CheckCircle2,
   Clock,
@@ -26,6 +26,7 @@ import type {
   StudioConfig,
 } from '../types/studio';
 import { formatMs, playPreviewTone, resolveSpokenText } from '../utils/pronunciation';
+import { PanelZoomModal, type SaveStatus } from './PanelZoomModal';
 
 interface EpisodeStudioViewProps {
   episode: EpisodeItem;
@@ -35,6 +36,8 @@ interface EpisodeStudioViewProps {
   onRerunFromStage: (episodeId: string, stageId: StageId) => void;
   onTogglePanelBlank: (episodeId: string, panelId: string) => void;
   onUpdateBeats: (episodeId: string, beats: ScriptBeat[], triggerFromStage5: boolean) => void;
+  /** 分镜大图弹窗里的字幕原文自动保存（不触发重跑配音）。缺省时退化为本地草稿保存。 */
+  onAutoSaveBeats?: (episodeId: string, beats: ScriptBeat[]) => Promise<void>;
   onExportEpisode: (episodeId: string, format: 'mp4' | 'ass' | 'script') => void;
 }
 
@@ -57,6 +60,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   onRerunFromStage,
   onTogglePanelBlank,
   onUpdateBeats,
+  onAutoSaveBeats,
   onExportEpisode,
 }) => {
   const [activeTab, setActiveTab] = useState<StudioTab>('script');
@@ -67,6 +71,14 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   const [draftBeats, setDraftBeats] = useState<ScriptBeat[]>(episode.beats);
   const [playingBeatId, setPlayingBeatId] = useState<string | null>(null);
 
+  // 分镜大图弹窗 + 字幕原文保存（切换分镜 / 关闭弹窗时落盘，编辑过程中不写库）
+  const [zoomBeatId, setZoomBeatId] = useState<string | null>(null);
+  const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle');
+  const [saveMessage, setSaveMessage] = useState('');
+  const draftBeatsRef = useRef<ScriptBeat[]>(episode.beats);
+  /** 待保存的草稿：{ episode_id, beats }；只在弹窗里改字时写入，落盘后清空 */
+  const pendingRef = useRef<{ episodeId: string; beats: ScriptBeat[] } | null>(null);
+
   // Video simulator state (9:16 standard)
   const [isPlayingVideo, setIsPlayingVideo] = useState(false);
   const [videoTimeMs, setVideoTimeMs] = useState(0);
@@ -75,7 +87,13 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   const localOutputPath = `workspace/${seriesId}/episodes/${epFolderName}/07_out/${episode.episode_id}.mp4`;
 
   useEffect(() => {
-    setDraftBeats(episode.beats);
+    // 后台会定时刷新剧集数据并回填 episode.beats；只要本话还有未保存的改动，
+    // 就保留本地草稿，别让用户正在改的字被服务端数据冲掉。
+    const pending = pendingRef.current;
+    if (!pending || pending.episodeId !== episode.episode_id) {
+      setDraftBeats(episode.beats);
+      draftBeatsRef.current = episode.beats;
+    }
     setSelectedPanelId(episode.panels[0]?.panel_id ?? '');
     setVideoTimeMs(0);
     setIsPlayingVideo(false);
@@ -163,6 +181,79 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
       prev.map((b) => (b.beat_id === beatId ? { ...b, [key]: value } : b))
     );
   };
+
+  // ── 分镜大图弹窗：字幕原文改完，在切换分镜 / 关闭弹窗时落盘 ────────────
+  /**
+   * 把待保存的草稿写回后端；没有待保存内容就不发请求。
+   * 返回是否保存成功（失败时保留弹窗，让用户看到错误并可重试）。
+   */
+  const flushSave = useCallback(async (): Promise<boolean> => {
+    const pending = pendingRef.current;
+    if (!pending) return true;
+    const { episodeId, beats } = pending;
+    setSaveStatus('saving');
+    try {
+      if (!onAutoSaveBeats) {
+        // 没有独立通道时退化为普通保存（不触发重跑配音）
+        onUpdateBeats(episodeId, beats, false);
+      } else {
+        await onAutoSaveBeats(episodeId, beats);
+      }
+      pendingRef.current = null;
+      setSaveStatus('saved');
+      setSaveMessage(new Date().toLocaleTimeString('zh-CN', { hour12: false }));
+      return true;
+    } catch (err) {
+      setSaveStatus('error');
+      setSaveMessage(err instanceof Error ? err.message : String(err));
+      return false;
+    }
+  }, [onAutoSaveBeats, onUpdateBeats]);
+
+  /** 弹窗内改字：只改本地草稿，落盘交给切格 / 关闭时统一做 */
+  const handleZoomNarrationChange = (beatId: string, text: string) => {
+    const next = draftBeatsRef.current.map((b) =>
+      b.beat_id === beatId ? { ...b, narration_text: text } : b
+    );
+    draftBeatsRef.current = next;
+    setDraftBeats(next);
+    pendingRef.current = { episodeId: episode.episode_id, beats: next };
+    setSaveStatus('dirty');
+    setSaveMessage('切换分镜或关闭弹窗时自动保存');
+  };
+
+  /** 上一格 / 下一格：先把当前格的改动存下来，再翻页 */
+  const handleZoomSelectBeat = useCallback(
+    async (nextBeatId: string) => {
+      if (nextBeatId === zoomBeatId) return;
+      const ok = await flushSave();
+      if (!ok) return; // 保存失败就别翻页，避免看起来改好了其实没存上
+      setZoomBeatId(nextBeatId);
+    },
+    [flushSave, zoomBeatId]
+  );
+
+  /** 关闭弹窗：先存盘，成功才关 */
+  const handleZoomClose = useCallback(async () => {
+    const ok = await flushSave();
+    if (!ok) {
+      setSaveMessage('保存失败，请检查后端服务后再次点击关闭重试');
+      return;
+    }
+    setZoomBeatId(null);
+  }, [flushSave]);
+
+  // 兜底：换话或卸载时把还挂着的草稿写回它所属的那一话。
+  // 依赖只能是 episode_id —— 若依赖 flushSave，App 的定时刷新会让回调身份变化，
+  // 清理函数被反复触发，等于又在编辑过程中偷偷保存。
+  const flushSaveRef = useRef(flushSave);
+  flushSaveRef.current = flushSave;
+  useEffect(
+    () => () => {
+      void flushSaveRef.current();
+    },
+    [episode.episode_id]
+  );
 
   const handleAddBeat = () => {
     const idx = draftBeats.length + 1;
@@ -517,7 +608,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                         字幕原文 (narration_text · 屏幕显示)
                       </th>
                       <th className="py-3 px-3 min-w-[220px]">
-                        多音字/TTS 读音文本 (不改字幕)
+                        TTS 送音文本（整句 · 不改字幕）
                       </th>
                       <th className="py-3 px-3 min-w-[210px]">
                         Qwen TTS 情绪指令 (instruction)
@@ -542,12 +633,20 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                                 {beat.beat_id}
                               </div>
                               {panel && (
-                                <img
-                                  src={panel.image_url}
-                                  alt={panel.panel_id}
-                                  referrerPolicy="no-referrer"
-                                  className="w-12 h-16 object-cover rounded border border-slate-200"
-                                />
+                                <button
+                                  type="button"
+                                  onClick={() => setZoomBeatId(beat.beat_id)}
+                                  title="放大查看分镜并编辑字幕原文"
+                                  aria-label={`放大查看 ${panel.panel_id} 并编辑字幕原文`}
+                                  className="block w-12 h-16 rounded border border-slate-200 overflow-hidden hover:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/40 cursor-pointer transition-colors"
+                                >
+                                  <img
+                                    src={panel.image_url}
+                                    alt={panel.panel_id}
+                                    referrerPolicy="no-referrer"
+                                    className="w-12 h-16 object-cover"
+                                  />
+                                </button>
                               )}
                               <select
                                 value={beat.target_panel_ids[0]}
@@ -593,7 +692,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                               onChange={(e) =>
                                 updateBeatField(beat.beat_id, 'tts_text', e.target.value)
                               }
-                              placeholder="留空则自动继承字幕 + 词典替换..."
+                              placeholder="留空则自动继承字幕 + 词典替换；填写时必须是整句送音文本..."
                               className="w-full p-2 text-xs text-slate-800 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600 resize-none"
                             />
                             <div className="mt-1 text-[11px] text-slate-500 leading-snug">
@@ -1033,6 +1132,19 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
           </>
         )}
       </section>
+
+      {/* 分镜大图 + 字幕原文编辑（改完自动保存） */}
+      <PanelZoomModal
+        open={zoomBeatId !== null}
+        beats={draftBeats}
+        panels={episode.panels}
+        activeBeatId={zoomBeatId}
+        saveStatus={saveStatus}
+        saveMessage={saveMessage}
+        onClose={handleZoomClose}
+        onSelectBeat={handleZoomSelectBeat}
+        onChangeNarration={handleZoomNarrationChange}
+      />
     </div>
   );
 };

@@ -707,6 +707,24 @@ export default function App() {
     }
   };
 
+  // 分镜大图弹窗的字幕原文自动保存：静默落盘（不弹 toast、不重跑配音），失败抛给弹窗展示
+  const handleAutoSaveBeats = async (
+    episodeId: string,
+    beats: ScriptBeat[]
+  ) => {
+    await apiFetch(`/episodes/${encodeURIComponent(episodeId)}/script`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        beats,
+        mode: 'full_video',
+      }),
+    });
+    patchEpisode(episodeId, (ep) => ({
+      ...ep,
+      beats,
+    }));
+  };
+
   const handleExportEpisode = async (
     episodeId: string,
     format: 'mp4' | 'ass' | 'script'
@@ -1188,6 +1206,7 @@ export default function App() {
               onRerunFromStage={handleRerunFromStage}
               onTogglePanelBlank={handleTogglePanelBlank}
               onUpdateBeats={handleUpdateBeats}
+              onAutoSaveBeats={handleAutoSaveBeats}
               onExportEpisode={handleExportEpisode}
             />
           )}

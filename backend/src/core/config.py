@@ -93,15 +93,48 @@ class RenderConfig(_StrictModel):
     ffmpeg_bin: str = "ffmpeg"
     background_blur: int = 40
     background_darken: float = 0.55
-    bgm_gain_db: float = -18.0
+    #: Patch v3.2 Patch 14：BGM 增益从 -18dB 提升到 -11.5dB。
+    #: 旧值在 loudnorm 之前再叠加侧链闪避会跌到 -45dB 以下，实测几乎听不到。
+    bgm_gain_db: float = -11.5
     #: Patch v3.1 Patch 11 B4：没有显式 BGM 时是否自动挂载默认氛围音乐。
     auto_bgm: bool = True
     #: Patch v3.1 Patch 11 B4：默认氛围音乐名（对应 ``assets/bgm/{name}.*``）。
     default_bgm: str = "suspense"
     #: Patch v3.1 Patch 11 B3/B4：是否把时间轴里的音效事件混进音轨。
     enable_sfx: bool = True
-    #: Patch v3.1 Patch 11 B4：音效相对人声的增益（dB）。
-    sfx_gain_db: float = -10.0
+    #: Patch v3.2 Patch 14：音效增益从 -10dB 提升到 -3.5dB（混前再做 dynaudnorm 峰值归一）。
+    sfx_gain_db: float = -3.5
+
+
+class VoiceSpec(_StrictModel):
+    """一个音色的「音色 ID + 语速」组合（Patch v3.2 Patch 13 B1）。"""
+
+    #: 百炼系统音色 ID（见 ``providers.tts_qwen.BAILIAN_VOICE_CATALOG``）。
+    voice: str = "Elias"
+    #: 语速倍率（1.0 = 原速）；ffmpeg ``atempo`` 的安全区间是 0.6 ~ 1.8。
+    speed: float = Field(default=1.18, ge=0.6, le=1.8)
+
+
+class SeriesTTSConfig(_StrictModel):
+    """作品级配音设置（Patch v3.2 Patch 13 B1）。
+
+    四级解析顺序（见 :func:`stages.s5_tts.resolve_beat_voice_spec`）：
+
+    1. ``narrator``：旁白（``beat.speaker_role == "narrator"``）；
+    2. ``character_voices``：已识别角色的专属音色（键是角色名）；
+    3. ``default_male`` / ``default_female``：按性别兜底的通用音；
+    4. 回退 ``narrator``。
+    """
+
+    narrator: VoiceSpec = Field(default_factory=lambda: VoiceSpec(voice="Elias", speed=1.18))
+    default_male: VoiceSpec = Field(
+        default_factory=lambda: VoiceSpec(voice="Ethan", speed=1.15)
+    )
+    default_female: VoiceSpec = Field(
+        default_factory=lambda: VoiceSpec(voice="Cherry", speed=1.15)
+    )
+    #: 角色名 → 专属音色（键是 ``beat.speaker_role``，如「继母」）。
+    character_voices: dict[str, VoiceSpec] = Field(default_factory=dict)
 
 
 class TTSConfig(_StrictModel):
@@ -121,6 +154,15 @@ class TTSConfig(_StrictModel):
             "female": "Cherry",
         }
     )
+    #: Patch v3.2 Patch 13 B1：全局配音模板（作品级 ``SeriesConfig.tts`` 可逐项覆盖）。
+    narrator: VoiceSpec = Field(default_factory=lambda: VoiceSpec(voice="Elias", speed=1.18))
+    default_male: VoiceSpec = Field(
+        default_factory=lambda: VoiceSpec(voice="Ethan", speed=1.15)
+    )
+    default_female: VoiceSpec = Field(
+        default_factory=lambda: VoiceSpec(voice="Cherry", speed=1.15)
+    )
+    character_voices: dict[str, VoiceSpec] = Field(default_factory=dict)
 
 
 class ConcurrencyConfig(_StrictModel):
@@ -160,6 +202,9 @@ class SeriesConfig(_StrictModel):
     pronunciation_overrides: dict[str, str] = Field(default_factory=dict)
     #: Patch v3.1 Patch 11 A2：作品级角色音色覆盖（优先于全局 ``tts.voice_cast``）。
     voice_cast: dict[str, str] = Field(default_factory=dict)
+    #: Patch v3.2 Patch 13 B1：作品级配音设置（讲解者/通用男女声/角色专属）。
+    #: ``None`` 表示作品没配置过 → 整体沿用全局模板 ``AppConfig.tts``。
+    tts: SeriesTTSConfig | None = None
 
 
 def _package_root() -> Path:
@@ -278,6 +323,33 @@ def merge_voice_cast(
     merged = dict(global_cast)
     merged.update(series_cast)
     return merged
+
+
+def merge_series_tts(
+    global_tts: TTSConfig,
+    series_tts: SeriesTTSConfig | None,
+) -> SeriesTTSConfig:
+    """合并全局配音模板与作品级配音设置（Patch v3.2 Patch 13 B1）。
+
+    作品级优先：``narrator`` / ``default_male`` / ``default_female`` 直接采用
+    作品级取值；``character_voices`` 逐键合并（同名角色以作品级为准）。
+    作品级为 ``None``（没配过）时原样返回全局模板。
+    """
+    if series_tts is None:
+        return SeriesTTSConfig(
+            narrator=global_tts.narrator,
+            default_male=global_tts.default_male,
+            default_female=global_tts.default_female,
+            character_voices=dict(global_tts.character_voices),
+        )
+    character_voices = dict(global_tts.character_voices)
+    character_voices.update(series_tts.character_voices)
+    return SeriesTTSConfig(
+        narrator=series_tts.narrator,
+        default_male=series_tts.default_male,
+        default_female=series_tts.default_female,
+        character_voices=character_voices,
+    )
 
 
 def resolve_api_key(

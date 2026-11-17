@@ -24,7 +24,14 @@ from core.config import ConfigError, resolve_api_key_with_env_file
 from core.http_client import build_client
 from providers.tts_base import TTSError, TTSRequestError, TTSResponseError, TTSResult
 
-__all__ = ["QwenTTS", "DEFAULT_MODEL", "DEFAULT_VOICE", "TTS_ENDPOINT_PATH"]
+__all__ = [
+    "QwenTTS",
+    "DEFAULT_MODEL",
+    "DEFAULT_VOICE",
+    "TTS_ENDPOINT_PATH",
+    "BAILIAN_VOICE_CATALOG",
+    "BAILIAN_VOICE_IDS",
+]
 
 DEFAULT_MODEL = "qwen3-tts-flash"
 
@@ -33,6 +40,113 @@ DEFAULT_MODEL = "qwen3-tts-flash"
 #: Patch v3.1 Patch 11 A1：主旁白默认音色改为 ``Elias``；角色音色由
 #: :func:`stages.s5_tts.resolve_beat_voice` 按 ``beat.speaker_role`` 路由。
 DEFAULT_VOICE = "Elias"
+
+#: 百炼 ``qwen3-tts-flash`` 官方系统音色目录（Patch v3.2 Patch 13 A）。
+#:
+#: 前端作品配音设置页用这份目录渲染音色下拉；``init_voice_samples.py`` 用它
+#: 决定要生成哪几个静态试听样例。字段：
+#:
+#: - ``id``：百炼音色 ID（合成接口的 ``voice`` 字段）；
+#: - ``name``：官方中文名；
+#: - ``gender``：``male`` / ``female``（用于默认男声/女声兜底）；
+#: - ``traits``：音色特点；
+#: - ``use_case``：适用场景。
+BAILIAN_VOICE_CATALOG: tuple[dict[str, str], ...] = (
+    {
+        "id": "Elias",
+        "name": "墨讲师",
+        "gender": "male",
+        "traits": "磁性沉稳、有故事讲述感",
+        "use_case": "悬疑/剧情漫评主旁白（推荐默认）",
+    },
+    {
+        "id": "Ethan",
+        "name": "晨煦",
+        "gender": "male",
+        "traits": "阳光温暖青年标准普通话",
+        "use_case": "现代男主 / 青春男旁白",
+    },
+    {
+        "id": "Moon",
+        "name": "月白",
+        "gender": "male",
+        "traits": "清冷率性帅气男声",
+        "use_case": "高冷/腹黑男主",
+    },
+    {
+        "id": "Kai",
+        "name": "凯",
+        "gender": "male",
+        "traits": "温柔低沉有质感男声",
+        "use_case": "深情男主 / 情感故事旁白",
+    },
+    {
+        "id": "Ryan",
+        "name": "甜茶",
+        "gender": "male",
+        "traits": "富有戏剧张力与情绪起伏男声",
+        "use_case": "冲突反派 / 激烈台词",
+    },
+    {
+        "id": "Marcus",
+        "name": "秦川",
+        "gender": "male",
+        "traits": "沉稳硬汉男声（略带地方硬朗韵味）",
+        "use_case": "霸道长辈 / 硬派反派",
+    },
+    {
+        "id": "Cherry",
+        "name": "芊悦",
+        "gender": "female",
+        "traits": "明亮亲切年轻女声",
+        "use_case": "年轻女主",
+    },
+    {
+        "id": "Serena",
+        "name": "苏瑶",
+        "gender": "female",
+        "traits": "温柔细腻小姐姐声",
+        "use_case": "温柔女主 / 抒情女旁白",
+    },
+    {
+        "id": "Maia",
+        "name": "四月",
+        "gender": "female",
+        "traits": "知性优雅女声",
+        "use_case": "理性女配 / 叙事旁白",
+    },
+    {
+        "id": "Katerina",
+        "name": "卡捷琳娜",
+        "gender": "female",
+        "traits": "成熟富有韵味女声",
+        "use_case": "继母 / 御姐反派",
+    },
+    {
+        "id": "Vivian",
+        "name": "十三",
+        "gender": "female",
+        "traits": "率性可爱略带小脾气",
+        "use_case": "傲娇女配 / 闺蜜",
+    },
+    {
+        "id": "Chelsie",
+        "name": "千雪",
+        "gender": "female",
+        "traits": "甜美少女感",
+        "use_case": "软萌/少女角色",
+    },
+    {
+        "id": "Bella",
+        "name": "萌宝",
+        "gender": "female",
+        "traits": "萝莉/孩童声线",
+        "use_case": "幼年主角 / 儿童角色",
+    },
+)
+
+#: 音色 ID 列表（顺序同 :data:`BAILIAN_VOICE_CATALOG`）。
+BAILIAN_VOICE_IDS: tuple[str, ...] = tuple(item["id"] for item in BAILIAN_VOICE_CATALOG)
 
 #: DashScope 原生（非 compatible-mode）多模态生成端点路径。
 TTS_ENDPOINT_PATH = "/api/v1/services/aigc/multimodal-generation/generation"

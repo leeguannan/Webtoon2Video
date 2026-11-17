@@ -102,6 +102,8 @@ FIELD_LOCKS: list[tuple[type, tuple[str, ...]]] = [
             "current_status",
             "first_seen_ep",
             "last_seen_ep",
+            # Patch v3.2 Patch 12：角色性别（默认 "unknown"，向后兼容旧 story_bible）
+            "gender",
         ),
     ),
     (
@@ -142,6 +144,8 @@ FIELD_LOCKS: list[tuple[type, tuple[str, ...]]] = [
             "focus_hint",
             # Patch v3.1 Patch 10：可选音效触发标签（默认 None，向后兼容旧剧本）
             "sfx_cue",
+            # Patch v3.2 Patch 12：说话人性别（默认 "unknown"，向后兼容旧剧本）
+            "speaker_gender",
         ),
     ),
     (
@@ -286,7 +290,8 @@ def test_pause_after_ms_bounds() -> None:
 def test_script_beat_defaults() -> None:
     beat = ScriptBeat(beat_id="b1", narration_text="正常长度文本", target_panel_ids=["p1"])
     assert beat.motion is CameraMotion.ZOOM_IN
-    assert beat.pause_after_ms == 250
+    # Patch v3.2 Patch 12：默认停顿由 250ms 收紧到 150ms。
+    assert beat.pause_after_ms == 150
     assert beat.speaker_role == "narrator"
     assert beat.emotion_instruction
 

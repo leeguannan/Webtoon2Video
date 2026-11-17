@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 from PIL import Image, ImageDraw
 
 from core.config import AppConfig, TTSConfig, WorkspaceConfig
-from core.schemas import NarrationScript, save_model
+from core.schemas import NarrationScript, load_model, save_model
 from providers.llm_base import ChatResponse
 from web.job_runner import JobRunner
 from web.server import DEFAULT_TTS_VOICE, create_app
@@ -367,6 +367,66 @@ def test_put_script_saves_beats(client: TestClient, workspace: Path) -> None:
     assert saved["beats"][0]["motion"] == "pan_down"
 
 
+def test_put_script_keeps_readonly_beat_fields_not_sent_by_client(
+    client: TestClient, workspace: Path
+) -> None:
+    """前端只回传旧字段时，speaker_role / sfx_cue / focus_hint 不能被抹掉。"""
+    source = _make_source(workspace)
+    series_id = _register(client, workspace, source)
+    _write_stage_artifacts(workspace, series_id, 1)
+
+    script_path = (
+        workspace / series_id / "episodes" / "ep_001" / "04_script" / "script.json"
+    )
+    script = load_model(NarrationScript, script_path)
+    script = script.model_copy(
+        update={
+            "beats": [
+                beat.model_copy(
+                    update={
+                        "speaker_role": "male_lead",
+                        "sfx_cue": "heart_thump",
+                        "focus_hint": "top",
+                    }
+                )
+                for beat in script.beats
+            ]
+        }
+    )
+    save_model(script, script_path)
+
+    legacy_beat = {
+        "beat_id": "b_001",
+        "narration_text": "人工改写后的解说词。",
+        "tts_text": "",
+        "emotion_instruction": "压低声音",
+        "target_panel_ids": ["panel_001"],
+        "motion": "pan_down",
+        "pause_after_ms": 300,
+        "audio_duration_ms": 4200,
+    }
+    response = client.put(
+        f"/api/episodes/{series_id}_ep_001/script",
+        json={"beats": [legacy_beat]},
+    )
+    assert response.status_code == 200, response.text
+    saved = json.loads(script_path.read_text("utf-8"))
+    assert saved["beats"][0]["speaker_role"] == "male_lead"
+    assert saved["beats"][0]["sfx_cue"] == "heart_thump"
+    assert saved["beats"][0]["focus_hint"] == "top"
+
+    # sfx_cue 允许显式清空（null）；focus_hint 不允许 null，非法 null 按「未提供」继承旧值
+    response = client.put(
+        f"/api/episodes/{series_id}_ep_001/script",
+        json={"beats": [{**legacy_beat, "sfx_cue": None, "focus_hint": None}]},
+    )
+    assert response.status_code == 200, response.text
+    saved = json.loads(script_path.read_text("utf-8"))
+    assert saved["beats"][0]["sfx_cue"] is None
+    assert saved["beats"][0]["focus_hint"] == "top"
+    assert saved["beats"][0]["speaker_role"] == "male_lead"
+
+
 # ---------------------------------------------------------------------------
 # 导出
 # ---------------------------------------------------------------------------
@@ -453,16 +513,13 @@ def test_get_config_prefers_configured_default_voice(workspace: Path) -> None:
 
 
 def test_get_config_lists_voice_options(client: TestClient) -> None:
-    """可选音色清单包含五个主音色（前端下拉用）。"""
+    """可选音色清单包含百炼官方 13 个音色（Patch v3.2 Patch 13 起前端下拉用）。"""
+    from providers.tts_qwen import BAILIAN_VOICE_IDS
+
     payload = client.get("/api/config").json()
     options = payload["ttsVoiceOptions"]
-    assert [item["id"] for item in options] == [
-        "Elias",
-        "Ethan",
-        "Ryan",
-        "Cherry",
-        "Katerina",
-    ]
+    assert [item["id"] for item in options] == list(BAILIAN_VOICE_IDS)
+    assert len(options) == 13
     assert all(item["label"] for item in options)
 
 
