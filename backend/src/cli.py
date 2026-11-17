@@ -29,6 +29,7 @@ from core.config import (
     load_config,
     load_env_file,
     load_series_config,
+    merge_voice_cast,
 )
 from core.http_client import build_client, local_path_from_url
 from core.manifest import ManifestManager
@@ -433,7 +434,9 @@ def _tts_factory(config: AppConfig, voice: str | None = None) -> Any:
         return QwenTTS(
             base_url=config.api.base_url,
             model=config.models.tts,
-            voice=voice or DEFAULT_VOICE,
+            # Patch v3.1 Patch 11 A1/A2：默认音色来自 ``config.tts.default_voice``，
+            # 配置缺失时回退 provider 内置默认值。
+            voice=voice or config.tts.default_voice or DEFAULT_VOICE,
             timeout_s=config.api.timeout_s,
         )
 
@@ -513,6 +516,9 @@ async def _produce_media_from_scripts(
     series_dir = registry.series_dir(series_id)
     overrides = _pronunciation_overrides(config, series_dir)
     series_config = load_series_config(series_dir)
+    # Patch v3.1 Patch 11 A2/A3：角色音色表（作品级覆盖全局）。
+    voice_cast = merge_voice_cast(config.tts.voice_cast, series_config.voice_cast)
+    default_voice = config.tts.default_voice
 
     # Stage 5：配音（每话独立合成，同部内并发）。
     factory = tts_factory or _tts_factory(config, voice)
@@ -533,6 +539,8 @@ async def _produce_media_from_scripts(
                     script=script,
                     overrides=overrides,
                     voice=voice,
+                    default_voice=default_voice,
+                    voice_cast=voice_cast,
                     concurrency=concurrency,
                     ffmpeg_bin=config.render.ffmpeg_bin,
                 )
@@ -941,7 +949,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--workspace", default=None, help="工作区根目录（默认取配置文件）")
     run.add_argument("--concurrency", type=int, default=8, help="单部漫画内的并发数")
     run.add_argument("--out", default=None, help="成片额外复制到该目录")
-    run.add_argument("--voice", default=None, help="TTS 音色（如 Cherry）")
+    run.add_argument("--voice", default=None, help="TTS 音色（如 Elias）；不指定则按角色音色表路由")
     run.add_argument("--bgm", default=None, help="BGM 音频路径")
     run.add_argument(
         "--skip-download", action="store_true", help="来源是已登记 series_id 时跳过 Stage 0/1"

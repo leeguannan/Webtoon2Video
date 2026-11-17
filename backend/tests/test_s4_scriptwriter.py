@@ -8,8 +8,10 @@ from pathlib import Path
 import httpx
 import pytest
 import respx
+from PIL import Image
 
 from core.memory import StoryBibleManager
+from core.normalize import normalize_script_payload
 from core.schemas import (
     CameraMotion,
     CharacterProfile,
@@ -18,13 +20,16 @@ from core.schemas import (
     NarrationScript,
     PanelVisionInfo,
     PlotThread,
+    RenderTimeline,
+    ScriptBeat,
+    SfxEvent,
     StoryBibleV2,
     VisionWindowOutput,
     load_model,
     save_model,
 )
 from providers.llm_bailian import BailianClient
-from stages import s4_scriptwriter
+from stages import s3_vision, s4_scriptwriter
 
 CHAT_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 
@@ -545,10 +550,10 @@ def test_chunk_panels_splits_by_fixed_size() -> None:
 
 
 def test_chapter_beat_budget_splits_total_across_chapters() -> None:
-    """Patch v3.0-7 真机修复：全话 30~65 条按章平分，单章至少 3 条。"""
-    assert s4_scriptwriter._chapter_beat_budget(1) == (30, 65)
-    # 6 章：下限 30//6=5，上限 ceil(65/6)=11，合计上限 66 ≈ 全话 65。
-    assert s4_scriptwriter._chapter_beat_budget(6) == (5, 11)
+    """Patch v3.1 Patch 10：全话条数预算收紧到 35~50 条，按章平分，单章至少 3 条。"""
+    assert s4_scriptwriter._chapter_beat_budget(1) == (35, 50)
+    # 6 章：下限 35//6=5，上限 ceil(50/6)=9，合计上限 54 ≈ 全话 50。
+    assert s4_scriptwriter._chapter_beat_budget(6) == (5, 9)
     # 章数极多时下限被托底为 3。
     low, high = s4_scriptwriter._chapter_beat_budget(20)
     assert low == 3 and high >= low
@@ -611,8 +616,8 @@ async def test_narrate_prompt_carries_beat_budget(tmp_path) -> None:
             series_dir, 2, client, model="qwen-plus", episode_id="wt_test_ep_002"
         )
     narrate_request = route.calls[2].request.content.decode("utf-8")
-    # 单章预算即全话预算 30~65。
-    assert "30~65 条" in narrate_request
+    # 单章预算即全话预算 35~50（Patch v3.1 Patch 10 收紧）。
+    assert "35~50 条" in narrate_request
     assert "本章解说条数预算" in narrate_request
 
 
@@ -750,6 +755,78 @@ async def test_long_episode_is_split_into_batches_with_global_beat_ids(tmp_path)
         "panel_011",
         "panel_022",
     ]
+
+
+@pytest.mark.anyio
+@respx.mock
+async def test_chapter_with_45_panels_is_not_split_under_new_limit(tmp_path) -> None:
+    """Patch v3.0 小修：CHAPTER_MAX_PANELS 40→120。
+
+    旧上限下 45 格的单章被切成两批 4B，而两批 prompt 都带着同一份
+    chapter.story_prose，等于把同一段故事讲两遍。新上限内必须一次调用讲完。
+    """
+    assert s4_scriptwriter.CHAPTER_MAX_PANELS == 120
+    series_dir = _make_series(tmp_path)
+    vision_dir = series_dir / "episodes" / "ep_002" / "03_vision"
+    panel_ids = [f"panel_{index:03d}" for index in range(1, 46)]
+    save_model(
+        VisionWindowOutput.model_validate(
+            {
+                "panels": [
+                    {
+                        "panel_id": panel_id,
+                        "scene_summary": f"画面{index}",
+                        "dialogues": [],
+                        "sfx_list": [],
+                    }
+                    for index, panel_id in enumerate(panel_ids, start=1)
+                ]
+            }
+        ),
+        vision_dir / "vision.json",
+    )
+    story_payload = {
+        "episode_id": "wt_test_ep_002",
+        "hook_opening": "雨夜有人敲门，来者不善。",
+        "full_story_markdown": "## 第一章 · 整章\n\n一整章的故事。",
+        "chapters": [
+            {
+                "chapter_index": 1,
+                "chapter_title": "第一章 · 整章",
+                "panel_hint_range": ["panel_001", "panel_045"],
+                "story_prose": "四十五格只讲这一遍的完整故事。",
+            }
+        ],
+    }
+    route = respx.post(CHAT_URL).mock(
+        side_effect=_dispatch(
+            overview=[
+                _script_response(json.dumps(_overview_payload(), ensure_ascii=False))
+            ],
+            story=[
+                _script_response(json.dumps(story_payload, ensure_ascii=False))
+            ],
+            # 只准备一个 4B 响应：若被错误切片，第二次调用会取同一个响应，
+            # 但 call_count 与请求内容断言仍会抓住切片行为。
+            beats=[
+                _script_response(
+                    json.dumps(
+                        _beats_payload(["panel_001", "panel_045"]), ensure_ascii=False
+                    )
+                )
+            ],
+        )
+    )
+    async with BailianClient(api_key="sk-test", sleep=_no_sleep) as client:
+        await s4_scriptwriter.run_stage4(
+            series_dir, 2, client, model="qwen-plus", episode_id="wt_test_ep_002"
+        )
+    # 1 概览 + 1 故事反写 + 1 次章节拆拍（旧逻辑会是 4 次：拆拍被切成两片）。
+    assert route.call_count == 3
+    narrate_request = route.calls[2].request.content.decode("utf-8")
+    # 唯一一次 4B 调用必须看得到整章首尾分镜，故事正文也只出现这一次。
+    assert "panel_001" in narrate_request and "panel_045" in narrate_request
+    assert narrate_request.count("四十五格只讲这一遍的完整故事") == 1
 
 
 @pytest.mark.anyio
@@ -1432,3 +1509,311 @@ async def test_persistent_reverse_is_clamped_after_retries(tmp_path, capsys) -> 
         == []
     )
     assert "顺位钳制" in capsys.readouterr().err
+
+
+# ===========================================================================
+# Patch v3.1 Patch 10：纯字卡标记 / speaker_role / sfx_cue / 旧 JSON 兼容
+# ===========================================================================
+
+
+def _prompt_of(call) -> str:
+    """从一次 LLM 请求体里取出最后一条消息的 prompt 文本（真实换行）。"""
+    body = json.loads(call.request.content.decode("utf-8"))
+    return body["messages"][-1]["content"]
+
+
+def _write_vision_with_pure_text_card(series_dir: Path, episode_no: int = 2) -> Path:
+    """铺一份 3 格 vision.json。
+
+    * ``panel_001``：普通剧情格；
+    * ``panel_002``：纯字卡（白底黑字、无人物动作），``is_pure_text_card=True``；
+    * ``panel_003``：超窄过渡条，``is_transition_blank=True`` 且 ``non_story_type``
+      仍是 ``none``——必须靠 ``is_transition_blank`` 这一个标记被滤掉。
+    """
+    vision_dir = series_dir / "episodes" / f"ep_{episode_no:03d}" / "03_vision"
+    vision_dir.mkdir(parents=True, exist_ok=True)
+    vision_path = vision_dir / "vision.json"
+    save_model(
+        VisionWindowOutput.model_validate(
+            {
+                "panels": [
+                    {
+                        "panel_id": "panel_001",
+                        "scene_summary": "雨夜街头，少年攥紧信纸",
+                        "dialogues": [],
+                        "sfx_list": [],
+                    },
+                    {
+                        "panel_id": "panel_002",
+                        "scene_summary": "白底黑字卡：倒计时三分钟",
+                        "dialogues": [],
+                        "sfx_list": [],
+                        "is_pure_text_card": True,
+                    },
+                    {
+                        "panel_id": "panel_003",
+                        "scene_summary": "细窄黑色过渡条",
+                        "dialogues": [],
+                        "sfx_list": [],
+                        "is_transition_blank": True,
+                        "non_story_type": "none",
+                    },
+                ]
+            }
+        ),
+        vision_path,
+    )
+    return vision_path
+
+
+@pytest.mark.anyio
+@respx.mock
+async def test_pure_text_card_is_marked_and_transition_blank_filtered(tmp_path) -> None:
+    """Patch v3.1 Patch 10 验收一。
+
+    给 4B 的候选面板摘要必须给 ``is_pure_text_card=True`` 的分镜标上
+    ``[纯字卡]``（提示模型跳过这类白底黑字 PPT 格），同时
+    ``is_transition_blank=True`` 的窄条不得出现在任何一段请求里。
+    """
+    series_dir = _make_series(tmp_path)
+    _write_vision_with_pure_text_card(series_dir)
+    route = respx.post(CHAT_URL).mock(
+        side_effect=_dispatch(
+            overview=[
+                _script_response(json.dumps(_overview_payload(), ensure_ascii=False))
+            ],
+            story=[
+                _script_response(
+                    json.dumps(_story_payload(["panel_001", "panel_002"]), ensure_ascii=False)
+                )
+            ],
+            beats=[
+                _script_response(
+                    json.dumps(
+                        _beats_payload(["panel_001", "panel_002"]), ensure_ascii=False
+                    )
+                )
+            ],
+        )
+    )
+    async with BailianClient(api_key="sk-test", sleep=_no_sleep) as client:
+        script, _path = await s4_scriptwriter.run_stage4(
+            series_dir, 2, client, model="qwen-plus", episode_id="wt_test_ep_002"
+        )
+    assert route.call_count == 3
+    # 过渡窄条三段都看不到（write_episode_script 的硬过滤 + _format_panel_ids 兜底）。
+    prompts = [_prompt_of(call) for call in route.calls]
+    for prompt in prompts:
+        assert "panel_003" not in prompt
+    # 4B 的候选清单里，纯字卡分镜带 [纯字卡] 标记，普通格不带。
+    narrate_prompt = prompts[2]
+    card_line = next(
+        line for line in narrate_prompt.splitlines() if line.startswith("- panel_002：")
+    )
+    assert "[纯字卡]" in card_line
+    plain_line = next(
+        line for line in narrate_prompt.splitlines() if line.startswith("- panel_001：")
+    )
+    assert "[纯字卡]" not in plain_line
+    # 剧本里也不会引用被滤掉的窄条。
+    referenced = {
+        panel_id for beat in script.beats for panel_id in beat.target_panel_ids
+    }
+    assert "panel_003" not in referenced
+
+
+def test_format_panel_ids_filters_transition_blank_and_marks_text_card() -> None:
+    """``_format_panel_ids`` 的兜底过滤：窄条剔除、纯字卡打标。"""
+    panel_map = {
+        "panel_001": PanelVisionInfo.model_validate(
+            {"panel_id": "panel_001", "scene_summary": "雨夜街头", "dialogues": []}
+        ),
+        "panel_002": PanelVisionInfo.model_validate(
+            {
+                "panel_id": "panel_002",
+                "scene_summary": "白底黑字卡",
+                "dialogues": [],
+                "is_pure_text_card": True,
+            }
+        ),
+        "panel_003": PanelVisionInfo.model_validate(
+            {
+                "panel_id": "panel_003",
+                "scene_summary": "细窄过渡条",
+                "dialogues": [],
+                "is_transition_blank": True,
+            }
+        ),
+    }
+    rendered = s4_scriptwriter._format_panel_ids(
+        ["panel_001", "panel_002", "panel_003"], panel_map
+    )
+    assert "- panel_001：" in rendered
+    assert "- panel_002： [纯字卡] 白底黑字卡" in rendered
+    assert "panel_003" not in rendered
+
+
+def test_script_beat_parses_speaker_role_and_sfx_cue() -> None:
+    """Patch v3.1 Patch 10 验收二：新字段能正常解析。"""
+    beat = ScriptBeat.model_validate(
+        {
+            "beat_id": "b1",
+            "narration_text": "道玄把伞递过去，声音压得很低。",
+            "target_panel_ids": ["panel_001"],
+            "speaker_role": "male_lead",
+            "sfx_cue": "heart_thump",
+        }
+    )
+    assert beat.speaker_role == "male_lead"
+    assert beat.sfx_cue == "heart_thump"
+
+
+def test_legacy_script_json_without_sfx_cue_deserializes(tmp_path) -> None:
+    """Patch v3.1 Patch 10 验收二后半：旧版 script.json 零报错反序列化。"""
+    legacy_path = tmp_path / "script.json"
+    legacy_path.write_text(_script_payload(), encoding="utf-8")
+    script = load_model(NarrationScript, legacy_path)
+    assert len(script.beats) == 2
+    # 新字段走默认值，缺失不报错。
+    assert all(beat.sfx_cue is None for beat in script.beats)
+    assert all(beat.speaker_role == "narrator" for beat in script.beats)
+
+
+def test_normalize_script_payload_converges_sfx_cue_and_speaker_role() -> None:
+    """sfx_cue 走白名单收敛（大小写不敏感），speaker_role 缺省 narrator。"""
+    payload = {
+        "hook_title": "雨夜来客",
+        "beats": [
+            {
+                "narration_text": "他攥紧信纸，指节发白。",
+                "target_panel_ids": ["panel_001"],
+                "sfx_cue": "heart_thump",
+            },
+            {
+                "narration_text": "门被猛地推开，她后退半步。",
+                "target_panel_ids": ["panel_002"],
+                "sfx_cue": "DOOR_SLAM",
+                "speaker_role": "female_lead",
+            },
+            {
+                "narration_text": "远处传来一阵脚步声。",
+                "target_panel_ids": ["panel_003"],
+                "sfx_cue": "not_a_real_key",
+            },
+            {
+                "narration_text": "雨声渐渐停了。",
+                "target_panel_ids": ["panel_001"],
+                "sfx_cue": "none",
+            },
+        ],
+        "episode_digest": {"one_line_hook": "钩子", "summary": "概要"},
+    }
+    normalized = normalize_script_payload(
+        payload,
+        episode_id="wt_test_ep_002",
+        episode_no=2,
+        valid_panel_ids={"panel_001", "panel_002", "panel_003"},
+    )
+    cues = [beat["sfx_cue"] for beat in normalized["beats"]]
+    assert cues == ["heart_thump", "door_slam", None, None]
+    roles = [beat["speaker_role"] for beat in normalized["beats"]]
+    assert roles == ["narrator", "female_lead", "narrator", "narrator"]
+
+
+def test_render_timeline_legacy_json_stays_compatible() -> None:
+    """RenderTimeline 新增 sfx_events 后，旧 timeline.json 照常反序列化。"""
+    legacy = {
+        "episode_id": "wt_test_ep_002",
+        "total_duration_ms": 12000,
+        "scenes": [],
+        "audios": [],
+        "subtitles": [],
+    }
+    timeline = RenderTimeline.model_validate(legacy)
+    assert timeline.sfx_events == []
+    with_events = RenderTimeline.model_validate(
+        {
+            **legacy,
+            "sfx_events": [{"sfx_key": "heart_thump", "start_ms": 3000}],
+        }
+    )
+    assert with_events.sfx_events == [
+        SfxEvent(sfx_key="heart_thump", start_ms=3000, gain_db=-10.0)
+    ]
+
+
+def _tile_payload_v31(
+    *,
+    non_story_type: str = "none",
+    blank: bool = False,
+    dialogues: list[dict] | None = None,
+    pure_text_card: bool = False,
+    summary: str = "画面内容",
+) -> dict:
+    """构造一份切片视觉结果（Stage 3 合并用的最小载荷）。"""
+    return {
+        "scene_summary": summary,
+        "dialogues": dialogues or [],
+        "sfx_list": [],
+        "focus_region": None,
+        "is_transition_blank": blank,
+        "non_story_type": non_story_type,
+        "is_pure_text_card": pure_text_card,
+    }
+
+
+def _tile_v31(index: int, count: int, top: int, bottom: int, total: int = 1000):
+    return s3_vision.PanelTile(
+        image=Image.new("RGB", (320, bottom - top), (20, 20, 20)),
+        top=top,
+        bottom=bottom,
+        total_height=total,
+        index=index,
+        count=count,
+    )
+
+
+def test_merge_tile_payloads_marks_pure_text_card() -> None:
+    """Patch v3.1 Patch 10：切片合并时只有「全部纯字卡且无对白」才算纯字卡。
+
+    （Patch 10 的「仅修改」清单里只有 ``test_s4_scriptwriter.py``，
+    所以 Stage 3 的合并用例也放在这里。）
+    """
+    tile_a = _tile_v31(0, 2, 0, 500)
+    tile_b = _tile_v31(1, 2, 500, 1000)
+
+    merged = s3_vision._merge_tile_payloads(
+        "panel_002",
+        [
+            (tile_a, _tile_payload_v31(pure_text_card=True, summary="白底黑字卡上半")),
+            (tile_b, _tile_payload_v31(pure_text_card=True, summary="白底黑字卡下半")),
+        ],
+    )
+    assert merged["is_pure_text_card"] is True
+    assert merged["non_story_type"] == "none"
+
+    # 只要有一片不是纯字卡，整格就不算纯字卡。
+    mixed = s3_vision._merge_tile_payloads(
+        "panel_002",
+        [
+            (tile_a, _tile_payload_v31(pure_text_card=True)),
+            (tile_b, _tile_payload_v31(pure_text_card=False)),
+        ],
+    )
+    assert mixed["is_pure_text_card"] is False
+
+    # 有对白就不算纯字卡（纯字卡必然没有气泡）。
+    with_dialogue = s3_vision._merge_tile_payloads(
+        "panel_002",
+        [
+            (
+                tile_a,
+                _tile_payload_v31(
+                    pure_text_card=True,
+                    dialogues=[{"speaker_guess": "小白", "text": "谁寄的？"}],
+                ),
+            ),
+            (tile_b, _tile_payload_v31(pure_text_card=True)),
+        ],
+    )
+    assert with_dialogue["is_pure_text_card"] is False

@@ -15,11 +15,11 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image, ImageDraw
 
-from core.config import AppConfig, WorkspaceConfig
+from core.config import AppConfig, TTSConfig, WorkspaceConfig
 from core.schemas import NarrationScript, save_model
 from providers.llm_base import ChatResponse
 from web.job_runner import JobRunner
-from web.server import create_app
+from web.server import DEFAULT_TTS_VOICE, create_app
 
 # ---------------------------------------------------------------------------
 # 夹具
@@ -434,6 +434,38 @@ def test_get_config_returns_studio_shape(client: TestClient) -> None:
     assert "apiKey" not in payload
 
 
+def test_get_config_uses_tts_default_voice(client: TestClient) -> None:
+    """默认音色来自 ``config.tts.default_voice``（不再写死旧值）。"""
+    payload = client.get("/api/config").json()
+    assert payload["ttsVoice"] == "Elias"
+    assert DEFAULT_TTS_VOICE == "Elias"
+
+
+def test_get_config_prefers_configured_default_voice(workspace: Path) -> None:
+    """配置里改过 ``tts.default_voice`` 时，回显跟着变。"""
+    config = AppConfig(
+        workspace=WorkspaceConfig(root=workspace),
+        tts=TTSConfig(default_voice="Katerina"),
+    )
+    with TestClient(create_app(config)) as client:
+        payload = client.get("/api/config").json()
+    assert payload["ttsVoice"] == "Katerina"
+
+
+def test_get_config_lists_voice_options(client: TestClient) -> None:
+    """可选音色清单包含五个主音色（前端下拉用）。"""
+    payload = client.get("/api/config").json()
+    options = payload["ttsVoiceOptions"]
+    assert [item["id"] for item in options] == [
+        "Elias",
+        "Ethan",
+        "Ryan",
+        "Cherry",
+        "Katerina",
+    ]
+    assert all(item["label"] for item in options)
+
+
 def test_put_config_writes_file(client: TestClient, workspace: Path) -> None:
     response = client.put(
         "/api/config", json={"visionModel": "qwen3-vl-max", "bgmDuckingDb": -12.0}
@@ -443,6 +475,15 @@ def test_put_config_writes_file(client: TestClient, workspace: Path) -> None:
     saved = (workspace / "config.yaml").read_text("utf-8")
     assert "qwen3-vl-max" in saved
     assert "-12.0" in saved
+
+
+def test_put_config_persists_tts_voice(client: TestClient, workspace: Path) -> None:
+    """保存音色要落到 ``tts.default_voice``，回显随之变化。"""
+    response = client.put("/api/config", json={"ttsVoice": "Cherry"})
+    assert response.status_code == 200, response.text
+    assert response.json()["ttsVoice"] == "Cherry"
+    saved = (workspace / "config.yaml").read_text("utf-8")
+    assert "default_voice: Cherry" in saved
 
 
 def test_pronunciation_rules_round_trip(client: TestClient, workspace: Path) -> None:
@@ -687,3 +728,76 @@ async def test_failed_stage_is_marked_failed_in_state_and_manifest(
     assert "视觉模型炸了" in manifest["stages"]["s3_vision"]["error"]
     # 前一个阶段成功过，也要留下记录。
     assert manifest["stages"]["s1_crawler"]["status"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# Patch v3.0 小修：Web 控制台 Stage 4A 也必须走 story_model
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_job_runner_passes_default_story_model_to_stage4(
+    config: AppConfig, workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """无作品级覆盖时，4A 故事反写透传全局 config.models.story_model。"""
+    from stages import s0_catalog, s4_scriptwriter
+
+    source = _make_source(workspace, episodes=1)
+    catalog = s0_catalog.import_local_catalog(source)
+    s0_catalog.CatalogRegistry(workspace).register(catalog)
+
+    captured: dict[str, Any] = {}
+
+    async def fake_run_stage4(*args: Any, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return None, None
+
+    monkeypatch.setattr(s4_scriptwriter, "run_stage4", fake_run_stage4)
+
+    runner = JobRunner(config, client_factory=lambda: _StubLLM())
+    job = await runner.submit_episode(
+        catalog.series_id, 1, from_stage="s4_scriptwriter", mode="phase1_only"
+    )
+    await runner.wait_all()
+
+    state = runner.state(job["episode_id"])
+    assert state is not None and state.status == "done", state.error
+    assert captured["model"] == config.models.script
+    assert captured["story_model"] == config.models.story_model
+    assert captured["story_model"] == "qwen3.8-max"
+
+
+@pytest.mark.anyio
+async def test_job_runner_story_model_respects_series_override(
+    config: AppConfig, workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """series_config.yaml 的 model_overrides.story 优先于全局配置。"""
+    from stages import s0_catalog, s4_scriptwriter
+
+    source = _make_source(workspace, episodes=1)
+    catalog = s0_catalog.import_local_catalog(source)
+    registry = s0_catalog.CatalogRegistry(workspace)
+    registry.register(catalog)
+    (workspace / catalog.series_id / "series_config.yaml").write_text(
+        "model_overrides:\n  story: custom-story-model\n", encoding="utf-8"
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def fake_run_stage4(*args: Any, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return None, None
+
+    monkeypatch.setattr(s4_scriptwriter, "run_stage4", fake_run_stage4)
+
+    runner = JobRunner(config, client_factory=lambda: _StubLLM())
+    job = await runner.submit_episode(
+        catalog.series_id, 1, from_stage="s4_scriptwriter", mode="phase1_only"
+    )
+    await runner.wait_all()
+
+    state = runner.state(job["episode_id"])
+    assert state is not None and state.status == "done", state.error
+    assert captured["story_model"] == "custom-story-model"
+    # script model 不受 story 覆盖影响。
+    assert captured["model"] == config.models.script

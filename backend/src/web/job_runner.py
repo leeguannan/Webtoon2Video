@@ -20,7 +20,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 
-from core.config import AppConfig, load_series_config, merge_pronunciation_overrides
+from core.config import (
+    AppConfig,
+    load_series_config,
+    merge_pronunciation_overrides,
+    merge_voice_cast,
+)
 from core.manifest import STAGE_DIR_NAMES, ManifestManager
 from core.memory import StoryBibleManager
 from core.schemas import NarrationScript, load_model
@@ -350,6 +355,12 @@ class JobRunner:
         series_config = load_series_config(series_dir)
         vision_model = series_config.model_overrides.get("vision", self.config.models.vision)
         script_model = series_config.model_overrides.get("script", self.config.models.script)
+        # 与 cli.py 同口径：4A 故事反写走 story_model（默认 qwen3.8-max），
+        # 作品级覆盖缺省时回落到全局配置，再缺省回落到 script_model。
+        story_model = (
+            series_config.model_overrides.get("story", self.config.models.story_model)
+            or script_model
+        )
 
         llm_client: Any = None
         tts_client: Any = None
@@ -372,6 +383,7 @@ class JobRunner:
                     tts_client=tts_client,
                     vision_model=vision_model,
                     script_model=script_model,
+                    story_model=story_model,
                     series_title=catalog.series_title,
                 )
             state.status = "done"
@@ -404,6 +416,7 @@ class JobRunner:
         tts_client: Any,
         vision_model: str,
         script_model: str,
+        story_model: str,
         series_title: str,
     ) -> None:
         state.current_stage = stage
@@ -442,7 +455,14 @@ class JobRunner:
                 )
             elif stage == "s4_scriptwriter":
                 await self._stage_script(
-                    state, series_dir, episode, manager, llm_client, script_model, series_title
+                    state,
+                    series_dir,
+                    episode,
+                    manager,
+                    llm_client,
+                    script_model,
+                    story_model,
+                    series_title,
                 )
             elif stage == "s5_tts":
                 await self._stage_tts(state, series_dir, episode, tts_client)
@@ -545,6 +565,7 @@ class JobRunner:
         manager: StoryBibleManager,
         llm_client: Any,
         script_model: str,
+        story_model: str,
         series_title: str,
     ) -> None:
         """Stage 4：必须按话升序 + 部级互斥锁执行（防剧透与写入竞态）。"""
@@ -558,6 +579,7 @@ class JobRunner:
                 episode.episode_no,
                 llm_client,
                 model=script_model,
+                story_model=story_model,
                 episode_id=episode.episode_id,
                 series_title=series_title,
                 manager=manager,
@@ -569,9 +591,14 @@ class JobRunner:
     async def _stage_tts(
         self, state: EpisodeState, series_dir: Path, episode: Any, tts_client: Any
     ) -> None:
+        series_config = load_series_config(series_dir)
         overrides = merge_pronunciation_overrides(
             dict(self.config.pronunciation_overrides),
-            dict(load_series_config(series_dir).pronunciation_overrides),
+            dict(series_config.pronunciation_overrides),
+        )
+        # Patch v3.1 Patch 11 A2/A3：作品级角色音色覆盖全局。
+        voice_cast = merge_voice_cast(
+            self.config.tts.voice_cast, series_config.voice_cast
         )
         script_path = (
             series_dir
@@ -587,6 +614,8 @@ class JobRunner:
             tts_client,
             script=script,
             overrides=overrides,
+            default_voice=self.config.tts.default_voice,
+            voice_cast=voice_cast,
             concurrency=self.config.concurrency.stage,
             ffmpeg_bin=self.config.render.ffmpeg_bin,
         )
@@ -602,7 +631,8 @@ class JobRunner:
         return QwenTTS(
             base_url=self.config.api.base_url,
             model=self.config.models.tts,
-            voice=DEFAULT_VOICE,
+            # Patch v3.1 Patch 11 A1/A2：默认音色来自 ``config.tts.default_voice``。
+            voice=self.config.tts.default_voice or DEFAULT_VOICE,
             timeout_s=self.config.api.timeout_s,
         )
 

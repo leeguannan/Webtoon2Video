@@ -61,15 +61,27 @@ from core.schemas import (
     load_model,
     save_model,
 )
+from providers.tts_qwen import DEFAULT_VOICE
 from stages import s0_catalog, s6_timeline, s7_renderer
 from web.job_runner import STAGE_DEFS, EpisodeState, JobError, JobRunner
 
 #: 面板图片后缀。
 PANEL_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp"})
 
-#: 前端 ``StudioConfig`` 的默认值（对应 ``src/data/mockStudioData.ts``）。
-DEFAULT_TTS_VOICE = "Cherry"
+#: 前端 ``StudioConfig`` 的默认音色（对应 ``src/data/mockStudioData.ts``）。
+#: Patch v3.1 Patch 11 A1：直接取 provider 的系统默认音色（``Elias``），不再写死旧值。
+DEFAULT_TTS_VOICE = DEFAULT_VOICE
 DEFAULT_MAX_IMAGE_LONG_EDGE = 1280
+
+#: 可选音色清单（前端下拉展示用）：音色 ID → 中文说明。
+#: Patch v3.1 Patch 11 A1：与 ``core.config.TTSConfig.voice_cast`` 的五个主音色一致。
+TTS_VOICE_OPTIONS: tuple[dict[str, str], ...] = (
+    {"id": "Elias", "label": "墨讲师（男声旁白）"},
+    {"id": "Ethan", "label": "晨煦（年轻男主）"},
+    {"id": "Ryan", "label": "甜茶（戏剧男声）"},
+    {"id": "Cherry", "label": "芊悦（年轻女主）"},
+    {"id": "Katerina", "label": "卡捷琳娜（成熟女声）"},
+)
 
 
 # ---------------------------------------------------------------------------
@@ -789,6 +801,7 @@ def create_app(
         api = dict(data.get("api") or {})
         models = dict(data.get("models") or {})
         render = dict(data.get("render") or {})
+        tts = dict(data.get("tts") or {})
         if payload.bailianBaseUrl:
             api["base_url"] = payload.bailianBaseUrl
         if payload.timeoutS is not None:
@@ -803,12 +816,18 @@ def create_app(
             models["tts"] = payload.ttsModel
         if payload.bgmDuckingDb is not None:
             render["bgm_gain_db"] = float(payload.bgmDuckingDb)
+        if payload.ttsVoice:
+            # Patch v3.1 Patch 11 A2：默认音色落在 ``tts.default_voice``，
+            # 与 ``GET /api/config`` 的回显口径保持一致（保留已有 voice_cast）。
+            tts["default_voice"] = payload.ttsVoice
         if api:
             data["api"] = api
         if models:
             data["models"] = models
         if render:
             data["render"] = render
+        if tts:
+            data["tts"] = tts
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
             yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8"
@@ -893,7 +912,11 @@ def _config_payload(config: AppConfig) -> dict[str, Any]:
         "visionModel": config.models.vision,
         "scriptModel": config.models.script,
         "ttsModel": config.models.tts,
-        "ttsVoice": DEFAULT_TTS_VOICE,
+        # Patch v3.1 Patch 11 A1/A2：默认音色来自 ``config.tts.default_voice``，
+        # 没有配置时退回 provider 的系统默认音色（``Elias``）。
+        "ttsVoice": config.tts.default_voice or DEFAULT_TTS_VOICE,
+        # Patch v3.1 Patch 11 A1：可选音色清单，供前端下拉展示。
+        "ttsVoiceOptions": [dict(item) for item in TTS_VOICE_OPTIONS],
         "maxImageLongEdge": DEFAULT_MAX_IMAGE_LONG_EDGE,
         "aspectRatio": config.video.aspect_ratio,
         "bgmDuckingDb": config.render.bgm_gain_db,

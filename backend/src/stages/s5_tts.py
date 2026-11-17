@@ -44,6 +44,7 @@ __all__ = [
     "audio_dir_for",
     "build_spoken_text",
     "load_audio_manifest",
+    "resolve_beat_voice",
     "run_stage5",
     "synthesize_episode",
 ]
@@ -291,6 +292,40 @@ async def _trim_silence(
 # ----------------------------------------------------------------------
 # 合成
 # ----------------------------------------------------------------------
+def resolve_beat_voice(
+    beat: ScriptBeat,
+    *,
+    default_voice: str | None = None,
+    voice_cast: Mapping[str, str] | None = None,
+) -> str | None:
+    """按 ``beat.speaker_role`` 查角色音色表（Patch v3.1 Patch 11 A3）。
+
+    查表顺序：
+
+    1. 角色名精确匹配 ``voice_cast``；
+    2. 角色名小写后匹配（容忍 ``Male_Lead`` / ``male_lead`` 混写）；
+    3. 都没命中 → 回退 ``voice_cast["narrator"]``，再回退 ``default_voice``。
+
+    ``voice_cast`` 为空时不改变既有行为（返回 ``default_voice`` 或 ``None``，
+    由 provider 决定默认音色）。
+    """
+    cast = {
+        str(key): str(value)
+        for key, value in (voice_cast or {}).items()
+        if str(key).strip() and str(value).strip()
+    }
+    role = str(getattr(beat, "speaker_role", "") or "").strip()
+    if role and cast:
+        if role in cast:
+            return cast[role]
+        lowered = role.lower()
+        for key, value in cast.items():
+            if key.lower() == lowered:
+                return value
+    fallback = cast.get("narrator") or default_voice
+    return fallback or None
+
+
 async def _synthesize_beat(
     client: Any,
     beat: ScriptBeat,
@@ -298,6 +333,8 @@ async def _synthesize_beat(
     audio_dir: Path,
     overrides: Mapping[str, str] | None,
     voice: str | None,
+    default_voice: str | None = None,
+    voice_cast: Mapping[str, str] | None = None,
     ffmpeg_bin: str,
     trim_silence: bool,
 ) -> tuple[AudioClipMeta | None, list[_Issue]]:
@@ -309,9 +346,19 @@ async def _synthesize_beat(
         return None, issues
 
     extra: dict[str, Any] = {}
-    if voice:
-        # 只有显式指定音色才覆盖，否则让 provider 用自己的默认音色。
-        extra["voice"] = voice
+    # 显式指定的音色优先（命令行 ``--voice`` / Web 单音覆盖）；
+    # 否则按 speaker_role 查角色音色表（Patch v3.1 Patch 11 A3）。
+    beat_voice = voice or resolve_beat_voice(
+        beat, default_voice=default_voice, voice_cast=voice_cast
+    )
+    if beat_voice:
+        extra["voice"] = beat_voice
+        logger.info(
+            "[s5_tts] %s：speaker_role=%s → 音色 %s",
+            beat.beat_id,
+            getattr(beat, "speaker_role", "") or "narrator",
+            beat_voice,
+        )
     try:
         result: TTSResult = await client.synthesize(
             spoken,
@@ -368,6 +415,8 @@ async def synthesize_episode(
     audio_dir: Path,
     overrides: Mapping[str, str] | None = None,
     voice: str | None = None,
+    default_voice: str | None = None,
+    voice_cast: Mapping[str, str] | None = None,
     concurrency: int = 4,
     ffmpeg_bin: str = "ffmpeg",
     trim_silence: bool = True,
@@ -376,7 +425,8 @@ async def synthesize_episode(
 
     * 单条 beat 失败只记录问题并跳过；**全部**失败才抛 :class:`TTSStageError`。
     * ``overrides`` 是发音词典，只作用于送音文本。
-    * ``voice`` 为 ``None`` 时不覆盖 provider 的默认音色。
+    * ``voice`` 为显式指定音色（优先）；否则按 ``beat.speaker_role`` 查
+      ``voice_cast``，再回退 ``default_voice``（Patch v3.1 Patch 11 A3）。
     """
     if not script.beats:
         raise TTSStageError("剧本里没有任何 beat，无法合成音频")
@@ -397,6 +447,8 @@ async def synthesize_episode(
                 audio_dir=target_dir,
                 overrides=overrides,
                 voice=voice,
+                default_voice=default_voice,
+                voice_cast=voice_cast,
                 ffmpeg_bin=ffmpeg_bin,
                 trim_silence=trim_silence,
             )
@@ -453,6 +505,8 @@ async def run_stage5(
     script: NarrationScript | None = None,
     overrides: Mapping[str, str] | None = None,
     voice: str | None = None,
+    default_voice: str | None = None,
+    voice_cast: Mapping[str, str] | None = None,
     concurrency: int = 4,
     ffmpeg_bin: str = "ffmpeg",
     trim_silence: bool = True,
@@ -461,6 +515,9 @@ async def run_stage5(
 
     ``script`` 为 ``None`` 时从 ``04_script/script.json`` 读取；文件不存在直接报错
     （Stage 5 的输入只能是 Stage 4 的产物，不能凭空造稿）。
+
+    ``voice`` 是显式音色；``voice_cast`` 是角色音色表；``default_voice`` 是兜底音色
+    （Patch v3.1 Patch 11 A3）。
     """
     series_root = Path(series_dir)
     script_path = series_root / "episodes" / f"ep_{episode_no:03d}" / "04_script" / "script.json"
@@ -479,6 +536,8 @@ async def run_stage5(
         audio_dir=audio_dir,
         overrides=overrides,
         voice=voice,
+        default_voice=default_voice,
+        voice_cast=voice_cast,
         concurrency=concurrency,
         ffmpeg_bin=ffmpeg_bin,
         trim_silence=trim_silence,

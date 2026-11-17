@@ -94,6 +94,33 @@ class RenderConfig(_StrictModel):
     background_blur: int = 40
     background_darken: float = 0.55
     bgm_gain_db: float = -18.0
+    #: Patch v3.1 Patch 11 B4：没有显式 BGM 时是否自动挂载默认氛围音乐。
+    auto_bgm: bool = True
+    #: Patch v3.1 Patch 11 B4：默认氛围音乐名（对应 ``assets/bgm/{name}.*``）。
+    default_bgm: str = "suspense"
+    #: Patch v3.1 Patch 11 B3/B4：是否把时间轴里的音效事件混进音轨。
+    enable_sfx: bool = True
+    #: Patch v3.1 Patch 11 B4：音效相对人声的增益（dB）。
+    sfx_gain_db: float = -10.0
+
+
+class TTSConfig(_StrictModel):
+    """Stage 5 配音参数（Patch v3.1 Patch 11 A2）。"""
+
+    #: 默认旁白音色（百炼系统音色 ID）。
+    default_voice: str = "Elias"
+    #: 角色 → 音色的映射表；键是 ``beat.speaker_role``（见 ``script_narrate.md``）。
+    voice_cast: dict[str, str] = Field(
+        default_factory=lambda: {
+            "narrator": "Elias",
+            "male_lead": "Ethan",
+            "male_antagonist": "Ryan",
+            "female_lead": "Cherry",
+            "female_mature": "Katerina",
+            "male": "Ethan",
+            "female": "Cherry",
+        }
+    )
 
 
 class ConcurrencyConfig(_StrictModel):
@@ -111,6 +138,7 @@ class AppConfig(_StrictModel):
     models: ModelConfig = ModelConfig()
     video: VideoConfig = VideoConfig()
     render: RenderConfig = RenderConfig()
+    tts: TTSConfig = TTSConfig()
     concurrency: ConcurrencyConfig = ConcurrencyConfig()
     pronunciation_overrides: dict[str, str] = Field(default_factory=dict)
 
@@ -130,11 +158,22 @@ class SeriesConfig(_StrictModel):
     bgm: str | None = None
     model_overrides: dict[str, str] = Field(default_factory=dict)
     pronunciation_overrides: dict[str, str] = Field(default_factory=dict)
+    #: Patch v3.1 Patch 11 A2：作品级角色音色覆盖（优先于全局 ``tts.voice_cast``）。
+    voice_cast: dict[str, str] = Field(default_factory=dict)
 
 
 def _package_root() -> Path:
     """backend 根目录（``backend/src/core/config.py`` → ``backend/``）。"""
     return Path(__file__).resolve().parents[2]
+
+
+def assets_root() -> Path:
+    """零版权素材目录（``backend/assets/``）。
+
+    Patch v3.1 Patch 11 B：Stage 7 的默认 BGM 与音效都从这里找，
+    ``backend/scripts/init_audio_assets.py`` 也往这里生成素材。
+    """
+    return _package_root() / "assets"
 
 
 def _load_yaml_mapping(path: Path) -> dict[str, Any]:
@@ -225,6 +264,19 @@ def merge_pronunciation_overrides(
     """合并全局与作品级发音词典，作品级优先。"""
     merged = dict(global_overrides)
     merged.update(series_overrides)
+    return merged
+
+
+def merge_voice_cast(
+    global_cast: Mapping[str, str],
+    series_cast: Mapping[str, str],
+) -> dict[str, str]:
+    """合并全局与作品级角色音色表（Patch v3.1 Patch 11 A2/A3）。
+
+    作品级优先：同一 ``speaker_role`` 在作品级出现时覆盖全局值。
+    """
+    merged = dict(global_cast)
+    merged.update(series_cast)
     return merged
 
 

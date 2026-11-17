@@ -35,6 +35,7 @@ from core.schemas import (
     NarrationScript,
     PanelMeta,
     RenderTimeline,
+    SfxEvent,
     SubtitleLine,
     TimelineScene,
     VisionWindowOutput,
@@ -104,6 +105,28 @@ FOCUS_BANDS: dict[str, tuple[float, float, float, float]] = {
 #: 尾部数字（``panel_001`` / ``ep_001_p001`` / ``p001`` → 1）。
 #: 统一走 :mod:`core.panel_ids`，Stage 4 的顺位校验用同一套规则。
 _TRAILING_NUMBER = re.compile(r"(\d+)\s*$")
+
+# --------------------------------------------------------------------------
+# 音效事件（Patch v3.1 Patch 11 B3）
+# --------------------------------------------------------------------------
+#: 任意两条音效事件之间的最小间隔（毫秒）。
+#:
+#: 为什么要有下限：音效是「点睛」，不是「背景」；一话里连着响会把解说压没。
+SFX_MIN_GAP_MS = 6000
+
+#: 单话音效事件数量上限。
+SFX_MAX_EVENTS = 8
+
+#: 保守关键词 → 音效键的兜底映射（只认 Stage 3 明确写出的音效描述）。
+#:
+#: 只在 beat 没写 ``sfx_cue`` 时启用，且必须命中关键词才触发，
+#: 避免把普通画面描述（如「安静的走廊」）误判成音效。
+SFX_KEYWORD_MAP: dict[str, tuple[str, ...]] = {
+    "heart_thump": ("心驚", "心跳", "心悸", "驚", "惊"),
+    "phone_msg": ("短信", "消息", "叮", "鈴", "铃"),
+    "door_slam": ("关门", "關門", "摔门", "砰", "啪"),
+    "footstep": ("脚步", "腳步", "踏", "咚"),
+}
 
 
 class TimelineError(RuntimeError):
@@ -467,6 +490,99 @@ def load_focus_regions(
 
 
 # --------------------------------------------------------------------------
+# 音效事件（Patch v3.1 Patch 11 B3）
+# --------------------------------------------------------------------------
+def load_panel_sfx_lists(
+    series_dir: str | Path, episode_no: int
+) -> dict[str, list[str]]:
+    """读取 Stage 3 的 ``sfx_list``（可选，缺失就返回空映射）。
+
+    这是音效事件的**兜底**来源：beat 自己没写 ``sfx_cue`` 时，
+    才来这里按保守关键词猜（Patch v3.1 Patch 11 B3）。
+    """
+    path = vision_path_for(series_dir, episode_no)
+    if not path.is_file():
+        return {}
+    try:
+        vision = load_model(VisionWindowOutput, path)
+    except Exception:
+        return {}
+    result: dict[str, list[str]] = {}
+    for panel in vision.panels:
+        items = [
+            str(item)
+            for item in (getattr(panel, "sfx_list", None) or [])
+            if str(item).strip()
+        ]
+        if items:
+            result[str(panel.panel_id)] = items
+    return result
+
+
+def resolve_sfx_key(
+    beat: Any,
+    panel_sfx_map: Mapping[str, Sequence[str]] | None = None,
+) -> str | None:
+    """决定某条 beat 触发哪个音效（Patch v3.1 Patch 11 B3）。
+
+    主来源是 beat 自己写的 ``sfx_cue``；没写（或写成 ``none``）时，
+    才用画面 ``sfx_list`` 的关键词兜底，且必须命中关键词才触发。
+    """
+    cue = str(getattr(beat, "sfx_cue", "") or "").strip().lower()
+    if cue and cue != "none":
+        return cue
+    if not panel_sfx_map:
+        return None
+
+    resolver = PanelIdResolver(panel_sfx_map.keys())
+    for raw_id in getattr(beat, "target_panel_ids", []) or []:
+        panel_id = str(raw_id)
+        items = panel_sfx_map.get(panel_id)
+        if items is None:
+            canonical = resolver.resolve(panel_id)
+            items = panel_sfx_map.get(canonical) if canonical else None
+        if not items:
+            continue
+        for item in items:
+            text = str(item)
+            for key, keywords in SFX_KEYWORD_MAP.items():
+                if any(keyword in text for keyword in keywords):
+                    return key
+    return None
+
+
+def select_sfx_events(
+    candidates: Sequence[tuple[int, str]],
+    *,
+    min_gap_ms: int = SFX_MIN_GAP_MS,
+    max_events: int = SFX_MAX_EVENTS,
+) -> list[SfxEvent]:
+    """把候选音效按时间排序后做节流（最小间隔 + 数量上限）。
+
+    * 任意两条保留的事件间隔必须 ``>= min_gap_ms``（默认 6000ms）；
+    * 整话最多 ``max_events`` 条（默认 8 条）。
+
+    这两条限制保证音效是「点睛」而不是「背景」——连着响会把解说压没。
+    """
+    ordered = sorted(candidates, key=lambda item: (int(item[0]), str(item[1])))
+    events: list[SfxEvent] = []
+    last_start: int | None = None
+    limit = max(0, int(max_events))
+    for start_ms, key in ordered:
+        if len(events) >= limit:
+            break
+        name = str(key or "").strip().lower()
+        if not name or name == "none":
+            continue
+        start = int(start_ms)
+        if last_start is not None and start - last_start < int(min_gap_ms):
+            continue
+        events.append(SfxEvent(sfx_key=name, start_ms=start))
+        last_start = start
+    return events
+
+
+# --------------------------------------------------------------------------
 # 时间轴编排
 # --------------------------------------------------------------------------
 def build_timeline(
@@ -479,6 +595,7 @@ def build_timeline(
     height: int = DEFAULT_HEIGHT,
     fps: int = DEFAULT_FPS,
     focus_regions: Mapping[str, tuple[float, float, float, float]] | None = None,
+    panel_sfx_map: Mapping[str, Sequence[str]] | None = None,
 ) -> RenderTimeline:
     """按 Audio-First 规则编排时间轴。
 
@@ -630,6 +747,18 @@ def build_timeline(
 
     total_duration = last_end + last_pause if plans else 0
 
+    # ---- 音效事件（Patch v3.1 Patch 11 B3）----
+    # 主来源：beat.sfx_cue；兜底：画面 sfx_list 的保守关键词。
+    sfx_candidates: list[tuple[int, str]] = []
+    for plan in plans:
+        beat = plan["beat"]
+        if beat is None:
+            continue
+        key = resolve_sfx_key(beat, panel_sfx_map)
+        if key:
+            sfx_candidates.append((int(plan["start"]), key))
+    sfx_events = select_sfx_events(sfx_candidates)
+
     return RenderTimeline(
         episode_id=episode_id,
         width=width,
@@ -639,6 +768,7 @@ def build_timeline(
         scenes=scenes,
         audios=list(audios),
         subtitles=subtitles,
+        sfx_events=sfx_events,
     )
 
 
@@ -731,6 +861,8 @@ def build_timeline_from_workspace(
         )
 
     focus_regions = load_focus_regions(series_dir, episode_no)
+    # Patch v3.1 Patch 11 B3：画面音效描述（sfx_cue 缺失时的兜底来源）。
+    panel_sfx_map = load_panel_sfx_lists(series_dir, episode_no)
 
     return build_timeline(
         episode_id=str(script.episode_id or f"ep_{episode_no:03d}"),
@@ -741,6 +873,7 @@ def build_timeline_from_workspace(
         height=height,
         fps=fps,
         focus_regions=focus_regions,
+        panel_sfx_map=panel_sfx_map,
     )
 
 
@@ -924,6 +1057,9 @@ __all__ = [
     "ASS_FILENAME",
     "AUDIO_MANIFEST_FILENAME",
     "PLAN_DIR_NAME",
+    "SFX_KEYWORD_MAP",
+    "SFX_MAX_EVENTS",
+    "SFX_MIN_GAP_MS",
     "SUBTITLE_DIR_NAME",
     "TIMELINE_FILENAME",
     "TimelineError",
@@ -940,15 +1076,18 @@ __all__ = [
     "frames_to_ms",
     "load_audio_manifest",
     "load_focus_regions",
+    "load_panel_sfx_lists",
     "ms_to_frames",
     "panel_dir_for",
     "parse_audio_manifest",
     "plan_dir_for",
     "render_ass",
     "render_subtitle_pngs",
+    "resolve_sfx_key",
     "run_stage6",
     "scan_panels",
     "script_path_for",
+    "select_sfx_events",
     "subtitle_dir_for",
     "subtitle_png_path_for",
     "vision_path_for",

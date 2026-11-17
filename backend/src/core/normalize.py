@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Sequence
 
 # 与 ``core.schemas`` 保持一致的契约取值
@@ -29,6 +30,21 @@ MOTION_VALUES: tuple[str, ...] = (
     "shake",
 )
 PLOT_THREAD_STATUS: tuple[str, ...] = ("open", "resolved")
+
+#: Patch v3.1 Patch 10：标准音效触发标签白名单。
+#:
+#: Stage 4B 只在剧情高潮或明显物理动作点给 beat 标一个音效 key；Stage 6 据此
+#: 生成 :class:`core.schemas.SfxEvent`（全话最多 8 个、间隔 >= 6000ms），
+#: Stage 7 再去 ``assets/sfx/<sfx_key>.wav`` 取素材。非法值一律丢弃。
+SFX_CUE_KEYS: tuple[str, ...] = (
+    "heart_thump",
+    "door_slam",
+    "whoosh",
+    "gasp",
+    "phone_msg",
+    "footstep",
+    "crash",
+)
 
 # 契约里的长度上限
 MAX_NARRATION_CHARS = 120
@@ -158,6 +174,84 @@ def clip_text(value: str, limit: int = MAX_NARRATION_CHARS) -> str:
     return value if len(value) <= limit else value[:limit]
 
 
+# --------------------------------------------------------------------------
+# Patch v3.1 Patch 9：字幕 / TTS 字符净化
+# --------------------------------------------------------------------------
+#: 逐字符剔除的「字体缺失 / 无法发音」符号。
+#:
+#: 成片 03:46 出现过一个「☒」方块，根因是台词里带了 ``♥`` 这类装饰符号：
+#: 中文字体没有这些字形，字幕渲染画成豆腐块；TTS 则直接跳过该字符（读出来缺字）。
+HYGIENE_STRIP_CHARS = "♥♡❤❥★☆♪♫♬✦✧※☒☐□■◆◇●○"
+
+#: 整段剔除的 Unicode 区段（控制字符 / 零宽 / Emoji / 私用区 / 变体选择符）。
+HYGIENE_STRIP_RANGES: tuple[tuple[int, int], ...] = (
+    (0x0000, 0x0008),  # C0 控制字符（\t 与 \n 单独放行）
+    (0x000B, 0x000C),  # \v / \f
+    (0x000E, 0x001F),  # \r 及其后
+    (0x007F, 0x009F),  # DEL + C1 控制字符
+    (0x200B, 0x200D),  # 零宽空格 / ZWNJ / ZWJ
+    (0x2600, 0x27BF),  # Misc Symbols + Dingbats（★ ☆ ✓ ✗ …）
+    (0x2B00, 0x2BFF),  # Misc Symbols and Arrows（⭐ …）
+    (0x1F000, 0x1F2FF),  # 麻将 / 多米诺 / 扑克
+    (0x1F300, 0x1FAFF),  # Misc Symbols and Pictographs（绝大多数 Emoji）
+    (0xE000, 0xF8FF),  # Private Use Area（私用区）
+    (0xFE00, 0xFE0F),  # Variation Selectors（含 U+FE0F）
+    (0xFEFF, 0xFEFF),  # BOM / 零宽不换行空格
+)
+
+
+def _in_hygiene_range(code: int) -> bool:
+    """判断码位是否落在需要整体剔除的区段内。"""
+    for low, high in HYGIENE_STRIP_RANGES:
+        if low <= code <= high:
+            return True
+    return False
+
+
+def sanitize_narration_and_tts(text: str, *, for_tts: bool = False) -> str:
+    """清除会渲染成豆腐块「☒」或让 TTS 吞字的字符。
+
+    * 删除字体大概率缺失、且无法发音的装饰符号（``♥`` ``★`` ``☒`` …）；
+    * 删除 Emoji 区段、私用区字符与 ``U+FE0F`` 变体选择符；
+    * 归一化异常波浪号 / 破折号组合；``for_tts=True`` 时额外去掉末尾多余的
+      ``~``（合成时会读出怪音）。
+
+    参数
+    ----
+    text:
+        原始文本。
+    for_tts:
+        该文本是否会送进 TTS 合成（``tts_text``）。``True`` 时执行尾符清理；
+        ``False`` 时保留单个 ``~``（字幕里它还可能承担语气符号的作用）。
+    """
+    if not text:
+        return ""
+    kept: list[str] = []
+    for char in text:
+        if char in ("\n", "\t"):
+            kept.append(char)
+            continue
+        if char in HYGIENE_STRIP_CHARS:
+            continue
+        if _in_hygiene_range(ord(char)):
+            continue
+        kept.append(char)
+    cleaned = "".join(kept)
+    # 全角波浪号归一化成半角，后续统一按 "~" 处理。
+    cleaned = cleaned.replace("～", "~")
+    # 连续波浪号只留 1 个；连续破折号收敛成中文标准的一组「——」。
+    cleaned = re.sub(r"~{2,}", "~", cleaned)
+    cleaned = re.sub(r"—{3,}", "——", cleaned)
+    # 删掉符号后可能留下多余空白。
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"[ \t]*\n[ \t]*", "\n", cleaned)
+    cleaned = cleaned.strip()
+    if for_tts:
+        # 末尾多余的 "~" 会让合成读出怪音，直接去掉。
+        cleaned = cleaned.rstrip("~ ")
+    return cleaned
+
+
 def normalize_script_payload(
     payload: dict[str, Any],
     *,
@@ -179,6 +273,8 @@ def normalize_script_payload(
         if not isinstance(item, dict):
             continue
         narration = coerce_str(item.get("narration_text") or item.get("text"))
+        # Patch v3.1 Patch 9：进字幕 / TTS 之前先净化，杜绝「☒」方块与吞字。
+        narration = sanitize_narration_and_tts(narration)
         if len(narration) < MIN_NARRATION_CHARS:
             continue
         narration = clip_text(narration, MAX_NARRATION_CHARS)
@@ -192,7 +288,13 @@ def normalize_script_payload(
         tts_raw = item.get("tts_text")
         tts_text = coerce_str(tts_raw) if tts_raw is not None else None
         if tts_text is not None:
+            tts_text = sanitize_narration_and_tts(tts_text, for_tts=True)
             tts_text = clip_text(tts_text, MAX_NARRATION_CHARS) or None
+        # Patch v3.1 Patch 10：可选音效标签（白名单收敛，非法值 / "none" 丢弃）。
+        sfx_cue_raw = item.get("sfx_cue")
+        sfx_cue = coerce_str(sfx_cue_raw).lower() if sfx_cue_raw is not None else ""
+        if sfx_cue not in SFX_CUE_KEYS:
+            sfx_cue = None
         beats.append(
             {
                 "beat_id": coerce_str(item.get("beat_id")) or f"b{index}",
@@ -204,6 +306,7 @@ def normalize_script_payload(
                 "target_panel_ids": panel_ids,
                 "motion": normalize_enum(item.get("motion"), MOTION_VALUES, "zoom_in"),
                 "pause_after_ms": coerce_int(item.get("pause_after_ms"), 250, low=0, high=2000),
+                "sfx_cue": sfx_cue,
             }
         )
 
@@ -304,4 +407,6 @@ def normalize_panel_payload(payload: dict[str, Any], *, panel_id: str) -> dict[s
         "sfx_list": coerce_str_list(payload.get("sfx_list") or payload.get("sfx")),
         "focus_region": coerce_floats(payload.get("focus_region"), 4),
         "is_transition_blank": coerce_bool(payload.get("is_transition_blank")),
+        # Patch v3.1 Patch 10：纯字卡标记（只有文字框、没有人脸/肢体动作）。
+        "is_pure_text_card": coerce_bool(payload.get("is_pure_text_card")),
     }

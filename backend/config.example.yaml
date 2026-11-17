@@ -37,6 +37,28 @@ render:
   background_blur: 40
   background_darken: 0.55
   bgm_gain_db: -18.0
+  # 没有显式 BGM 时，自动挂载 assets/bgm/ 下的默认氛围音乐
+  auto_bgm: true
+  # 默认氛围音乐名（对应 assets/bgm/{default_bgm}.*）
+  default_bgm: suspense
+  # 是否把时间轴里的音效事件（sfx_events）混进音轨
+  enable_sfx: true
+  # 音效相对人声的增益（dB）
+  sfx_gain_db: -10.0
+
+tts:
+  # 主旁白音色（百炼系统音色 ID）
+  default_voice: Elias
+  # 角色 → 音色映射；键是解说句里的 speaker_role
+  # 作品级 series_config.yaml 的 voice_cast 可覆盖同名角色
+  voice_cast:
+    narrator: Elias
+    male_lead: Ethan
+    male_antagonist: Ryan
+    female_lead: Cherry
+    female_mature: Katerina
+    male: Ethan
+    female: Cherry
 
 concurrency:
   # 跨作品并发度

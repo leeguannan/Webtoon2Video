@@ -337,3 +337,103 @@ async def test_stage3_keeps_panel_id_from_filename(tmp_path) -> None:
     output = load_model(VisionWindowOutput, path)
     assert [panel.panel_id for panel in output.panels] == ["p_001"]
     assert route.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Patch v3.0 小修：超高画格切片合并的 sfx_only 整格判定
+# ---------------------------------------------------------------------------
+
+
+def _tile(index: int, count: int, top: int, bottom: int, total: int = 1000) -> s3_vision.PanelTile:
+    return s3_vision.PanelTile(
+        image=Image.new("RGB", (320, bottom - top), (20, 20, 20)),
+        top=top,
+        bottom=bottom,
+        total_height=total,
+        index=index,
+        count=count,
+    )
+
+
+def _tile_payload(
+    *,
+    non_story_type: str = "none",
+    blank: bool = False,
+    dialogues: list[dict] | None = None,
+    sfx: list[str] | None = None,
+    summary: str = "画面内容",
+) -> dict:
+    return {
+        "panel_id": "p_001",
+        "scene_summary": summary,
+        "dialogues": dialogues or [],
+        "sfx_list": sfx if sfx is not None else ["咚"],
+        "focus_region": [0.0, 0.0, 1.0, 1.0],
+        "is_transition_blank": blank,
+        "non_story_type": non_story_type,
+    }
+
+
+def test_merge_tiles_sfx_only_tail_does_not_drop_dialogue_panel() -> None:
+    """尾部一个 sfx_only 切片不能把前面带对白的超长画格整格误杀。"""
+    tiles = [
+        (
+            _tile(0, 2, 0, 500),
+            _tile_payload(
+                non_story_type="none",
+                dialogues=[{"speaker_guess": "小白", "text": "你终于来了"}],
+            ),
+        ),
+        (_tile(1, 2, 500, 1000), _tile_payload(non_story_type="sfx_only", sfx=["轰"])),
+    ]
+    merged = s3_vision._merge_tile_payloads("p_001", tiles)
+    assert merged["non_story_type"] == "none"
+    assert merged["dialogues"] and merged["dialogues"][0]["text"] == "你终于来了"
+
+
+def test_merge_tiles_all_sfx_and_no_dialogue_marks_sfx_only() -> None:
+    """所有有效切片都只剩拟声词且无对白，整格才标 sfx_only。"""
+    tiles = [
+        (_tile(0, 2, 0, 500), _tile_payload(non_story_type="sfx_only")),
+        (_tile(1, 2, 500, 1000), _tile_payload(non_story_type="sfx_only", sfx=["锵"])),
+    ]
+    merged = s3_vision._merge_tile_payloads("p_001", tiles)
+    assert merged["non_story_type"] == "sfx_only"
+    assert merged["dialogues"] == []
+
+
+def test_merge_tiles_blank_sfx_slice_excluded_from_all_check() -> None:
+    """空白切片不参与「全部 sfx_only」判定：一个空白 + 两个有效 sfx_only 仍是 sfx_only。"""
+    tiles = [
+        (_tile(0, 3, 0, 333), _tile_payload(non_story_type="sfx_only", blank=True)),
+        (_tile(1, 3, 333, 666), _tile_payload(non_story_type="sfx_only")),
+        (_tile(2, 3, 666, 1000), _tile_payload(non_story_type="sfx_only", sfx=["锵"])),
+    ]
+    merged = s3_vision._merge_tile_payloads("p_001", tiles)
+    assert merged["non_story_type"] == "sfx_only"
+
+
+def test_merge_tiles_sfx_label_with_dialogue_is_not_sfx_only() -> None:
+    """切片虽自报 sfx_only 但抽出了对白：合并后 dialogues 非空，整格按剧情格处理。"""
+    tiles = [
+        (
+            _tile(0, 1, 0, 1000),
+            _tile_payload(
+                non_story_type="sfx_only",
+                dialogues=[{"speaker_guess": "黑衣人", "text": "别追了"}],
+            ),
+        ),
+    ]
+    merged = s3_vision._merge_tile_payloads("p_001", tiles)
+    assert merged["non_story_type"] == "none"
+    assert merged["dialogues"]
+
+
+def test_merge_tiles_copyright_banner_still_wins() -> None:
+    """版权/推广页的强判定不受本次收紧影响：任一切片命中即整格命中。"""
+    tiles = [
+        (_tile(0, 2, 0, 500), _tile_payload(non_story_type="copyright_notice")),
+        (_tile(1, 2, 500, 1000), _tile_payload(non_story_type="sfx_only")),
+    ]
+    merged = s3_vision._merge_tile_payloads("p_001", tiles)
+    assert merged["non_story_type"] == "copyright_notice"

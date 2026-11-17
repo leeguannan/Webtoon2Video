@@ -38,8 +38,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from core.config import AppConfig, load_series_config
-from core.schemas import RenderTimeline, SubtitleLine, TimelineScene, load_model
+from core.config import AppConfig, assets_root, load_series_config
+from core.schemas import RenderTimeline, SfxEvent, SubtitleLine, TimelineScene, load_model
 
 #: Stage 7 输出目录名（对应 ``core.manifest.STAGE_DIR_NAMES["s7_renderer"]``）。
 OUT_DIR_NAME = "07_out"
@@ -102,6 +102,23 @@ _SIDECHAIN_RELEASE_MS = 200
 
 #: 错误信息里保留的 stderr 末尾长度（够定位问题，又不会把整份 ffmpeg 日志塞进异常）。
 _STDERR_TAIL_CHARS = 2000
+
+# --------------------------------------------------------------------------
+# Patch v3.1 Patch 11 B：零版权素材（默认 BGM / 音效）
+# --------------------------------------------------------------------------
+#: 同名素材的解析优先级：压缩率高的格式优先（``.mp3`` > ``.m4a`` > ``.wav`` > ``.ogg``）。
+ASSET_SUFFIX_PRIORITY: tuple[str, ...] = (".mp3", ".m4a", ".wav", ".ogg")
+
+#: 素材根目录名（相对 ``backend/``）。
+ASSETS_DIR_NAME = "assets"
+#: 氛围音乐子目录名。
+BGM_DIR_NAME = "bgm"
+#: 音效子目录名。
+SFX_DIR_NAME = "sfx"
+
+#: 音效默认增益（dB）。与 ``core.schemas.SfxEvent.gain_db`` 的默认值保持一致，
+#: 便于区分「事件显式指定的音量」与「沿用默认」。
+DEFAULT_SFX_GAIN_DB = -10.0
 
 #: 文件名里不允许出现的字符（Windows/macOS 通用安全集）。
 _UNSAFE_NAME_CHARS = re.compile(r'[\\/:*?"<>|\r\n\t]')
@@ -539,6 +556,69 @@ _MAX_SCENES_PER_SEGMENT = 8
 """
 
 
+def resolve_audio_asset(
+    directory: str | Path,
+    name: str,
+    *,
+    suffixes: Sequence[str] = ASSET_SUFFIX_PRIORITY,
+) -> Path | None:
+    """在目录里按优先级找同名素材，返回命中的文件；找不到返回 ``None``。
+
+    **为什么按后缀优先级找**：同名素材可能同时存在 ``.mp3`` 与 ``.wav``，
+    优先用压缩率高的格式（``.mp3`` > ``.m4a`` > ``.wav`` > ``.ogg``），
+    渲染时下载/解码开销更小。
+    """
+    stem = Path(str(name)).stem
+    if not stem:
+        return None
+    root = Path(directory).expanduser()
+    for suffix in suffixes:
+        candidate = root / f"{stem}{suffix}"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def resolve_default_bgm(
+    config: AppConfig | None = None,
+    *,
+    assets_dir: str | Path | None = None,
+) -> Path | None:
+    """按 ``render.default_bgm`` 找默认氛围音乐；找不到返回 ``None``。
+
+    找不到同名素材时回退到 ``bgm/`` 目录里的第一个音频文件——
+    这样「装了素材但没配名字」也能出片。
+
+    ``render.auto_bgm`` 为 ``False`` 时**不启用**默认音乐（返回 ``None``）：
+    用户显式关掉自动配乐时，不能偷偷铺一层氛围垫底。
+    """
+    settings = config or AppConfig()
+    if not settings.render.auto_bgm:
+        return None
+    root = Path(assets_dir).expanduser() if assets_dir else assets_root()
+    bgm_dir = root / BGM_DIR_NAME
+    if not bgm_dir.is_dir():
+        return None
+    hit = resolve_audio_asset(bgm_dir, settings.render.default_bgm)
+    if hit is not None:
+        return hit
+    for suffix in ASSET_SUFFIX_PRIORITY:
+        for candidate in sorted(bgm_dir.glob(f"*{suffix}")):
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+def resolve_sfx_asset(
+    sfx_key: str,
+    *,
+    assets_dir: str | Path | None = None,
+) -> Path | None:
+    """按音效键找素材文件（``sfx/<key>.<ext>``）；找不到返回 ``None``。"""
+    root = Path(assets_dir).expanduser() if assets_dir else assets_root()
+    return resolve_audio_asset(root / SFX_DIR_NAME, sfx_key)
+
+
 def _beat_start_map(scenes: Sequence[TimelineScene], clips: Sequence[Any]) -> dict[str, int]:
     """beat_id → 音频起始毫秒。
 
@@ -569,14 +649,21 @@ def _prepare_audio(
     bgm_path: Path | None,
     bgm_gain_db: float,
     ffmpeg_bin: str,
-) -> tuple[Path, Path | None]:
-    """调用 A「备音」：产出人声轨与规范化 BGM，返回 ``(voice.wav, bgm.wav | None)``。
+    sfx_events: Sequence[SfxEvent] = (),
+    enable_sfx: bool = True,
+    sfx_gain_db: float = DEFAULT_SFX_GAIN_DB,
+    assets_dir: Path | None = None,
+) -> tuple[Path, Path | None, Path | None]:
+    """调用 A「备音」：产出人声轨、BGM 轨与音效轨。
+
+    返回 ``(voice.wav, bgm.wav | None, sfx.wav | None)``。
 
     **为什么先落盘再进成片调用**：``sidechaincompress`` 的侧链输入只能取自输入文件流，
     人声轨必须是真实文件才能作为闪避触发器。
     """
     voice_path = work_dir / "voice.wav"
     bgm_norm_path = work_dir / "bgm.wav"
+    sfx_norm_path = work_dir / "sfx.wav"
 
     clips = list(timeline.audios or [])
     starts = _beat_start_map(timeline.scenes or [], clips)
@@ -590,6 +677,26 @@ def _prepare_audio(
             continue
         usable.append((resolved, int(starts.get(str(getattr(clip, "beat_id", "") or ""), 0))))
 
+    # ---- 音效轨（Patch v3.1 Patch 11 B4）----
+    sfx_inputs: list[tuple[Path, int, float]] = []
+    if enable_sfx:
+        for event in sfx_events or []:
+            key = str(getattr(event, "sfx_key", "") or "").strip()
+            if not key:
+                continue
+            asset = resolve_sfx_asset(key, assets_dir=assets_dir)
+            if asset is None:
+                print(f"[s7] 警告：找不到音效素材 {key!r}，该音效跳过")
+                continue
+            gain = sfx_gain_db
+            event_gain = getattr(event, "gain_db", None)
+            if event_gain is not None and float(event_gain) != DEFAULT_SFX_GAIN_DB:
+                # 事件显式给了别的音量就用它，否则以配置为准。
+                gain = float(event_gain)
+            sfx_inputs.append(
+                (asset, max(0, int(getattr(event, "start_ms", 0) or 0)), float(gain))
+            )
+
     args: list[str] = ["-y", "-hide_banner"]
     for path, _ in usable:
         args += ["-i", str(path)]
@@ -597,6 +704,9 @@ def _prepare_audio(
     if bgm_path is not None:
         # -stream_loop -1 让短 BGM 循环铺满整条片，末尾由 atrim 精确截断。
         args += ["-stream_loop", "-1", "-i", str(bgm_path)]
+    sfx_base = len(usable) + (1 if bgm_path is not None else 0)
+    for path, _start, _gain in sfx_inputs:
+        args += ["-i", str(path)]
 
     chains: list[str] = []
     labels: list[str] = []
@@ -624,13 +734,32 @@ def _prepare_audio(
             f"apad,atrim=0:{total_s:.3f}[bgm]"
         )
 
+    sfx_labels: list[str] = []
+    for offset, (_path, start, gain) in enumerate(sfx_inputs):
+        chains.append(
+            f"[{sfx_base + offset}:a]aformat=sample_fmts=fltp:sample_rates={_AUDIO_RATE}:"
+            f"channel_layouts={_AUDIO_LAYOUT},adelay={start}|{start},volume={gain:.1f}dB,"
+            f"apad,atrim=0:{total_s:.3f}[sx{offset}]"
+        )
+        sfx_labels.append(f"sx{offset}")
+    if sfx_labels:
+        mixed_sfx, sfx_chains = _mix_labels(sfx_labels, prefix="s")
+        chains.extend(sfx_chains)
+        chains.append(f"[{mixed_sfx}]apad,atrim=0:{total_s:.3f}[sfx]")
+
     args += ["-filter_complex", ";".join(chains)]
     args += ["-map", "[voice]", "-c:a", "pcm_s16le", "-ar", str(_AUDIO_RATE), "-ac", "2", str(voice_path)]
     if bgm_path is not None:
         args += ["-map", "[bgm]", "-c:a", "pcm_s16le", "-ar", str(_AUDIO_RATE), "-ac", "2", str(bgm_norm_path)]
+    if sfx_labels:
+        args += ["-map", "[sfx]", "-c:a", "pcm_s16le", "-ar", str(_AUDIO_RATE), "-ac", "2", str(sfx_norm_path)]
 
     run_ffmpeg(args, ffmpeg_bin=ffmpeg_bin)
-    return voice_path, (bgm_norm_path if bgm_path is not None else None)
+    return (
+        voice_path,
+        (bgm_norm_path if bgm_path is not None else None),
+        (sfx_norm_path if sfx_labels else None),
+    )
 
 
 def _prepare_background(
@@ -709,6 +838,7 @@ def _render_segment(
     seg_len_ms: int,
     voice_path: Path,
     bgm_path: Path | None,
+    sfx_path: Path | None = None,
     fps: int,
     width: int,
     height: int,
@@ -749,6 +879,9 @@ def _render_segment(
         ]
         voice_index = bgm_index + 1
     args += ["-ss", f"{audio_start_s:.3f}", "-t", f"{seg_s:.3f}", "-i", str(voice_path)]
+    sfx_index = voice_index + 1
+    if sfx_path is not None:
+        args += ["-ss", f"{audio_start_s:.3f}", "-t", f"{seg_s:.3f}", "-i", str(sfx_path)]
 
     # ---- 画面链 ----
     chains: list[str] = []
@@ -797,7 +930,27 @@ def _render_segment(
             f"[{voice_index}:a]aformat=sample_fmts=fltp:sample_rates={_AUDIO_RATE}:"
             f"channel_layouts={_AUDIO_LAYOUT}[vin]"
         )
-        chains.append("[vin][bgmv]amix=inputs=2:duration=first:normalize=0[aout]")
+        if sfx_path is not None:
+            # 音效轨与人声、BGM 三路混音（音效本身已在备音阶段做了延迟与降音量）。
+            chains.append(
+                f"[{sfx_index}:a]aformat=sample_fmts=fltp:sample_rates={_AUDIO_RATE}:"
+                f"channel_layouts={_AUDIO_LAYOUT}[sfxv]"
+            )
+            chains.append(
+                "[vin][bgmv][sfxv]amix=inputs=3:duration=first:normalize=0[aout]"
+            )
+        else:
+            chains.append("[vin][bgmv]amix=inputs=2:duration=first:normalize=0[aout]")
+    elif sfx_path is not None:
+        chains.append(
+            f"[{voice_index}:a]aformat=sample_fmts=fltp:sample_rates={_AUDIO_RATE}:"
+            f"channel_layouts={_AUDIO_LAYOUT},apad,atrim=0:{seg_s:.3f}[vin]"
+        )
+        chains.append(
+            f"[{sfx_index}:a]aformat=sample_fmts=fltp:sample_rates={_AUDIO_RATE}:"
+            f"channel_layouts={_AUDIO_LAYOUT},apad,atrim=0:{seg_s:.3f}[sfxv]"
+        )
+        chains.append("[vin][sfxv]amix=inputs=2:duration=first:normalize=0[aout]")
     else:
         chains.append(
             f"[{voice_index}:a]aformat=sample_fmts=fltp:sample_rates={_AUDIO_RATE}:"
@@ -839,15 +992,20 @@ def render_timeline(
     background_darken: float = 0.55,
     bgm_gain_db: float = -18.0,
     work_dir: Path | None = None,
+    enable_sfx: bool = True,
+    sfx_gain_db: float = DEFAULT_SFX_GAIN_DB,
+    assets_dir: Path | None = None,
 ) -> Path:
     """按时间轴渲染成片，返回成片路径。
 
-    流程：调用 A 备音（人声 + BGM）→ 调用 B 成片（画面 + 字幕 + 闪避 + 混音）。
+    流程：调用 A 备音（人声 + BGM + 音效）→ 调用 B 成片（画面 + 字幕 + 闪避 + 混音）。
 
     * 画面：每个场景一条滤镜片段 → ``concat`` 串成一条；
     * 字幕：``06_plan/subtitles/{index:04d}.png`` 逐条 ``overlay``，
       ``enable='between(t,start,end)'`` 控制显示窗口；
-    * BGM：``sidechaincompress``（侧链 = 人声轨）做闪避，再与人声 ``amix`` 混合。
+    * BGM：``sidechaincompress``（侧链 = 人声轨）做闪避，再与人声 ``amix`` 混合；
+    * 音效：``timeline.sfx_events`` 里的事件已在备音阶段 ``adelay`` 对齐 + 降音量，
+      这里再与人声、BGM 三路混音。
     """
     episode_dir = Path(episode_dir).expanduser()
     out_path = Path(out_path).expanduser()
@@ -887,7 +1045,7 @@ def render_timeline(
         else:
             print(f"[s7] 警告：BGM 不存在（{candidate}），本次不铺 BGM")
 
-    voice_path, bgm_norm_path = _prepare_audio(
+    voice_path, bgm_norm_path, sfx_norm_path = _prepare_audio(
         timeline,
         episode_dir=episode_dir,
         work_dir=work_dir,
@@ -895,6 +1053,10 @@ def render_timeline(
         bgm_path=bgm_input,
         bgm_gain_db=bgm_gain_db,
         ffmpeg_bin=ffmpeg_bin,
+        sfx_events=list(timeline.sfx_events or []),
+        enable_sfx=enable_sfx,
+        sfx_gain_db=sfx_gain_db,
+        assets_dir=assets_dir,
     )
 
     # ---- 字幕 PNG ----
@@ -964,6 +1126,7 @@ def render_timeline(
             seg_len_ms=seg_len_ms,
             voice_path=voice_path,
             bgm_path=bgm_norm_path,
+            sfx_path=sfx_norm_path,
             fps=fps,
             width=width,
             height=height,
@@ -1053,7 +1216,7 @@ def render_episode(
 
     resolved_episode_id = str(episode_id or timeline.episode_id or f"ep_{int(episode_no):03d}")
 
-    # ---- BGM：显式参数优先，其次作品级配置 ----
+    # ---- BGM：显式参数优先 → 作品级配置 → 默认素材（Patch v3.1 Patch 11 B4）----
     resolved_bgm: Path | None = None
     if bgm_path:
         resolved_bgm = Path(bgm_path).expanduser()
@@ -1064,6 +1227,10 @@ def render_episode(
         if configured:
             candidate = Path(configured).expanduser()
             resolved_bgm = candidate if candidate.is_absolute() else series_dir / candidate
+        else:
+            resolved_bgm = resolve_default_bgm(settings)
+            if resolved_bgm is not None:
+                print(f"[s7] 使用默认氛围音乐：{resolved_bgm}")
 
     out_dir = out_dir_for(series_dir, episode_no)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1080,6 +1247,8 @@ def render_episode(
         background_darken=settings.render.background_darken,
         bgm_gain_db=settings.render.bgm_gain_db,
         work_dir=work_dir,
+        enable_sfx=settings.render.enable_sfx,
+        sfx_gain_db=settings.render.sfx_gain_db,
     )
 
     # 清理中间音频，避免污染 07_out。
@@ -1095,14 +1264,19 @@ def render_episode(
 
 
 __all__ = [
+    "ASSET_SUFFIX_PRIORITY",
+    "ASSETS_DIR_NAME",
     "AUDIO_DIR_NAME",
+    "BGM_DIR_NAME",
     "DEFAULT_FPS",
     "DEFAULT_HEIGHT",
+    "DEFAULT_SFX_GAIN_DB",
     "DEFAULT_WIDTH",
     "EXPORTS_DIR_NAME",
     "OUT_DIR_NAME",
     "PANEL_DIR_NAME",
     "PLAN_DIR_NAME",
+    "SFX_DIR_NAME",
     "SUBTITLE_DIR_NAME",
     "TIMELINE_FILENAME",
     "RenderError",
@@ -1113,5 +1287,8 @@ __all__ = [
     "probe_duration_ms",
     "render_episode",
     "render_timeline",
+    "resolve_audio_asset",
+    "resolve_default_bgm",
+    "resolve_sfx_asset",
     "run_ffmpeg",
 ]

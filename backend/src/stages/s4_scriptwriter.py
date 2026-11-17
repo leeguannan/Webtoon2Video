@@ -67,7 +67,10 @@ STORY_DRAFT_MAX_TOKENS = 12000
 #: Patch v3.0-7：4B 单章拆拍的输出上限（整章约 5~20 条解说句）。
 NARRATE_MAX_TOKENS = 8000
 #: Patch v3.0-7：单章候选分镜上限，超出则按序拆成多次调用。
-CHAPTER_MAX_PANELS = 40
+#: 单章 4B 调用的候选分镜上限。Patch v3.0 小修：40 太小，单章稍长就被拆成
+#: 两批，而两批都带着同一份 chapter.story_prose，等于把同一段故事讲两遍。
+#: 120 覆盖常规整话规模，只有极端超长话才会触发切片（并平分条数预算）。
+CHAPTER_MAX_PANELS = 120
 #: 百炼 qwen3 系模型默认开启长链思考（thinking），复杂撰稿任务的推理 token 会
 #: 撞穿 180s 请求超时（实测 88 格 4A 连续 4 次 ReadTimeout）；compatible-mode 统一
 #: 接受 ``enable_thinking=False``（qwen3.8-max / qwen-plus 均实测兼容），关掉后
@@ -105,8 +108,88 @@ TTS_ALLOWED_WORDS = frozenset(
 #: 从顺位校验错误文本里提取 panel id（兼容 ``p_005`` 与旧写法 ``panel_005``）。
 _ERROR_PANEL_ID_RE = re.compile(r"p(?:anel)?_\d{3}")
 #: 全话解说句条数规格（与 prompts/script_narrate.md 铁律一保持一致）。
-BEAT_TOTAL_MIN = 30
-BEAT_TOTAL_MAX = 65
+#: Patch v3.1 Patch 10：整体收紧到 35~50 条，让成品稳定落在 2.5~3.5 分钟。
+BEAT_TOTAL_MIN = 35
+BEAT_TOTAL_MAX = 50
+
+#: Patch v3.1 Patch 10：故事正文里禁止出现的「元词汇」黑名单。
+#:
+#: 这些词是「看图写话」的产物——把画面里的字、框、气泡当成可念的东西念出来，
+#: 或者像旁白一样描述镜头本身。命中只告警（附带反馈给 4B），不阻断流水线。
+META_VOCABULARY_BLACKLIST: tuple[str, ...] = (
+    "手写体",
+    "二字",
+    "字幕",
+    "幕布",
+    "画面中",
+    "画面上",
+    "这一格",
+    "镜头",
+    "气泡",
+    "文字框",
+    "对话框",
+)
+
+#: 连续以「他 / 她」开头的句子达到该长度即视为「代词连环糊涂账」。
+PRONOUN_RUN_LIMIT = 3
+
+#: 句末标点（切句用）。
+_SENTENCE_SPLIT_RE = re.compile(r"[。！？!?；;\n]+")
+
+
+def _split_sentences(text: str) -> list[str]:
+    """按句末标点切句，忽略空句。"""
+    return [part.strip() for part in _SENTENCE_SPLIT_RE.split(text or "") if part.strip()]
+
+
+def detect_meta_vocabulary(text: str) -> list[str]:
+    """扫出故事正文里的元词汇与「他/她」连环开头。
+
+    返回问题描述列表（空列表表示干净）。两项检查：
+
+    1. **元词汇**：命中 :data:`META_VOCABULARY_BLACKLIST` 里的词（如「手写体」
+       「幕布」「画面中」）——这些是把画面的字/框当实体念出来的典型痕迹；
+    2. **代词连环**：连续 :data:`PRONOUN_RUN_LIMIT` 句以上以「他」「她」开头，
+       观众闭眼听会分不清谁对谁做了什么。
+    """
+    problems: list[str] = []
+    body = text or ""
+    hits = [word for word in META_VOCABULARY_BLACKLIST if word in body]
+    if hits:
+        problems.append("正文出现元词汇：" + "、".join(hits))
+
+    run = 0
+    longest = 0
+    for sentence in _split_sentences(body):
+        if sentence[:1] in {"他", "她"}:
+            run += 1
+            longest = max(longest, run)
+        else:
+            run = 0
+    if longest >= PRONOUN_RUN_LIMIT:
+        problems.append(f"正文有连续 {longest} 句以「他/她」开头，人物指代混乱")
+    return problems
+
+
+def _story_style_feedback(draft: object) -> str:
+    """把 4A 产物里的元词汇/代词问题整理成给 4B 的附加反馈（非阻断）。"""
+    chapters = getattr(draft, "chapters", None) or []
+    problems: list[str] = []
+    for chapter in chapters:
+        prose = getattr(chapter, "story_prose", "") or ""
+        for item in detect_meta_vocabulary(prose):
+            problems.append(f"{item}（第 {getattr(chapter, 'chapter_index', '?')} 章）")
+    full = getattr(draft, "full_story_markdown", "") or ""
+    for item in detect_meta_vocabulary(full):
+        problems.append(item)
+    if not problems:
+        return ""
+    return (
+        "【故事稿自检告警】"
+        + "；".join(dict.fromkeys(problems))
+        + "。解说句里请改用人物姓名或明确身份指代，不要念出画面里的字/框/镜头，"
+        "也不要连续用「他/她」开头。"
+    )
 
 
 def _filter_feedback_for_window(
@@ -130,7 +213,7 @@ def _filter_feedback_for_window(
 
 
 def _chapter_beat_budget(chapter_count: int) -> tuple[int, int]:
-    """按章数平分全话 30~65 条的条数预算，返回单章 ``(下限, 上限)``。"""
+    """按章数平分全话 35~50 条的条数预算，返回单章 ``(下限, 上限)``。"""
     chapter_count = max(1, chapter_count)
     low = max(3, BEAT_TOTAL_MIN // chapter_count)
     high = max(low + 2, -(-BEAT_TOTAL_MAX // chapter_count))  # ceil 除法
@@ -179,7 +262,11 @@ def render_prompt(template: str, mapping: dict[str, str]) -> str:
 
 
 def format_panel_list(panels: Sequence[PanelVisionInfo]) -> str:
-    """把一批 Stage 3 面板渲染成撰稿 Prompt 片段。"""
+    """把一批 Stage 3 面板渲染成撰稿 Prompt 片段。
+
+    Patch v3.1 Patch 10：纯字卡（``is_pure_text_card=True``）会在分镜 ID 后面
+    标上 ``[纯字卡]``，提示 4B 尽量跳过这类「白底黑字 PPT 格」。
+    """
     if not panels:
         return "（本话暂无视觉抽取结果）"
     lines: list[str] = []
@@ -187,7 +274,10 @@ def format_panel_list(panels: Sequence[PanelVisionInfo]) -> str:
         dialogues = "；".join(
             f"{item.speaker_guess}：{item.text}" for item in panel.dialogues
         )
-        parts = [f"- {panel.panel_id}：{panel.scene_summary}"]
+        parts = [f"- {panel.panel_id}："]
+        if getattr(panel, "is_pure_text_card", False):
+            parts.append("[纯字卡]")
+        parts.append(panel.scene_summary)
         if dialogues:
             parts.append(f"对白：{dialogues}")
         if panel.sfx_list:
@@ -508,8 +598,16 @@ def _chapter_blocks(
 def _format_panel_ids(
     panel_ids: Sequence[str], panel_map: dict[str, PanelVisionInfo]
 ) -> str:
-    """按给定顺序渲染候选分镜清单（给 4B 挑图用）。"""
-    panels = [panel_map[panel_id] for panel_id in panel_ids if panel_id in panel_map]
+    """按给定顺序渲染候选分镜清单（给 4B 挑图用）。
+
+    Patch v3.1 Patch 10：过渡空页 / 窄条（``is_transition_blank=True``）在这里
+    再过滤一次，保证送给 4B 的候选清单里绝不出现「纯黑过渡页」这种废帧。
+    """
+    panels = [
+        panel_map[panel_id]
+        for panel_id in panel_ids
+        if panel_id in panel_map and not panel_map[panel_id].is_transition_blank
+    ]
     return format_panel_list(panels)
 
 
@@ -819,14 +917,20 @@ async def _write_narration_chapter(
     if len(panel_ids) > CHAPTER_MAX_PANELS:
         chunks = list(_chunk_ids(list(panel_ids), CHAPTER_MAX_PANELS))
         per_chunk = _split_budget(beat_budget, len(chunks))
+        total_panels = len(panel_ids)
+        consumed = 0
         result: list[dict] = []
         for chunk, chunk_budget in zip(chunks, per_chunk, strict=True):
+            # Patch v3.1 Patch 9：每片只带自己那一段章节正文，避免整章复述。
+            ratio_start = consumed / total_panels
+            consumed += len(chunk)
+            ratio_end = consumed / total_panels
             result.extend(
                 await _write_narration_chapter(
                     client,
                     model=model,
                     context=context,
-                    chapter=chapter,
+                    chapter=_slice_chapter_prose(chapter, ratio_start, ratio_end),
                     panel_ids=chunk,
                     panel_map=panel_map,
                     story_full=story_full,
@@ -921,6 +1025,40 @@ def _chunk_ids(ids: list[str], size: int) -> list[list[str]]:
     if size <= 0:
         raise ValueError("size must be positive")
     return [ids[index : index + size] for index in range(0, len(ids), size)]
+
+
+def _slice_chapter_prose(
+    chapter: StoryChapter, ratio_start: float, ratio_end: float
+) -> StoryChapter:
+    """按分片占比切一段章节正文，避免每一片都复述整章。
+
+    超长章节（候选分镜超过 ``CHAPTER_MAX_PANELS``）会被切成多片逐片调用，
+    如果每片都带同一份 ``story_prose``，模型就会把整章复述一遍（Patch v3.1
+    把上限提到 120 格后这个风险更明显）。这里按每片候选分镜的占比，从章节正文
+    里取对应的一段，切点尽量落在段落边界上。
+    """
+    prose = (chapter.story_prose or "").strip()
+    if not prose or ratio_end <= ratio_start:
+        return chapter
+    paragraphs = [part for part in prose.split("\n\n") if part.strip()]
+    if not paragraphs:
+        return chapter
+    total = sum(len(part) for part in paragraphs)
+    if total <= 0:
+        return chapter
+    picked: list[str] = []
+    offset = 0
+    for part in paragraphs:
+        end = offset + len(part)
+        if end > total * ratio_start and offset < total * ratio_end:
+            picked.append(part)
+        offset = end
+    if not picked:
+        return chapter
+    sliced = "\n\n".join(picked)
+    if sliced == prose:
+        return chapter
+    return chapter.model_copy(update={"story_prose": sliced})
 
 
 def _strip_pinyin_from_beats(beats: Sequence[dict]) -> None:
@@ -1187,6 +1325,11 @@ async def write_episode_script(
     merged_beats: list[dict] = []
     errors: list[str] = []
     budget_low, budget_high = _chapter_beat_budget(len(chapter_blocks))
+    # Patch v3.1 Patch 10：4A 故事稿自检（元词汇 / 「他/她」连环开头）。
+    # 只告警 + 把问题反馈给 4B，不阻断流水线。
+    style_feedback = _story_style_feedback(story_draft)
+    if style_feedback:
+        print(f"[s4_scriptwriter] {style_feedback}", file=sys.stderr)
     for attempt in range(ALIGNMENT_MAX_RETRIES + 1):
         merged_beats = []
         chapter_errors: list[str] = []
@@ -1197,6 +1340,10 @@ async def write_episode_script(
             chapter_feedback = "\n".join(
                 f"- {item}" for item in _filter_feedback_for_window(errors, window)
             )
+            if style_feedback:
+                chapter_feedback = (
+                    f"{chapter_feedback}\n{style_feedback}" if chapter_feedback else style_feedback
+                )
             raw_beats = await _write_narration_chapter(
                 client,
                 model=model,

@@ -18,6 +18,8 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
+from core.normalize import sanitize_narration_and_tts
+
 #: 字幕渲染异常。
 class SubtitleRenderError(RuntimeError):
     """字幕 PNG 渲染失败（字体缺失、图片写入失败等）。"""
@@ -101,6 +103,18 @@ def _split_paragraphs(text: str) -> list[str]:
     return normalized.split("\n")
 
 
+def strip_render_unsafe_chars(text: str) -> str:
+    """渲染前的最后一道兜底：剔除任何可能变成方块的字符。
+
+    Pillow 遇到字体里没有的字形会**静默**画成豆腐块「☒」——不报错、不留痕，
+    只有看成片才能发现（成片 03:46 就这么翻车过一次）。字幕文本可能来自旧版
+    ``script.json``（没经过 ``core.normalize`` 净化），所以这里在
+    ``wrap_text`` / ``draw.text`` 之前再筛一遍：控制符、私用区字符
+    （U+E000–U+F8FF）、Emoji 区段与各类装饰符号一律剔除。
+    """
+    return sanitize_narration_and_tts(text or "")
+
+
 def wrap_text(
     text: str,
     font: ImageFont.FreeTypeFont,
@@ -182,6 +196,8 @@ def render_subtitle_png(
     """
     target = Path(out_path)
     font_path = resolve_font_path(font_name)
+    # 兜底净化：保证永远不会画出「☒」方块。
+    text = strip_render_unsafe_chars(text)
     max_width = float(max(1, int(width) - 2 * int(margin_h)))
     font, lines = _fit_font(
         font_path,
@@ -242,6 +258,7 @@ __all__ = [
     "load_font",
     "render_subtitle_png",
     "resolve_font_path",
+    "strip_render_unsafe_chars",
     "subtitle_filename",
     "wrap_text",
 ]

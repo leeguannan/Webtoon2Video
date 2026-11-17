@@ -110,6 +110,17 @@ OVERSIZED_CUT_MAX = 3200
 BLANK_PANEL_CONTENT_RATIO = 0.06
 #: 偏离主背景色的灰度差阈值。
 BLANK_PANEL_COLOR_DELTA = 15
+# --------------------------------------------------------------------------
+# Patch v3.1 Patch 9：超窄装饰横条过滤
+# --------------------------------------------------------------------------
+#: 裁去上下边距后的「有效高度」上限（像素）：低于该值才可能是装饰窄条。
+THIN_STRIP_MAX_HEIGHT_PX = 150
+#: 装饰窄条的 Canny 边缘密度上限（0~1）：纯色窄条几乎没有线稿。
+THIN_STRIP_MAX_EDGE_DENSITY = 0.015
+#: 宽高比下限：超过该值即「极扁窄横条」。
+THIN_STRIP_MIN_ASPECT_RATIO = 7.5
+#: 近白像素占比下限：超过该值说明条子里有文字（旁白条 / 对话框），不能当装饰条。
+THIN_STRIP_TEXT_BRIGHT_RATIO = 0.02
 #: Stage 2 的切图清单文件名（Patch v3.0 Patch 6）：
 #: 本次切分的唯一事实来源 —— Stage 3 只按这里列出的 panel_id 遍历，
 #: 并继承其中的 is_transition_blank 标记。
@@ -622,7 +633,13 @@ def segment_episode(
         # Patch 6 第 4 条：纯白过渡页 / 纯黑页这类「无内容画面」不再直接丢弃，
         # 而是照常落盘并标记 is_transition_blank —— Stage 3 会跳过它们（不烧 VLM），
         # Stage 4 直接过滤，成片里就不会出现「白屏空等 3 秒」。
-        contentless = is_blank_panel(inner) or is_contentless_panel(panel)
+        # is_contentless_panel 也必须吃 inner：短黑页上下保留的 10px 安全边距
+        # （PANEL_WHITE_MARGIN_PX）会改变主背景色统计，把本该判空的短黑页救回来。
+        contentless = is_blank_panel(inner) or is_contentless_panel(inner)
+        # Patch v3.1 Patch 9：超窄装饰横条（画面缝隙 / 纯色窄条）同样不算内容，
+        # 标记 is_transition_blank，避免它单独占一幕成片。
+        if is_thin_decoration_strip(inner, width=int(gray.shape[1])):
+            contentless = True
         if is_blacklisted_bumper(panel, blacklist_hashes):
             # 片尾版权声明 / 推广尾图：跳过不写入 panels，日志留痕
             print(
@@ -1117,6 +1134,57 @@ def is_contentless_panel(
     deviation = np.abs(gray.astype(np.int16) - mode_value) > delta
     content_ratio = float(deviation.mean())
     return content_ratio < ratio
+
+
+def is_thin_decoration_strip(
+    inner_gray: np.ndarray,
+    *,
+    width: int,
+    max_height: int = THIN_STRIP_MAX_HEIGHT_PX,
+    max_edge_density: float = THIN_STRIP_MAX_EDGE_DENSITY,
+    min_aspect_ratio: float = THIN_STRIP_MIN_ASPECT_RATIO,
+    text_bright_ratio: float = THIN_STRIP_TEXT_BRIGHT_RATIO,
+) -> bool:
+    """判定一块画面是不是「超窄装饰横条」（画面缝隙 / 纯色窄条）。
+
+    Patch v3.1 Patch 9：成片 03:00 处出现过一段 80px 左右的暗色细条单独占一幕，
+    它既不是内容也不是过渡页，只是两张画格之间的缝隙被切成了一个面板。
+    判据（四条同时满足，缺一不可）：
+
+    1. 裁掉上下 10px 安全边距后的**有效高度** < ``max_height``（默认 150px）；
+    2. **够扁窄**：宽高比（``width / 有效高度``）> ``min_aspect_ratio``——
+       只是「矮」而不够扁的块，多半是漫画里的小画格，不能当装饰条；
+    3. **几乎没有线稿**：Canny 边缘密度 < ``max_edge_density``；
+    4. **不含文字**：整块近白像素占比 < ``text_bright_ratio``，且没有任何一行
+       的近白像素占比达到 ``text_bright_ratio``——「黑底白字」的旁白条 /
+       对话框、白底留白格都要保留，不能误杀。
+
+    参数
+    ----
+    inner_gray:
+        已裁掉上下边距的灰度图（2D）。
+    width:
+        该块的原始宽度（像素），用于计算宽高比。
+    """
+    if inner_gray is None or inner_gray.size == 0:
+        return False
+    effective_height = int(inner_gray.shape[0])
+    if effective_height <= 0 or effective_height >= max_height:
+        return False
+    effective_width = int(inner_gray.shape[1]) if inner_gray.ndim >= 2 else 0
+    aspect = float(width or effective_width) / float(effective_height)
+    if aspect <= min_aspect_ratio:
+        return False
+    edge_density = float(canny_edge_density(inner_gray).mean())
+    if edge_density >= max_edge_density:
+        return False
+    bright = inner_gray > 200
+    if float(bright.mean()) >= text_bright_ratio:
+        return False
+    row_bright = bright.mean(axis=1)
+    if bool((row_bright >= text_bright_ratio).any()):
+        return False
+    return True
 
 
 def dominant_color_ratio(block_bgr: np.ndarray, *, quantize: int = 16) -> float:

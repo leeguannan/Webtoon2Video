@@ -12,6 +12,7 @@ import pytest
 from stages.s2_segmenter import (
     MAX_ATOMIC_BLOCK_HEIGHT,
     MAX_PANEL_HEIGHT,
+    PANEL_WHITE_MARGIN_PX,
     SegmenterError,
     blank_row_mask,
     canny_edge_density,
@@ -22,6 +23,7 @@ from stages.s2_segmenter import (
     hamming_distance_64,
     imwrite_unicode,
     is_blacklisted_bumper,
+    is_contentless_panel,
     is_standalone_text_box,
     is_blank_panel,
     list_slice_paths,
@@ -363,6 +365,31 @@ def test_blank_panel_is_marked_as_transition_blank(tmp_path) -> None:
     flags = {item["panel_id"]: item["is_transition_blank"] for item in manifest["panels"]}
     assert flags["p_002"] is True
     assert flags["p_001"] is False
+
+
+def test_contentless_short_black_panel_ignores_safe_margin() -> None:
+    """短黑页判空必须吃 inner（裁掉 10px 安全边距），不能被边距救回来。
+
+    旧表达式 ``is_contentless_panel(panel)`` 统计整图：切图阶段保留的上下
+    10px 平坦边距会改变主背景色统计，把本该判空的短黑页救回来、当成正常分镜。
+    修复后与 ``is_blank_panel(inner)`` 一样只统计 inner 区。
+    端到端切分上游还有 ``_trim_uniform_edges`` 等步骤，这里在调用点的函数
+    契约层面锁定回归（s2_segmenter.py 的 contentless 表达式）。
+    """
+    width, body_height = 320, 60
+    body = np.full((body_height, width, 3), 12, dtype=np.uint8)
+    # inner 区（10~50 行）放 4% 的深灰实心块（16x32=512 / 12800）：
+    # is_blank_panel=False（中间调 4% > 0.5%，实心块带 Canny 边缘），
+    # is_contentless_panel(inner)=True（偏离主色占比 4% < 6% 阈值）。
+    body[20:36, 120:152] = 100
+    # 底部安全边距内残留 4 行亮线（黑/白交界），旧逻辑统计整图时会抬高偏离占比。
+    body[-4:, :] = 255
+    inner = body[PANEL_WHITE_MARGIN_PX : body_height - PANEL_WHITE_MARGIN_PX]
+
+    assert is_blank_panel(inner) is False
+    assert is_contentless_panel(inner) is True
+    # 回归锚点：带边距的整图确实逃过判空，证明修复点就在 inner/body 之差。
+    assert is_contentless_panel(body) is False
 
 
 def test_is_blank_panel() -> None:

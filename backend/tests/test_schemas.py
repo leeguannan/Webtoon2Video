@@ -86,6 +86,8 @@ FIELD_LOCKS: list[tuple[type, tuple[str, ...]]] = [
             "sfx_list",
             "focus_region",
             "is_transition_blank",
+            # Patch v3.1 Patch 10：纯字卡标记（默认 False，向后兼容旧 vision.json）
+            "is_pure_text_card",
             # Patch v2.5-1：非剧情内容标记（默认 "none"，向后兼容）
             "non_story_type",
         ),
@@ -138,6 +140,8 @@ FIELD_LOCKS: list[tuple[type, tuple[str, ...]]] = [
             "pause_after_ms",
             # Patch v2.6-5：一镜多句时用 focus_hint 区分上下半格。
             "focus_hint",
+            # Patch v3.1 Patch 10：可选音效触发标签（默认 None，向后兼容旧剧本）
+            "sfx_cue",
         ),
     ),
     (
@@ -186,6 +190,8 @@ FIELD_LOCKS: list[tuple[type, tuple[str, ...]]] = [
             "scenes",
             "audios",
             "subtitles",
+            # Patch v3.1 Patch 10：音效事件表（默认空列表，向后兼容旧 timeline.json）
+            "sfx_events",
         ),
     ),
 ]

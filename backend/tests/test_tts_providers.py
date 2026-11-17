@@ -246,7 +246,8 @@ def test_edge_tts_reports_missing_dependency() -> None:
 
 
 def test_edge_tts_result_suffix_and_defaults() -> None:
-    assert DEFAULT_VOICE == "Cherry"
+    # Patch v3.1 Patch 11 A1：百炼默认音色改成男声「墨讲师」Elias。
+    assert DEFAULT_VOICE == "Elias"
     assert TTSResult(audio=b"x").suffix == ".wav"
     assert TTSResult(audio=b"x", content_type="audio/mpeg").suffix == ".mp3"
 

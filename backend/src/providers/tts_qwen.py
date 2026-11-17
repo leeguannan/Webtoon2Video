@@ -28,8 +28,11 @@ __all__ = ["QwenTTS", "DEFAULT_MODEL", "DEFAULT_VOICE", "TTS_ENDPOINT_PATH"]
 
 DEFAULT_MODEL = "qwen3-tts-flash"
 
-#: qwen3-tts-flash 的系统音色（女声，适合漫评旁白）。
-DEFAULT_VOICE = "Cherry"
+#: qwen3-tts-flash 的系统音色（男声「墨讲师」，适合漫评主旁白）。
+#:
+#: Patch v3.1 Patch 11 A1：主旁白默认音色改为 ``Elias``；角色音色由
+#: :func:`stages.s5_tts.resolve_beat_voice` 按 ``beat.speaker_role`` 路由。
+DEFAULT_VOICE = "Elias"
 
 #: DashScope 原生（非 compatible-mode）多模态生成端点路径。
 TTS_ENDPOINT_PATH = "/api/v1/services/aigc/multimodal-generation/generation"
@@ -139,11 +142,16 @@ class QwenTTS:
         if not text.strip():
             raise TTSRequestError("待合成文本为空")
 
+        # Patch v3.1 Patch 11 A1：真正生效的音色 = 显式传入的 voice or 客户端默认音色。
+        # 下面 payload 与返回的 TTSResult.voice 都必须用它，否则「按角色换音色」
+        # 之后 TTSResult 里的 voice 仍然是客户端默认值，对不上账。
+        effective_voice = voice or self._voice
+
         payload: dict[str, Any] = {
             "model": self._model,
             "input": {
                 "text": text,
-                "voice": voice or self._voice,
+                "voice": effective_voice,
                 "language_type": language_type,
             },
             "parameters": {},
@@ -173,7 +181,7 @@ class QwenTTS:
                 )
             else:
                 if response.status_code == 200:
-                    return await self._download_audio(client, response)
+                    return await self._download_audio(client, response, effective_voice)
                 if response.status_code in RETRYABLE_STATUS:
                     last_error = TTSError(
                         f"百炼 TTS 返回可重试状态码 {response.status_code}（第 {attempt + 1} 次）："
@@ -189,8 +197,15 @@ class QwenTTS:
 
         raise TTSError(f"百炼 TTS 重试耗尽：{last_error}")
 
-    async def _download_audio(self, client: httpx.AsyncClient, response: httpx.Response) -> TTSResult:
-        """从响应里取出 ``output.audio.url`` 并把音频字节下载回来。"""
+    async def _download_audio(
+        self, client: httpx.AsyncClient, response: httpx.Response, voice: str | None = None
+    ) -> TTSResult:
+        """从响应里取出 ``output.audio.url`` 并把音频字节下载回来。
+
+        ``voice`` 是本次真正生效的音色（Patch v3.1 Patch 11 A1）：返回的
+        :class:`TTSResult` 必须带上它，不能回退成客户端默认音色。
+        """
+        used_voice = voice or self._voice
         try:
             data = response.json()
         except ValueError as exc:
@@ -206,7 +221,7 @@ class QwenTTS:
             return TTSResult(
                 audio=base64.b64decode(inline),
                 content_type=audio.get("content_type") or "audio/wav",
-                voice=self._voice,
+                voice=used_voice,
             )
         if not url:
             raise TTSResponseError(f"百炼 TTS 响应里没有音频：{_brief(response.text)}")
@@ -220,7 +235,7 @@ class QwenTTS:
         return TTSResult(
             audio=_fix_wav_size(download.content),
             content_type=content_type,
-            voice=self._voice,
+            voice=used_voice,
         )
 
     async def aclose(self) -> None:

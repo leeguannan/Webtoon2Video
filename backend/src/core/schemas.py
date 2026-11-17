@@ -91,6 +91,10 @@ class PanelVisionInfo(BaseModel):
     sfx_list: list[str] = Field(default_factory=list)
     focus_region: tuple[float, float, float, float] | None = None
     is_transition_blank: bool = False
+    #: Patch v3.1 Patch 10：纯字卡标记——本格主体只是一块文字框/内心独白卡片，
+    #: 没有角色表情与肢体动作。Stage 4B 会给这类分镜打上 ``[纯字卡]`` 标签并
+    #: 尽量跳过，避免「白底黑字 PPT 朗读」。
+    is_pure_text_card: bool = False
     #: Patch v2.5-1：非剧情内容标记（默认 "none"，向后兼容旧 JSON）。
     #: Patch v3.0 Patch 6：新增 ``sfx_only``——整格只有拟声词特效字/纯气氛背景、
     #: 没有人物动作与剧情对白的画面。
@@ -164,6 +168,11 @@ class ScriptBeat(BaseModel):
     #: ``top``，第 2 句讲人物口头台词用 ``bottom``；``full`` 表示整格取景
     #: （默认值，向后兼容旧剧本）。
     focus_hint: Literal["full", "top", "bottom", "center"] = "full"
+    #: Patch v3.1 Patch 10：可选音效触发标签。仅在剧情高潮或明显物理动作点
+    #: 输出一个标准 key（``heart_thump`` / ``door_slam`` / ``whoosh`` / ``gasp`` /
+    #: ``phone_msg`` / ``footstep`` / ``crash``）；普通对话与叙述留空。
+    #: Stage 6 会据此生成 :class:`SfxEvent`（全话最多 8 个、间隔 >= 6000ms）。
+    sfx_cue: str | None = None
 
 
 class NarrationScript(BaseModel):
@@ -279,6 +288,18 @@ class SubtitleLine(BaseModel):
     end_ms: int
 
 
+class SfxEvent(BaseModel):
+    """Patch v3.1 Patch 10：时间轴上的音效事件。
+
+    Stage 6 依据 ``ScriptBeat.sfx_cue``（或 ``vision.json`` 里的 ``sfx_list``
+    关键词兜底）生成，Stage 7 用它把 ``assets/sfx/<sfx_key>.wav`` 混进成片。
+    """
+
+    sfx_key: str
+    start_ms: int
+    gain_db: float = -10.0
+
+
 class RenderTimeline(BaseModel):
     episode_id: str
     aspect_ratio: Literal["9:16"] = "9:16"
@@ -289,6 +310,8 @@ class RenderTimeline(BaseModel):
     scenes: list[TimelineScene]
     audios: list[AudioClipMeta]
     subtitles: list[SubtitleLine]
+    #: Patch v3.1 Patch 10：音效事件（默认空列表，旧 timeline.json 照常反序列化）。
+    sfx_events: list[SfxEvent] = Field(default_factory=list)
 
 
 def save_model(model: BaseModel, path: Path) -> None:

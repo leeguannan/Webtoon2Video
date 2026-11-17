@@ -313,7 +313,12 @@ def _merge_tile_payloads(
     * ``sfx_list``：去重保序；
     * ``focus_region``：把切片内的归一化坐标映射回整格坐标；
     * ``is_transition_blank``：全部切片都是空白才算空白；
-    * ``non_story_type``：任一切片是版权/推广页即整体按该类型处理。
+    * ``non_story_type``：任一切片是版权/推广页即整体按该类型处理；
+      ``sfx_only`` 则严格得多——只有**所有有效（非空白）切片都只剩拟声词**
+      且合并后没有任何对白时，整格才标 ``sfx_only``。否则尾部一个空白/音效
+      切片就会把前面带对白的超长画格整格误杀。
+    * ``is_pure_text_card``：Patch v3.1 Patch 10——只有**所有有效切片都是纯字卡**
+      且合并后没有任何对白时，整格才是纯字卡（任一切片有人物表情/动作即否）。
     """
     summaries: list[str] = []
     dialogues: list[dict[str, Any]] = []
@@ -323,6 +328,10 @@ def _merge_tile_payloads(
     focus_region: tuple[float, float, float, float] | None = None
     non_story_type = "none"
     blank_flags: list[bool] = []
+    #: 每个「有效切片」（非空白）是否自报 sfx_only。
+    valid_sfx_flags: list[bool] = []
+    #: 每个「有效切片」（非空白）是否自报纯字卡（Patch v3.1 Patch 10）。
+    valid_text_card_flags: list[bool] = []
 
     for tile, payload in tile_payloads:
         summary = str(payload.get("scene_summary") or "").strip()
@@ -356,11 +365,32 @@ def _merge_tile_payloads(
                 focus_region = (x1, min(gy1, gy2), x2, max(gy1, gy2))
         raw_non_story = str(payload.get("non_story_type") or "none")
         if raw_non_story in NON_STORY_BANNER_TYPES:
+            # 版权/推广页仍保持「任一切片命中即整格命中」的强判定。
             non_story_type = raw_non_story
-        elif raw_non_story in NON_STORY_SFX_TYPES and non_story_type == "none":
-            # Patch v3.0-6：任一切片只剩拟声词特效即整格按 sfx_only 处理
-            non_story_type = raw_non_story
+        if not bool(payload.get("is_transition_blank")):
+            # 空白切片不算有效切片，不参与 sfx_only 的「全部」判定。
+            valid_sfx_flags.append(raw_non_story in NON_STORY_SFX_TYPES)
+            valid_text_card_flags.append(bool(payload.get("is_pure_text_card")))
         blank_flags.append(bool(payload.get("is_transition_blank")))
+
+    if (
+        non_story_type == "none"
+        and not dialogues
+        and valid_sfx_flags
+        and all(valid_sfx_flags)
+    ):
+        # 所有有效切片都自报 sfx_only 且整格确实没有对白，才标 sfx_only；
+        # 只要有一个有效切片含剧情/对白，整格就按普通剧情格处理。
+        non_story_type = "sfx_only"
+
+    # Patch v3.1 Patch 10：纯字卡合并——所有有效切片都是纯字卡、且整格没有对白
+    # 时才算纯字卡；只要有一片出现人物表情/动作或对白，就按普通剧情格处理。
+    is_pure_text_card = bool(
+        valid_text_card_flags
+        and all(valid_text_card_flags)
+        and not dialogues
+        and non_story_type == "none"
+    )
 
     merged: dict[str, Any] = {
         "panel_id": panel_id,
@@ -370,6 +400,7 @@ def _merge_tile_payloads(
         "focus_region": list(focus_region) if focus_region else None,
         "is_transition_blank": bool(blank_flags) and all(blank_flags),
         "non_story_type": non_story_type,
+        "is_pure_text_card": is_pure_text_card,
     }
     return merged
 
