@@ -28,6 +28,7 @@ import type {
 } from '../types/studio';
 import { formatMs, playPreviewTone, resolveSpokenText } from '../utils/pronunciation';
 import { PanelZoomModal, type SaveStatus } from './PanelZoomModal';
+import { StoryboardEditor } from './StoryboardEditor';
 
 interface EpisodeStudioViewProps {
   episode: EpisodeItem;
@@ -42,7 +43,7 @@ interface EpisodeStudioViewProps {
   onExportEpisode: (episodeId: string, format: 'mp4' | 'ass' | 'script') => void;
 }
 
-type StudioTab = 'panels' | 'script' | 'timeline' | 'preview';
+type StudioTab = 'panels' | 'storyboard' | 'script' | 'timeline' | 'preview';
 
 const MOTION_LABELS: Record<CameraMotion, string> = {
   zoom_in: 'ZOOM_IN 缓推',
@@ -65,6 +66,8 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   onExportEpisode,
 }) => {
   const [activeTab, setActiveTab] = useState<StudioTab>('script');
+  /** Patch v4.0 Patch 20：镜头编排 Tab 的幕数（由 StoryboardEditor 加载后回传）。 */
+  const [storyboardSceneCount, setStoryboardSceneCount] = useState<number | null>(null);
   const [selectedPanelId, setSelectedPanelId] = useState<string>(
     episode.panels[0]?.panel_id ?? ''
   );
@@ -585,6 +588,13 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
             {(
               [
                 { id: 'panels', label: `分镜与视觉抽取 (${episode.panels.length})` },
+                {
+                  id: 'storyboard',
+                  label:
+                    storyboardSceneCount === null
+                      ? '镜头编排 (Storyboard)'
+                      : `镜头编排 (${storyboardSceneCount})`,
+                },
                 { id: 'script', label: `解说与多音字审核 (${draftBeats.length})` },
                 { id: 'timeline', label: '时间轴与执行日志' },
                 { id: 'preview', label: '成片动态预览' },
@@ -779,6 +789,18 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                   </div>
                 </div>
               </div>
+            )}
+
+            {/* Patch v4.0 Patch 20: 镜头编排（Storyboard）Tab */}
+            {activeTab === 'storyboard' && (
+              <StoryboardEditor
+                episode={episode}
+                onJobSubmitted={() => {
+                  // 后台任务进度由 App 层定时刷新剧集 stages 驱动，这里无需额外轮询。
+                }}
+                onSwitchToScriptTab={() => setActiveTab('script')}
+                onScenesLoaded={setStoryboardSceneCount}
+              />
             )}
 
             {/* TAB 2: Script & Polyphone Editor */}

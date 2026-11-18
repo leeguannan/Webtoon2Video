@@ -373,19 +373,19 @@ def test_path_helpers(tmp_path: Path) -> None:
 
 
 def test_sidechain_uses_gentle_v32_ducking(monkeypatch, tmp_path: Path) -> None:
-    """Patch v3.2 Patch 14：柔和漫评闪避参数被钉死。
+    """Patch v3.2 Patch 14：柔和漫评闪避参数被钉死（Patch v4.0 Patch 18 微调）。
 
-    BGM 先经 ``loudnorm`` 统一到 -16 LUFS 再降 -11.5dB，基线已规范化，
-    侧链压缩改为 threshold=0.05 / ratio=2.8 / attack=25ms / release=320ms，
+    BGM 先经 ``loudnorm`` 统一到 -16 LUFS 再降 -8.0dB（Patch 18 由 -11.5dB 上调），
+    基线已规范化，侧链压缩改为 threshold=0.06 / ratio=2.0 / attack=30ms / release=350ms，
     说话时温和退让 4~6dB、停顿时自然托底；旧的深压参数（0.01 / ratio=8）
     会让配乐忽大忽小，不得回退。
     """
     from stages import s7_renderer
 
-    assert s7_renderer._SIDECHAIN_THRESHOLD == 0.05
-    assert s7_renderer._SIDECHAIN_RATIO == 2.8
-    assert s7_renderer._SIDECHAIN_ATTACK_MS == 25
-    assert s7_renderer._SIDECHAIN_RELEASE_MS == 320
+    assert s7_renderer._SIDECHAIN_THRESHOLD == 0.06
+    assert s7_renderer._SIDECHAIN_RATIO == 2.0
+    assert s7_renderer._SIDECHAIN_ATTACK_MS == 30
+    assert s7_renderer._SIDECHAIN_RELEASE_MS == 350
 
     captured: dict[str, list[str]] = {}
 

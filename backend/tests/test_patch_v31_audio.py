@@ -471,10 +471,11 @@ def test_render_timeline_mixes_sfx_events(tmp_path: Path, monkeypatch: pytest.Mo
     joined = " ".join(" ".join(call) for call in calls)
     # 音效轨：延迟到事件时间点 + 峰值归一 + 降音量，并单独成轨。
     # Patch 14 起 SfxEvent 的 schema 默认增益(-10.0)被视为「未显式指定」，
-    # 沿用渲染配置的新默认 -3.5dB，且每条 SFX 链先过 dynaudnorm。
+    # 沿用渲染配置的默认（SFX 增益 Patch v4.0 Patch 18 起为 -2.0dB），
+    # 且每条 SFX 链先过 dynaudnorm。
     assert "adelay=200|200" in joined
     assert "dynaudnorm" in joined
-    assert "volume=-3.5dB" in joined
+    assert "volume=-2.0dB" in joined
     assert "[sfx]" in joined
     # 成片混音：人声 + 音效两路。
     assert "amix=inputs=2" in joined

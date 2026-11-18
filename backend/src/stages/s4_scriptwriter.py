@@ -36,8 +36,10 @@ from core.schemas import (
     ArcSummary,
     CharacterProfile,
     EpisodeStoryDraft,
+    EpisodeStoryboard,
     NarrationScript,
     PanelVisionInfo,
+    StoryboardScene,
     StoryChapter,
     VisionWindowOutput,
     load_model,
@@ -314,6 +316,185 @@ def _split_budget(budget_text: str, parts: int) -> list[str]:
     per_low = max(1, low // parts)
     per_high = max(per_low + 1, -(-high // parts))
     return [f"{per_low}~{per_high} 条" for _ in range(parts)]
+
+
+# --------------------------------------------------------------------------
+# Patch v4.0 Patch 19：Scene-Grounded 逐幕撰稿（动态配额 + 覆盖校验）
+# --------------------------------------------------------------------------
+#: Patch v4.0 Patch 19：全话解说句条数的动态上限（旧写死 50 条已废弃）。
+BEAT_TOTAL_HARD_MAX = 90
+#: Patch v4.0 Patch 19：单话故事正文的动态字数区间。
+STORY_WORD_HARD_MAX = 1700
+
+
+def compute_episode_beat_budget(
+    active_scene_count: int, valid_panel_count: int
+) -> tuple[int, int]:
+    """按「幕数 + 分镜密度」计算全话解说句条数预算，返回 ``(下限, 上限)``。
+
+    * 每幕基础 6~10 条；
+    * ``total_min = max(35, active_scene_count * 5)``；
+    * ``total_max = min(90, max(55, active_scene_count * 10,
+      round(valid_panel_count * 1.05)))``。
+
+    例：8 幕 / 75 格 → ``(40, 80)``（旧写死的 50 条上限明显不够用）。
+    """
+    scenes = max(1, int(active_scene_count))
+    panels = max(0, int(valid_panel_count))
+    total_min = max(BEAT_TOTAL_MIN, scenes * 5)
+    total_max = min(
+        BEAT_TOTAL_HARD_MAX,
+        max(55, scenes * 10, round(panels * 1.05)),
+    )
+    if total_max < total_min:
+        total_max = total_min
+    return total_min, total_max
+
+
+def compute_story_word_budget(
+    active_scene_count: int, valid_panel_count: int
+) -> tuple[int, int]:
+    """按幕数计算单话故事正文字数预算，返回 ``(下限, 上限)``。
+
+    每幕约 140~210 字，整体区间
+    ``[max(600, active_scene_count * 130), min(1700, max(1000, active_scene_count * 210))]``。
+    """
+    scenes = max(1, int(active_scene_count))
+    low = max(600, scenes * 130)
+    high = min(STORY_WORD_HARD_MAX, max(1000, scenes * 210))
+    if high < low:
+        high = low
+    return low, high
+
+
+def _strip_punctuation(text: str) -> str:
+    """去掉标点与空白，只留文字本体（用于必保原话比对）。"""
+    return re.sub(r"[^\w\u4e00-\u9fff]+", "", coerce_str(text))
+
+
+def _quote_core(quote: str) -> str:
+    """必保原话的核心片段（去标点后的正文）。"""
+    return _strip_punctuation(quote)
+
+
+def validate_storyboard_coverage(
+    beats: Sequence[dict[str, Any]],
+    active_scenes: Sequence[StoryboardScene],
+) -> list[StoryboardScene]:
+    """校验解说句是否覆盖了每个必保幕，返回**缺失幕列表**（空列表表示全通过）。
+
+    判定规则（Patch v4.0 Patch 19）：
+
+    1. 幕必须 ``enabled`` 且 ``must_cover``；
+    2. 命中该幕 ``panel_ids`` 的 beat 数量 ``>= 1``（该幕分镜 ``>= 3`` 格时至少 ``>= 2`` 条）；
+    3. 该幕 ``locked_quotes`` 的每一句，去标点后的核心片段（或前 6 字核心短语）
+       必须出现在命中该幕的 beat ``narration_text`` / ``tts_text`` 里。
+    """
+    missing: list[StoryboardScene] = []
+    for scene in active_scenes:
+        if not scene.enabled or not scene.must_cover:
+            continue
+        panel_ids = set(scene.panel_ids or [])
+        hit = [
+            beat
+            for beat in beats
+            if panel_ids & set(coerce_str_list(beat.get("target_panel_ids") or []))
+        ]
+        required = 2 if len(panel_ids) >= 3 else 1
+        if len(hit) < required:
+            missing.append(scene)
+            continue
+        spoken = _strip_punctuation(
+            " ".join(
+                f"{coerce_str(beat.get('narration_text'))}"
+                f"{coerce_str(beat.get('tts_text'))}"
+                for beat in hit
+            )
+        )
+        for quote in scene.locked_quotes or []:
+            core = _quote_core(quote)
+            if not core:
+                continue
+            probe = core[:6]
+            if core not in spoken and probe not in spoken:
+                missing.append(scene)
+                break
+    return missing
+
+
+def _storyboard_constraints_block(
+    active_scenes: Sequence[StoryboardScene],
+) -> str:
+    """给 4A 故事反写的「分幕约束」文本。"""
+    if not active_scenes:
+        return (
+            "【分幕约束】本话未启用镜头组编排：章节数 3~8 章，"
+            "按分镜时间顺序单调排列，每章自带 panel_hint_range。"
+        )
+    lines = [
+        f"【分幕约束】本话已切分为 {len(active_scenes)} 个镜头组，"
+        "章节数量与顺序必须与下表严格一一对应（第 i 章 = 第 i 幕）：",
+    ]
+    for index, scene in enumerate(active_scenes, start=1):
+        panel_ids = list(scene.panel_ids or [])
+        span = f"{panel_ids[0]} ~ {panel_ids[-1]}" if panel_ids else "（无分镜）"
+        lines.append(
+            f"- 第 {index} 幕（{scene.title or '未命名幕'}）："
+            f"分镜 {span}，共 {len(panel_ids)} 格"
+        )
+        if scene.user_note:
+            lines.append(f"  · 必讲要点：{scene.user_note}")
+        if scene.locked_quotes:
+            lines.append(f"  · 必保原话：{'；'.join(scene.locked_quotes)}")
+        if scene.visual_recap:
+            lines.append(f"  · 画面复核：{scene.visual_recap}")
+    return "\n".join(lines)
+
+
+def _scene_directives_block(scene: StoryboardScene | None) -> str:
+    """给 4B 拆拍的「本幕指令」文本。"""
+    if scene is None:
+        return "（本幕没有额外约束，按故事节奏自行拆拍）"
+    lines = [f"本幕标题：{scene.title or '未命名幕'}"]
+    if scene.user_note:
+        lines.append(f"必讲要点：{scene.user_note}")
+    if scene.locked_quotes:
+        lines.append(f"必保原话（必须原样念出）：{'；'.join(scene.locked_quotes)}")
+    if scene.visual_recap:
+        lines.append(f"画面复核：{scene.visual_recap}")
+    lines.append("本幕关键动作与转折必须讲到；只允许跳过纯粹重复的静态反应格。")
+    return "\n".join(lines)
+
+
+def _splice_scene_beats(
+    beats: list[dict[str, Any]],
+    scene: StoryboardScene,
+    new_beats: Sequence[dict[str, Any]],
+    ordered_panel_ids: Sequence[str],
+) -> list[dict[str, Any]]:
+    """把某幕补写出来的解说句插回全话列表中该幕应在的位置。"""
+    if not new_beats:
+        return beats
+    scene_panels = set(scene.panel_ids or [])
+    order = {panel_id: index for index, panel_id in enumerate(ordered_panel_ids)}
+    scene_start = order.get(
+        scene.panel_ids[0] if scene.panel_ids else "", len(ordered_panel_ids)
+    )
+    insert_at = len(beats)
+    later_index: int | None = None
+    for index, beat in enumerate(beats):
+        ids = coerce_str_list(beat.get("target_panel_ids") or [])
+        if scene_panels & set(ids):
+            insert_at = index
+            break
+        if later_index is None and ids:
+            positions = [order.get(panel_id, len(order)) for panel_id in ids]
+            if min(positions) > scene_start:
+                later_index = index
+    else:
+        if later_index is not None:
+            insert_at = later_index
+    return beats[:insert_at] + list(new_beats) + beats[insert_at:]
 
 #: 篇章摘要压缩器（Stage 4 用百炼 ``qwen-plus`` 压缩待归档原文）。
 ArcCompressor = Callable[[str], Awaitable[str]]
@@ -750,6 +931,23 @@ _SPEECH_VERBS: tuple[str, ...] = (
     "嘶",
 )
 
+#: Patch v4.0 Patch 18：引号内容「是不是真开口」的判定依据。
+#:
+#: ``lead_before`` 以这些引导标点结尾，说明引号里的话是**有人当场说出来的**。
+_QUOTE_LEAD_PUNCT: tuple[str, ...] = ("：", ":", "——", "，")
+
+#: 引号内容自成一句的句末标点（独立语调）。
+_SENTENCE_END_PUNCT: tuple[str, ...] = ("。", "！", "？", "…")
+
+#: 「完整主谓句式」的粗判正则：主语代词 + 不超过 6 个字 + 谓词。
+_COMPLETE_SENTENCE_RE = re.compile(
+    r"(我|你|他|她|它|咱|大家|我们|你们|他们|她们)"
+    r"[^，。！？、…]{0,6}"
+    r"(会|要|能|不敢|不能|不会|没有|是|有|想|去|来|走|说|道|问|答|快|别|滚|"
+    r"帮|给|爱|恨|死|活|打|杀|救|怕|哭|笑|叫|喊|醒|回|放|拿|抓|拉|推|开|关|"
+    r"站|坐|躺|睡|敢|让|把|为|在|等)"
+)
+
 #: 不能当人名的开头（避免把「她轻声说」里的「她轻」当成角色名）。
 _NON_NAME_PREFIXES: frozenset[str] = frozenset(
     {"他", "她", "它", "我", "你", "咱", "众", "有人", "两人", "三人"}
@@ -872,6 +1070,59 @@ def _pick_speaker_role(
     return name or role or "narrator"
 
 
+def _is_spoken_quote_segment(
+    inner: str,
+    lead_before: str,
+    tail_after: str,
+    *,
+    full_lead_in_len: int,
+) -> bool:
+    """这段引号是不是「角色真的开口说出来的话」。
+
+    Patch v4.0 Patch 18：叙述句里作名词 / 代称的引号短语不是台词。
+    ``继母恶毒地让他们带着这个“孤儿”立刻离开。`` 里的 ``“孤儿”`` 只是
+    一个词，硬拆会把一句话劈成「继母恶毒地让他们带着这个 / 孤儿 /
+    立刻离开。」三条支离破碎的 Beat。
+
+    只认下面几种「确实有人在说」的充分条件（任一成立即认为是台词）：
+
+    1. 整条 Beat 基本就是纯引号台词（引号外没有实质旁白）；
+    2. 引号前是引导词：以引导标点收尾，且前文出现说话动词
+       （``道振平静说道：``）或心理活动动词（``他心想：``）；
+    3. 引号内容自成一句完整的话：以句末语调标点收尾，或者净字数
+       达到 :data:`MIN_DIALOGUE_CHARS` 且内部含完整主谓句式。
+
+    都不成立时按「句中嵌入引用词」处理：并回引导文本，双引号保留给字幕。
+    """
+    text = coerce_str(inner).strip()
+    if not text:
+        return False
+    # ① 整条几乎就是纯引号台词。
+    if full_lead_in_len < 2:
+        return True
+    # ② 引号前有引导词（说话动词 / 心理动词 + 引导标点）。
+    lead = coerce_str(lead_before).rstrip()
+    for punct in _QUOTE_LEAD_PUNCT:
+        if not lead.endswith(punct):
+            continue
+        head = lead[: -len(punct)]
+        if any(verb in head for verb in _SPEECH_VERBS) or is_psychological_lead(head):
+            return True
+        break
+    # ③ 引号内容自成一句完整的话。
+    if text.endswith(_SENTENCE_END_PUNCT):
+        return True
+    tail = coerce_str(tail_after).strip()
+    tail_continues = bool(tail) and tail[0] not in _SENTENCE_END_PUNCT
+    if (
+        quote_char_count(text) >= MIN_DIALOGUE_CHARS
+        and _COMPLETE_SENTENCE_RE.search(text)
+        and not tail_continues
+    ):
+        return True
+    return False
+
+
 def split_mixed_quote_beats(
     beats: Sequence[dict[str, Any]],
     *,
@@ -892,6 +1143,11 @@ def split_mixed_quote_beats(
     整条本来就是纯引号对白时不做拆分，只归属角色并剥掉引号。
     所有子 Beat 共享同一组 ``target_panel_ids``（画面稳住不跳），
     并按新顺序重新编号 ``b1, b2, …``。
+
+    Patch v4.0 Patch 18：不是所有引号都是台词。叙述句里作名词 / 代称的
+    引号短语（``继母恶毒地让他们带着这个“孤儿”立刻离开。`` 里的 ``“孤儿”``）
+    会并回引导文本，保留双引号给字幕，不再把一句话劈成三条支离破碎的
+    Beat；判定规则见 :func:`_is_spoken_quote_segment`。
     """
     gender_index = _character_gender_index(characters)
     result: list[dict[str, Any]] = []
@@ -915,21 +1171,13 @@ def split_mixed_quote_beats(
         # 按引号边界切段：(kind, text, lead_before)
         # lead_before = 该引号段之前紧邻的引号外文本（没有则为 ""），
         # 用来判断这段台词是不是有独立的引导词（「继母指着…骂：」）。
-        segments: list[tuple[str, str, str]] = []
+        lead_parts: list[str] = []
         cursor = 0
-        pending_lead = ""
         for match in matches:
-            if match.start() > cursor:
-                text = narration[cursor : match.start()]
-                segments.append(("lead", text, ""))
-                pending_lead += text
-            segments.append(("quote", match.group(1), pending_lead))
-            pending_lead = ""
+            lead_parts.append(narration[cursor : match.start()])
             cursor = match.end()
-        if cursor < len(narration):
-            segments.append(("lead", narration[cursor:], ""))
-
-        lead_in = "".join(text for kind, text, _ in segments if kind == "lead")
+        lead_parts.append(narration[cursor:])
+        lead_in = "".join(lead_parts)
         original_tts = beat.get("tts_text")
         original_tts_text = coerce_str(original_tts)
         try:
@@ -937,9 +1185,22 @@ def split_mixed_quote_beats(
         except (TypeError, ValueError):
             pause = default_pause_after_ms
 
+        # Patch v4.0 Patch 18：逐段判断引号是不是「角色真的开口说的话」。
+        # 叙述句里作名词 / 代称的引号短语（「这个“孤儿”」）不是台词，
+        # 直接并回引导文本，不再单开子 Beat。
+        spoken_flags = [
+            _is_spoken_quote_segment(
+                match.group(1),
+                lead_parts[index],
+                lead_parts[index + 1],
+                full_lead_in_len=len(lead_in.strip()),
+            )
+            for index, match in enumerate(matches)
+        ]
+
         if len(lead_in.strip()) < 2:
             # 纯引号对白：整体归属对应角色，只剥外层引号 + 补角色信息。
-            inner = "".join(text for kind, text, _ in segments if kind == "quote").strip()
+            inner = "".join(match.group(1) for match in matches).strip()
             speaker_role = _pick_speaker_role(beat, lead_in, gender_index)
             beat["speaker_role"] = speaker_role
             beat["speaker_gender"] = _resolve_speaker_gender(
@@ -949,6 +1210,21 @@ def split_mixed_quote_beats(
                 beat["tts_text"] = _derive_tts_text(inner, original_tts_text)
             result.append(beat)
             continue
+
+        segments: list[tuple[str, str, str]] = []
+        pending_lead = ""
+        for index, match in enumerate(matches):
+            pending_lead += lead_parts[index]
+            if spoken_flags[index]:
+                segments.append(("lead", pending_lead, ""))
+                segments.append(("quote", match.group(1), pending_lead))
+                pending_lead = ""
+                continue
+            # 句中嵌入的引用词：并回引导文本，双引号保留给字幕。
+            pending_lead += match.group(0)
+        pending_lead += lead_parts[len(matches)]
+        if pending_lead:
+            segments.append(("lead", pending_lead, ""))
 
         speaker_role = _pick_speaker_role(beat, lead_in, gender_index)
         prev_quote_role = ""
@@ -1180,6 +1456,8 @@ async def _write_story_draft(
     series_title: str,
     template: str | None,
     temperature: float,
+    story_word_budget: str = "",
+    storyboard_constraints: str = "",
 ) -> EpisodeStoryDraft:
     """Stage 4A：全话通读 + 说书体故事反写，产出按时间单调排列的章节稿。
 
@@ -1188,6 +1466,9 @@ async def _write_story_draft(
 
     Patch v3.0-7：提示词换成 ``prompts/story_draft.md``（说书体正文，Story-First），
     模型默认走 ``story_model``（见 :func:`write_episode_script`）。
+
+    Patch v4.0 Patch 19：新增动态字数配额（``story_word_budget``）与分幕约束
+    （``storyboard_constraints``），章节数量/顺序必须与镜头组一一对应。
     """
     prompt = render_prompt(
         template if template is not None else load_prompt_template(STORY_PROMPT_FILENAME),
@@ -1198,6 +1479,9 @@ async def _write_story_draft(
             "EPISODE_NO": str(context.episode_no),
             "SERIES_TITLE": series_title or "未知作品",
             "BASE_SOURCE": context.base_source,
+            "STORY_WORD_BUDGET": story_word_budget or "600~1000 字",
+            "STORYBOARD_CONSTRAINTS": storyboard_constraints
+            or "【分幕约束】章节数 3~8 章，按分镜时间顺序单调排列。",
         },
     )
     # Patch v3.3 Patch 15：qwen4-max 未开通时自动降级到 qwen3.8-max/qwen-plus。
@@ -1312,6 +1596,7 @@ async def _write_narration_chapter(
     template: str | None,
     temperature: float,
     beat_budget: str = "",
+    scene_directives: str = "",
 ) -> list[dict]:
     """Step 4B：对一章故事做一次拆拍调用，产出这一章的解说句草稿。
 
@@ -1320,6 +1605,8 @@ async def _write_narration_chapter(
     * 章节窗口超过 ``CHAPTER_MAX_PANELS`` 时按上限切片，逐片调用；
     * 响应被 ``max_tokens`` 截断时按候选分镜对半拆开重跑，避免整章报废；
     * ``beat_budget`` 是给模型的条数配额文本（如「5~11 条」），切片时按片数平分；
+    * ``scene_directives`` 是 Patch v4.0 Patch 19 的「本幕指令」（必讲要点 /
+      必保原话 / 画面复核），让拆拍严格落在本幕镜头组里；
     * 返回原始 dict 列表（未归一化），由上层统一重排 ``beat_id`` 并做顺位校验。
     """
     if not panel_ids:
@@ -1351,6 +1638,7 @@ async def _write_narration_chapter(
                     template=template,
                     temperature=temperature,
                     beat_budget=chunk_budget,
+                    scene_directives=scene_directives,
                 )
             )
         return result
@@ -1371,6 +1659,7 @@ async def _write_narration_chapter(
             "PREVIOUS_TAIL": previous_tail or "（本话开头，没有上一句需要衔接）",
             "ALIGNMENT_FEEDBACK": alignment_feedback or "（首轮，没有需要修正的问题）",
             "BEAT_BUDGET": beat_budget or "按故事节奏自行决定条数",
+            "SCENE_DIRECTIVES": scene_directives or "（本幕没有额外约束）",
         },
     )
     try:
@@ -1409,6 +1698,7 @@ async def _write_narration_chapter(
             template=template,
             temperature=temperature,
             beat_budget=half_budgets[0],
+            scene_directives=scene_directives,
         )
         right = await _write_narration_chapter(
             client,
@@ -1425,6 +1715,7 @@ async def _write_narration_chapter(
             template=template,
             temperature=temperature,
             beat_budget=half_budgets[1],
+            scene_directives=scene_directives,
         )
         return left + right
     if not isinstance(data, dict):
@@ -1601,6 +1892,12 @@ async def write_episode_script(
     story_source_markdown: str | None = None,
     require_story_source: bool = False,
     force_story_markdown: bool = False,
+    storyboard: EpisodeStoryboard | None = None,
+    storyboard_path: Path | None = None,
+    vision_client: LLMClient | None = None,
+    vision_model: str = "",
+    panels_dir: Path | None = None,
+    reset_storyboard: bool = False,
 ) -> NarrationScript:
     """Story-First 两步撰稿：先讲清故事，再顺着故事挑图配解说。
 
@@ -1615,6 +1912,15 @@ async def write_episode_script(
 
     人工介入：若 ``04_script/story_draft.md`` 已被人工改过（或直接传入
     ``story_source_markdown``），4B 直接采用人工稿，不再调用 4A。
+
+    Patch v4.0 Patch 19（Scene-Grounded 逐幕撰稿）：传入 ``storyboard`` 或
+    ``storyboard_path`` 时启用镜头组编排——
+
+    * 4A 拿到「分幕约束」，章节数量与顺序必须与启用的镜头组一一对应；
+    * 4B 逐幕拆拍（每幕只看自己的分镜窗口，并收到本幕必讲要点/必保原话）；
+    * 条数配额改用 :func:`compute_episode_beat_budget` 动态伸缩；
+    * 结束后用 :func:`validate_storyboard_coverage` 硬校验覆盖度，缺失幕
+      **只对该幕**定向补写。
     """
     all_panels = list(vision.panels) if vision else []
     # Patch v2.5-1 第三重：版权声明/推广尾页/过渡空页硬过滤——既不进入 LLM
@@ -1654,6 +1960,55 @@ async def write_episode_script(
     valid_panel_ids = {panel.panel_id for panel in panels} if panels else None
     ordered_panel_ids = _ordered_panel_ids(valid_panel_ids or [])
     panel_map = {panel.panel_id: panel for panel in panels}
+
+    # ------------------------------------------------------------------
+    # Patch v4.0 Patch 19：镜头组编排（storyboard）+ 整幕视觉联看复核
+    # ------------------------------------------------------------------
+    # * 显式传入 storyboard 或 storyboard_path → 启用 Scene-Grounded 逐幕撰稿；
+    # * 两者都没有时，也在内存里聚一份镜头组，用于动态字数配额。
+    resolved_storyboard: EpisodeStoryboard | None = None
+    active_scenes: list[StoryboardScene] = []
+    scene_mode = False
+    if vision is not None and vision.panels:
+        # 局部导入，避免 stages 包内部的循环依赖。
+        from stages import s3b_scenes
+
+        if storyboard is not None:
+            resolved_storyboard = storyboard
+            scene_mode = True
+        elif storyboard_path is not None:
+            resolved_storyboard = s3b_scenes.load_or_build_storyboard(
+                episode_id,
+                vision,
+                Path(storyboard_path),
+                reset=reset_storyboard,
+            )
+            scene_mode = True
+        else:
+            resolved_storyboard = s3b_scenes.auto_build_storyboard(episode_id, vision)
+        if resolved_storyboard is not None:
+            active_scenes = [
+                scene for scene in resolved_storyboard.scenes if scene.enabled
+            ]
+            if vision_client is not None and panels_dir is not None:
+                resolved_storyboard = await s3b_scenes.enrich_storyboard_with_vision(
+                    vision_client,
+                    storyboard=resolved_storyboard,
+                    panels_dir=panels_dir,
+                    model=vision_model,
+                    force=False,
+                    vision=vision,
+                )
+                active_scenes = [
+                    scene for scene in resolved_storyboard.scenes if scene.enabled
+                ]
+    story_word_low, story_word_high = compute_story_word_budget(
+        max(1, len(active_scenes)), len(ordered_panel_ids)
+    )
+    story_word_budget = f"{story_word_low}~{story_word_high} 字"
+    storyboard_constraints = _storyboard_constraints_block(
+        active_scenes if scene_mode else []
+    )
 
     # ------------------------------------------------------------------
     # Stage 4A：整话通读 → 故事反写（章节稿）
@@ -1699,6 +2054,8 @@ async def write_episode_script(
                 series_title=series_title,
                 template=story_draft_template,
                 temperature=temperature,
+                story_word_budget=story_word_budget,
+                storyboard_constraints=storyboard_constraints,
             )
         except Exception as exc:  # noqa: BLE001 - 故事反写失败不阻断流水线
             # 故事反写失败不阻断流水线：退回整话概览作为 4B 的锚点。
@@ -1744,6 +2101,58 @@ async def write_episode_script(
     merged_beats: list[dict] = []
     errors: list[str] = []
     budget_low, budget_high = _chapter_beat_budget(len(chapter_blocks))
+    # Patch v4.0 Patch 19：Scene-Grounded 逐幕计划。
+    #
+    # * 默认仍按 4A 章节稿拆拍（向后兼容 Patch v3.x 的行为与历史单测）；
+    # * 启用镜头组编排时，改为「一幕一章一章拍」，窗口锁定该幕自己的分镜。
+    chapter_plan: list[tuple[StoryChapter, list[str], StoryboardScene | None]] = [
+        (chapter, window, None) for chapter, window in chapter_blocks
+    ]
+    scene_budgets: list[str] = []
+    if scene_mode and active_scenes:
+        chapters = list(story_draft.chapters or [])
+        if len(chapters) > len(active_scenes):
+            # 章多于幕：把多出来的章节正文并入最后一章，避免丢内容。
+            head = chapters[: len(active_scenes) - 1]
+            tail = chapters[len(active_scenes) - 1 :]
+            merged_tail = tail[0]
+            if len(tail) > 1:
+                merged_tail = merged_tail.model_copy(
+                    update={
+                        "story_prose": "\n".join(
+                            [merged_tail.story_prose or ""]
+                            + [(item.story_prose or "") for item in tail[1:]]
+                        ).strip()
+                    }
+                )
+            chapters = head + [merged_tail]
+        chapter_plan = []
+        for index, scene in enumerate(active_scenes):
+            if index < len(chapters):
+                chapter = chapters[index]
+            else:
+                chapter = StoryChapter(
+                    chapter_index=index + 1,
+                    chapter_title=scene.title or f"第 {index + 1} 幕",
+                    panel_hint_range=(
+                        (scene.panel_ids[0], scene.panel_ids[-1])
+                        if scene.panel_ids
+                        else ("", "")
+                    ),
+                    story_prose=scene.visual_recap or scene.user_note or "",
+                )
+            window = [
+                panel_id
+                for panel_id in scene.panel_ids
+                if not valid_panel_ids or panel_id in valid_panel_ids
+            ]
+            chapter_plan.append((chapter, window, scene))
+        episode_low, episode_high = compute_episode_beat_budget(
+            len(active_scenes), len(ordered_panel_ids)
+        )
+        scene_budgets = _split_budget(
+            f"{episode_low}~{episode_high} 条", len(chapter_plan)
+        )
     # Patch v3.1 Patch 10：4A 故事稿自检（元词汇 / 「他/她」连环开头）。
     # 只告警 + 把问题反馈给 4B，不阻断流水线。
     style_feedback = _story_style_feedback(story_draft)
@@ -1753,7 +2162,7 @@ async def write_episode_script(
         merged_beats = []
         chapter_errors: list[str] = []
         previous_tail = ""
-        for chapter, window in chapter_blocks:
+        for plan_index, (chapter, window, scene) in enumerate(chapter_plan):
             # 真机修复：反馈按章过滤，模型只收到自己候选窗口内能修的错误
             # （不含 panel id 的拼音/空绑定类错误仍全局广播）。
             chapter_feedback = "\n".join(
@@ -1763,6 +2172,11 @@ async def write_episode_script(
                 chapter_feedback = (
                     f"{chapter_feedback}\n{style_feedback}" if chapter_feedback else style_feedback
                 )
+            chapter_budget = (
+                scene_budgets[plan_index]
+                if scene_budgets and plan_index < len(scene_budgets)
+                else f"{budget_low}~{budget_high} 条"
+            )
             raw_beats = await _write_narration_chapter(
                 client,
                 model=model,
@@ -1777,7 +2191,8 @@ async def write_episode_script(
                 series_title=series_title,
                 template=beats_template,
                 temperature=temperature,
-                beat_budget=f"{budget_low}~{budget_high} 条",
+                beat_budget=chapter_budget,
+                scene_directives=_scene_directives_block(scene),
             )
             if not raw_beats:
                 chapter_errors.append(
@@ -1850,6 +2265,89 @@ async def write_episode_script(
                 f"[s4_scriptwriter] 顺位钳制完成，共修正 {len(clamp_logs)} 条解说。",
                 file=sys.stderr,
             )
+
+    # ------------------------------------------------------------------
+    # Patch v4.0 Patch 19：镜头组覆盖硬校验 + 缺失幕单幕定向补写
+    # ------------------------------------------------------------------
+    if scene_mode and active_scenes:
+        missing_scenes = validate_storyboard_coverage(merged_beats, active_scenes)
+        if missing_scenes:
+            titles = "、".join(
+                f"第 {scene.scene_index} 幕（{scene.title or '未命名'}）"
+                for scene in missing_scenes
+            )
+            print(
+                f"[s4_scriptwriter] 镜头组覆盖不足：{titles} 缺少解说或必保原话，"
+                "逐幕定向补写。",
+                file=sys.stderr,
+            )
+            for scene_index, scene in enumerate(missing_scenes):
+                plan_index = next(
+                    (
+                        index
+                        for index, item in enumerate(chapter_plan)
+                        if item[2] is not None and item[2].scene_id == scene.scene_id
+                    ),
+                    None,
+                )
+                if plan_index is None:
+                    continue
+                chapter, window, _ = chapter_plan[plan_index]
+                locked = "、".join(scene.locked_quotes or [])
+                reason = (
+                    f"上一稿漏掉了本幕必保台词「{locked}」或未覆盖尾幕分镜，"
+                    "请完整讲述本幕冲突与反转。"
+                    if locked
+                    else "上一稿未覆盖本幕分镜，请完整讲述本幕冲突与反转。"
+                )
+                budget = (
+                    scene_budgets[plan_index]
+                    if scene_budgets and plan_index < len(scene_budgets)
+                    else f"{budget_low}~{budget_high} 条"
+                )
+                new_beats = await _write_narration_chapter(
+                    client,
+                    model=model,
+                    context=context,
+                    chapter=chapter,
+                    panel_ids=window,
+                    panel_map=panel_map,
+                    story_full=story_draft.full_story_markdown or chapter.story_prose,
+                    previous_tail="",
+                    alignment_feedback=reason,
+                    episode_id=episode_id,
+                    series_title=series_title,
+                    template=beats_template,
+                    temperature=temperature,
+                    beat_budget=budget,
+                    scene_directives=_scene_directives_block(scene),
+                )
+                if not new_beats:
+                    continue
+                merged_beats = _splice_scene_beats(
+                    merged_beats, scene, new_beats, ordered_panel_ids
+                )
+            for index, beat in enumerate(merged_beats, start=1):
+                beat["beat_id"] = f"b{index}"
+            _canonicalize_beat_panel_ids(merged_beats, valid_panel_ids)
+            merged_beats = split_mixed_quote_beats(
+                merged_beats, characters=context.characters
+            )
+            merged_beats = deduplicate_adjacent_beats(merged_beats)
+            merged_beats = apply_dialogue_speaker_inheritance(merged_beats)
+            for index, beat in enumerate(merged_beats, start=1):
+                beat["beat_id"] = f"b{index}"
+            errors = validate_beat_alignment(
+                merged_beats,
+                ordered_panel_ids,
+                important_panel_ids=important_panel_ids,
+            )
+            errors += validate_tts_text_no_pinyin(merged_beats)
+            if errors:
+                print(
+                    f"[s4_scriptwriter] 补写后仍有 {len(errors)} 项校验异常：{errors}",
+                    file=sys.stderr,
+                )
 
     payload = {
         "hook_title": overview.get("hook_title"),
@@ -2040,12 +2538,21 @@ async def run_stage4(
     story_source_markdown: str | None = None,
     require_story_source: bool = False,
     force_story_markdown: bool = False,
+    storyboard: EpisodeStoryboard | None = None,
+    storyboard_path: str | Path | None = None,
+    vision_client: LLMClient | None = None,
+    vision_model: str = "",
+    panels_dir: str | Path | None = None,
+    reset_storyboard: bool = False,
 ) -> tuple[NarrationScript, Path]:
     """执行 Stage 4：出稿 → 落盘 → 更新记忆与快照，返回 ``(剧本, script.json 路径)``。
 
     产物：``04_script/script.json``、``04_script/script_readable.md``、
     ``04_script/story_draft.json``（Stage 4A 的故事稿）与
     ``04_script/story_draft.md``（人工可编辑的故事初稿）。
+
+    Patch v4.0 Patch 19：传入 ``storyboard_path`` 时启用 Scene-Grounded 逐幕撰稿，
+    并把镜头组编排落盘到 ``04_script/storyboard.json``（人工编排不会被覆写）。
     """
     series_root = Path(series_dir)
     resolved_episode_id = episode_id or f"ep_{episode_no:03d}"
@@ -2069,6 +2576,21 @@ async def run_stage4(
         if story_markdown_path is not None
         else target_dir / STORY_DRAFT_MD_FILENAME
     )
+    # Patch v4.0 Patch 19：镜头组编排（缺失时自动聚类并落盘；人工编排原样保留）。
+    resolved_storyboard = storyboard
+    storyboard_existed = False
+    if storyboard_path is not None:
+        from stages import s3b_scenes
+
+        board_path = Path(storyboard_path)
+        storyboard_existed = board_path.is_file()
+        if resolved_storyboard is None and vision is not None:
+            resolved_storyboard = s3b_scenes.load_or_build_storyboard(
+                resolved_episode_id,
+                vision,
+                board_path,
+                reset=reset_storyboard,
+            )
     script = await write_episode_script(
         client,
         model=model,
@@ -2085,7 +2607,22 @@ async def run_stage4(
         story_source_markdown=story_source_markdown,
         require_story_source=require_story_source,
         force_story_markdown=force_story_markdown,
+        storyboard=resolved_storyboard,
+        storyboard_path=storyboard_path,
+        vision_client=vision_client,
+        vision_model=vision_model,
+        panels_dir=panels_dir,
+        reset_storyboard=reset_storyboard,
     )
+    # 整幕视觉复核的结果只在「本次自动生成」时回写，人工编排一律不覆写。
+    if (
+        storyboard_path is not None
+        and resolved_storyboard is not None
+        and not storyboard_existed
+    ):
+        from stages import s3b_scenes
+
+        s3b_scenes.save_storyboard(resolved_storyboard, Path(storyboard_path))
 
     script_path = target_dir / SCRIPT_FILENAME
     save_model(script, script_path)

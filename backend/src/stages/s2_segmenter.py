@@ -56,6 +56,20 @@ MIN_PANEL_HEIGHT = 200
 BLANK_PANEL_INK_RATIO = 0.005   # 空白面板判据：中间调像素占比低于 0.5%
 BLANK_PANEL_EDGE_RATIO = 0.001  # 空白面板判据：Canny 边缘密度低于 0.1%
 
+#: Patch v4.0 Patch 18：暗黑高反差剧情格保护阈值。
+#:
+#: 深黑底 + 血红警示光 / 火光剪影的高潮格里常有**一条高亮的白色对白框**，
+#: 整幅画面却几乎全是黑像素：全局中间调占比与全局边缘密度都低得能被
+#: 判成「纯黑空白页」，于是这格高潮戏被整格切掉、故事断在半句。
+#:
+#: * ``DARK_SCENE_ROW_STD_MIN``：逐行像素标准差的峰值下限。黑底上的亮框
+#:   会让穿框的那几行标准差暴涨（接近 127），纯黑页则接近 0。
+#: * ``DARK_SCENE_LOCAL_EDGE_MIN``：局部（逐行）Canny 边缘密度下限。
+#:   亮框的上下边线会在少数几行产生密集边缘；右侧补白那种整列竖边
+#:   的密度只有 1/宽度 量级，达不到这个阈值。
+DARK_SCENE_ROW_STD_MIN = 18.0
+DARK_SCENE_LOCAL_EDGE_MIN = 0.02
+
 #: Canny 边缘检测阈值。
 CANNY_LOW = 100
 CANNY_HIGH = 200
@@ -462,16 +476,40 @@ def _pad_to_width(image: np.ndarray, width: int) -> np.ndarray:
     )
 
 
+def _has_local_structure(gray: np.ndarray) -> bool:
+    """画面整体偏暗，但局部是否存在清晰结构（亮框 / 人脸轮廓 / 字幕边缘）。
+
+    Patch v4.0 Patch 18：暗黑高潮格的全局指标（中间调占比、全局边缘密度）
+    都很低，单看全局会把「深黑底 + 一条高亮白色对白框」判成纯黑空白页。
+    这里改看**局部行高对比峰值**：穿框的那几行像素标准差会暴涨，
+    同时该处必须真的有局部边缘（纯补白竖边达不到边缘密度阈值）。
+    """
+    if gray.size == 0 or gray.ndim != 2:
+        return False
+    row_std = gray.astype(np.float32).std(axis=1)
+    if float(row_std.max()) < DARK_SCENE_ROW_STD_MIN:
+        return False
+    edge_rows = canny_edge_density(gray)
+    return float(edge_rows.max()) >= DARK_SCENE_LOCAL_EDGE_MIN
+
+
 def is_blank_panel(gray: np.ndarray) -> bool:
     """整块近乎无内容（纯白 / 纯黑）时判定为空白面板。
 
     判据取两项同时成立：中间调像素占比极低 **且** Canny 边缘密度极低。
     只看像素取值不行——白底黑线的漫画页几乎没有中间调像素，会被误判成空白；
     只看方差也不行——右侧补白边会把纯黑封面页的方差放大。
+
+    Patch v4.0 Patch 18：全局指标之外再加一道**局部结构保护**——
+    深黑底 + 高亮白色对白框的高潮剧情格同样没有中间调像素，
+    但它有明显的局部行高对比与局部边缘，这类画面一律判为**有效画面**，
+    绝不能当成纯黑空白页切掉。
     """
     mid = float(((gray > 40) & (gray < 215)).mean())
     edges = float(canny_edge_density(gray).mean())
-    return mid < BLANK_PANEL_INK_RATIO and edges < BLANK_PANEL_EDGE_RATIO
+    if mid >= BLANK_PANEL_INK_RATIO or edges >= BLANK_PANEL_EDGE_RATIO:
+        return False
+    return not _has_local_structure(gray)
 
 
 def _detect_overlaps(images: list[np.ndarray]) -> tuple[int, ...]:

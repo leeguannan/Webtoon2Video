@@ -13,6 +13,10 @@
 ``POST /api/episodes/{eid}/rerun`` 从指定阶段断点重跑
 ``PUT /api/episodes/{eid}/script`` 保存人工修改的 beats（可选从 Stage 5 重跑）
 ``PATCH /api/episodes/{eid}/panels/{pid}``  标记 / 取消 ``is_transition_blank``
+``GET  /api/episodes/{eid}/panels/{file}``   分镜原图回源（Storyboard 缩略图）
+``GET/PUT /api/episodes/{eid}/storyboard``   镜头编排读取 / 人工保存（Patch 20）
+``POST /api/episodes/{eid}/storyboard/reset``    恢复自动分组
+``POST /api/episodes/{eid}/storyboard/generate`` 按镜头组重跑 S4 / 一键制片
 ``GET /api/episodes/{eid}/events``            SSE 实时推送阶段状态与日志
 ``GET /api/episodes/{eid}/export``            下载成片 / 外挂字幕 / 文稿
 ``GET /api/series/{sid}/export-zip``          批量打包成片为 ZIP
@@ -55,16 +59,20 @@ from core.config import (
     resolve_voice_for_tts_model,
 )
 from core.manifest import ManifestManager, infer_stage_artifacts, infer_stage_status
+from core.panel_ids import panel_sort_key
 from core.schemas import (
     ArcSummary,
     CharacterProfile,
     DialogueBubble,
+    EpisodeStoryboard,
     NarrationScript,
     PlotThread,
     ScriptBeat,
     SeriesCatalog,
     StageStatus,
     StoryBibleV2,
+    StoryboardScene,
+    VisionWindowOutput,
     load_model,
     save_model,
 )
@@ -80,7 +88,7 @@ from providers.tts_qwen import (
     QWEN3_TTS_VOICES,
     voice_sample_filename,
 )
-from stages import s0_catalog, s5_tts, s6_timeline, s7_renderer
+from stages import s0_catalog, s3b_scenes, s5_tts, s6_timeline, s7_renderer
 from web.job_runner import STAGE_DEFS, EpisodeState, JobError, JobRunner
 
 #: 面板图片后缀。
@@ -321,6 +329,109 @@ class ScriptUpdateRequest(BaseModel):
     beats: list[dict[str, Any]] = Field(default_factory=list)
     from_stage: str | None = None
     mode: str = "full_video"
+
+
+# ---------------------------------------------------------------------------
+# Patch v4.0 Patch 20：镜头编排（Storyboard）接口
+# ---------------------------------------------------------------------------
+class StoryboardUpdateRequest(BaseModel):
+    """``PUT /api/episodes/{ep_id}/storyboard`` 请求体。"""
+
+    scenes: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class StoryboardGenerateRequest(BaseModel):
+    """``POST /api/episodes/{ep_id}/storyboard/generate`` 请求体。"""
+
+    scenes: list[dict[str, Any]] | None = None
+    mode: str = "phase1_only"
+
+
+#: 镜头组重生成支持的任务模式。
+STORYBOARD_MODES: frozenset[str] = frozenset({"phase1_only", "full_video"})
+
+#: 面板图片后缀 → media type（``/panels/{filename}`` 静态回源用）。
+PANEL_MEDIA_TYPES: dict[str, str] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+}
+
+
+def _load_episode_vision(episode_dir: Path) -> VisionWindowOutput | None:
+    """读取一话的 Stage 3 视觉结果；缺失或损坏时返回 ``None``。"""
+    vision_path = episode_dir / "03_vision" / "vision.json"
+    if not vision_path.is_file():
+        return None
+    try:
+        return load_model(VisionWindowOutput, vision_path)
+    except Exception:  # noqa: BLE001 - 视觉结果损坏按「尚未识图」处理
+        return None
+
+
+def _validate_storyboard_scenes(
+    raw_scenes: list[dict[str, Any]], valid_panel_ids: set[str]
+) -> list[StoryboardScene]:
+    """校验前端提交的镜头组并构造 ``StoryboardScene`` 列表。
+
+    规则（违例一律抛 ``400``，不交给 pydantic 的 422）：
+
+    * 至少保留一幕，每幕 ``panel_ids`` 非空；
+    * 同一分镜不允许跨幕重复引用；
+    * 所有分镜必须属于本话；
+    * 幕内分镜按 :func:`panel_sort_key` 单调不减排列。
+    """
+    if not raw_scenes:
+        raise HTTPException(status_code=400, detail="至少保留一个镜头组")
+    seen: set[str] = set()
+    scenes: list[StoryboardScene] = []
+    for index, raw in enumerate(raw_scenes):
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=400, detail=f"第 {index + 1} 幕格式不正确")
+        panel_ids = [str(pid).strip() for pid in (raw.get("panel_ids") or [])]
+        panel_ids = [pid for pid in panel_ids if pid]
+        if not panel_ids:
+            raise HTTPException(
+                status_code=400, detail=f"第 {index + 1} 幕的 panel_ids 不能为空"
+            )
+        duplicate = next((pid for pid in panel_ids if pid in seen), "")
+        if duplicate:
+            raise HTTPException(
+                status_code=400,
+                detail=f"分镜 {duplicate} 被多个镜头组重复引用，请先拆分或合并",
+            )
+        unknown = next((pid for pid in panel_ids if pid not in valid_panel_ids), "")
+        if unknown:
+            raise HTTPException(
+                status_code=400, detail=f"分镜 {unknown} 不属于本话有效分镜"
+            )
+        ordered = [panel_sort_key(pid) for pid in panel_ids]
+        if any(ordered[i] > ordered[i + 1] for i in range(len(ordered) - 1)):
+            raise HTTPException(
+                status_code=400,
+                detail=f"第 {index + 1} 幕的分镜顺序必须单调不减",
+            )
+        seen.update(panel_ids)
+        scenes.append(
+            StoryboardScene(
+                # 与 s3b_scenes 约定对齐：scene_index 1-based、scene_id 前缀 sc_。
+                scene_id=str(raw.get("scene_id") or f"sc_{index + 1:03d}"),
+                scene_index=index + 1,
+                title=str(raw.get("title") or ""),
+                location=str(raw.get("location") or ""),
+                panel_ids=panel_ids,
+                enabled=bool(raw.get("enabled", True)),
+                must_cover=bool(raw.get("must_cover", True)),
+                user_note=str(raw.get("user_note") or ""),
+                locked_quotes=[
+                    str(item) for item in (raw.get("locked_quotes") or []) if str(item)
+                ],
+                visual_recap=str(raw.get("visual_recap") or ""),
+            )
+        )
+    return scenes
 
 
 #: 前端保存脚本时不会回传这些字段（由 Stage 4 产出、前端只读展示）。
@@ -1070,6 +1181,159 @@ def create_app(
             )
             result["job"] = job
         return result
+
+    # ------------------------------------------------------------------
+    # 镜头编排（Storyboard，Patch v4.0 Patch 20）
+    # ------------------------------------------------------------------
+    def _storyboard_payload(
+        storyboard: EpisodeStoryboard,
+        episode_id: str,
+        series_id: str,
+        episode_no: int,
+    ) -> dict[str, Any]:
+        """组装镜头编排响应：storyboard 本体 + 每格缩略图/摘要/对白索引。"""
+        panels_index: dict[str, dict[str, Any]] = {}
+        file_by_id = {
+            item["panel_id"]: Path(item["image_url"]).name
+            for item in view.panels(series_id, episode_no)
+        }
+        for panel in view._vision_panels(view.episode_dir(series_id, episode_no)):
+            filename = file_by_id.get(panel.panel_id, f"{panel.panel_id}.png")
+            panels_index[panel.panel_id] = {
+                "panel_id": panel.panel_id,
+                "image_url": f"/api/episodes/{episode_id}/panels/{filename}",
+                "scene_summary": panel.scene_summary,
+                "dialogues": [item.model_dump() for item in panel.dialogues],
+            }
+        payload = storyboard.model_dump()
+        payload["panels_index"] = panels_index
+        return payload
+
+    @app.get("/api/episodes/{episode_id}/storyboard")
+    async def get_storyboard(episode_id: str) -> dict[str, Any]:
+        located = view.find_episode(episode_id)
+        if located is None:
+            raise HTTPException(status_code=404, detail=f"找不到话次：{episode_id}")
+        series_id, episode_no = located
+        episode_dir = view.episode_dir(series_id, episode_no)
+        vision = _load_episode_vision(episode_dir)
+        if vision is None:
+            raise HTTPException(
+                status_code=404, detail="该话还没有 Stage 3 视觉结果，无法编排镜头组"
+            )
+        storyboard_path = s3b_scenes.storyboard_path_for(episode_dir)
+        storyboard = s3b_scenes.load_storyboard(storyboard_path)
+        if storyboard is None:
+            # 首次打开：自动聚类并落盘，后续人工编辑与重置都基于这份文件。
+            storyboard = s3b_scenes.auto_build_storyboard(episode_id, vision)
+            s3b_scenes.save_storyboard(storyboard, storyboard_path)
+        return _storyboard_payload(storyboard, episode_id, series_id, episode_no)
+
+    @app.put("/api/episodes/{episode_id}/storyboard")
+    async def save_storyboard(
+        episode_id: str, payload: StoryboardUpdateRequest
+    ) -> dict[str, Any]:
+        located = view.find_episode(episode_id)
+        if located is None:
+            raise HTTPException(status_code=404, detail=f"找不到话次：{episode_id}")
+        series_id, episode_no = located
+        episode_dir = view.episode_dir(series_id, episode_no)
+        vision = _load_episode_vision(episode_dir)
+        if vision is None:
+            raise HTTPException(status_code=404, detail="该话还没有 Stage 3 视觉结果")
+        valid_panel_ids = {panel.panel_id for panel in vision.panels}
+        scenes = _validate_storyboard_scenes(payload.scenes, valid_panel_ids)
+        # 人工保存一律标记 source="human"，此后自动流程与 reset 之外绝不覆写。
+        storyboard = EpisodeStoryboard(
+            episode_id=episode_id, source="human", scenes=scenes
+        )
+        storyboard_path = s3b_scenes.storyboard_path_for(episode_dir)
+        s3b_scenes.save_storyboard(storyboard, storyboard_path)
+        return _storyboard_payload(storyboard, episode_id, series_id, episode_no)
+
+    @app.post("/api/episodes/{episode_id}/storyboard/reset")
+    async def reset_storyboard(episode_id: str) -> dict[str, Any]:
+        located = view.find_episode(episode_id)
+        if located is None:
+            raise HTTPException(status_code=404, detail=f"找不到话次：{episode_id}")
+        series_id, episode_no = located
+        episode_dir = view.episode_dir(series_id, episode_no)
+        vision = _load_episode_vision(episode_dir)
+        if vision is None:
+            raise HTTPException(status_code=404, detail="该话还没有 Stage 3 视觉结果")
+        storyboard = s3b_scenes.auto_build_storyboard(episode_id, vision)
+        storyboard_path = s3b_scenes.storyboard_path_for(episode_dir)
+        s3b_scenes.save_storyboard(storyboard, storyboard_path)
+        return _storyboard_payload(storyboard, episode_id, series_id, episode_no)
+
+    @app.post("/api/episodes/{episode_id}/storyboard/generate")
+    async def generate_from_storyboard(
+        episode_id: str, payload: StoryboardGenerateRequest
+    ) -> dict[str, Any]:
+        located = view.find_episode(episode_id)
+        if located is None:
+            raise HTTPException(status_code=404, detail=f"找不到话次：{episode_id}")
+        if payload.mode not in STORYBOARD_MODES:
+            raise HTTPException(
+                status_code=400, detail="mode 只支持 phase1_only / full_video"
+            )
+        series_id, episode_no = located
+        episode_dir = view.episode_dir(series_id, episode_no)
+        vision = _load_episode_vision(episode_dir)
+        if vision is None:
+            raise HTTPException(status_code=404, detail="该话还没有 Stage 3 视觉结果")
+        storyboard_path = s3b_scenes.storyboard_path_for(episode_dir)
+        if payload.scenes:
+            # 带 scenes：先按人工编排保存（source="human"），再入队重跑。
+            valid_panel_ids = {panel.panel_id for panel in vision.panels}
+            scenes = _validate_storyboard_scenes(payload.scenes, valid_panel_ids)
+            storyboard = EpisodeStoryboard(
+                episode_id=episode_id, source="human", scenes=scenes
+            )
+            s3b_scenes.save_storyboard(storyboard, storyboard_path)
+        else:
+            storyboard = s3b_scenes.load_storyboard(storyboard_path)
+            if storyboard is None:
+                storyboard = s3b_scenes.auto_build_storyboard(episode_id, vision)
+                s3b_scenes.save_storyboard(storyboard, storyboard_path)
+        try:
+            job = await job_runner.submit_episode(
+                series_id,
+                episode_no,
+                from_stage="s4_scriptwriter",
+                mode=payload.mode,
+            )
+        except JobError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "job": job,
+            "storyboard": _storyboard_payload(
+                storyboard, episode_id, series_id, episode_no
+            ),
+        }
+
+    @app.get("/api/episodes/{episode_id}/panels/{filename}")
+    async def get_episode_panel_file(episode_id: str, filename: str) -> FileResponse:
+        """按文件名回源一话的分镜原图（Storyboard 缩略图与识图复核共用）。"""
+        located = view.find_episode(episode_id)
+        if located is None:
+            raise HTTPException(status_code=404, detail=f"找不到话次：{episode_id}")
+        series_id, episode_no = located
+        safe_name = Path(filename).name  # 只取文件名，防路径穿越
+        suffix = Path(safe_name).suffix.lower()
+        if suffix not in PANEL_SUFFIXES:
+            raise HTTPException(status_code=404, detail="不支持的图片格式")
+        path = view.episode_dir(series_id, episode_no) / "02_panels" / safe_name
+        if not path.is_file():
+            raise HTTPException(
+                status_code=404, detail=f"找不到分镜图片：{safe_name}"
+            )
+        return FileResponse(
+            path,
+            media_type=PANEL_MEDIA_TYPES.get(suffix, "application/octet-stream"),
+            filename=safe_name,
+            content_disposition_type="inline",
+        )
 
     @app.patch("/api/episodes/{episode_id}/panels/{panel_id}")
     async def flag_panel(

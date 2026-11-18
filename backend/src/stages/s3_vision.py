@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,7 +21,7 @@ from typing import Any
 
 from PIL import Image, ImageOps
 
-from core.normalize import normalize_panel_payload
+from core.normalize import coerce_str, normalize_panel_payload
 from core.schemas import PanelVisionInfo, VisionWindowOutput, save_model
 from providers.image_utils import encode_image_data_url, encode_pil_data_url
 from providers.llm_base import ChatMessage, ContentPart, LLMClient, parse_json_response
@@ -60,6 +61,46 @@ NON_STORY_SFX_TYPES = frozenset({"sfx_only"})
 
 #: 参与视觉抽取的图片后缀。
 IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp"})
+
+# --------------------------------------------------------------------------
+# Patch v4.0 Patch 18：暗黑高潮格护栏
+# --------------------------------------------------------------------------
+#: 深黑底 + 血红警示光 / 火光剪影的高潮剧情格，极易被模型误判成过渡空页、
+#: 纯字卡或纯拟声格，随后在 Stage 4 被整格剔除，结尾反转直接被砍。
+#: 这里用**确定性关键词判据**把它们救回来（不依赖模型自觉）。
+
+#: 去掉标点 / 空白后的净字符（判断「有效台词」用）。
+_PUNCT_ONLY_RE = re.compile(r"[^\w]+", re.UNICODE)
+
+#: 人物 / 躯体证据词（``scene_summary`` 里出现即说明画面里有人）。
+_DRAMATIC_PERSON_KEYWORDS: tuple[str, ...] = (
+    "男人", "女人", "男子", "女子", "少年", "少女", "男孩", "女孩", "老人", "孩子",
+    "婴儿", "身影", "剪影", "人影", "面孔", "脸", "眼睛", "视线", "目光", "表情",
+    "嘴角", "眉头", "头发", "手掌", "手指", "双腿", "肩膀", "后背", "胸膛",
+    "倒地", "跪着", "躺着", "坐着", "站着",
+)
+
+#: 躯体动作证据词（打耳光、推搡、倒地这类高潮动作）。
+_DRAMATIC_ACTION_KEYWORDS: tuple[str, ...] = (
+    "挥", "扇", "抓", "推", "拉", "摔", "撞", "倒", "跌", "扑", "跪", "跑", "冲",
+    "抱", "握", "攥", "举", "扔", "踢", "掐", "挣", "拖", "扶", "压", "抹", "撕",
+    "打", "踹", "拽", "捂", "抬手", "转身", "低头", "抬头", "咬牙", "发抖",
+)
+
+#: 空间证据词（单有空间词还不够，必须再有人物指代才判定为剧情格）。
+_DRAMATIC_SPACE_KEYWORDS: tuple[str, ...] = (
+    "病房", "走廊", "客厅", "卧室", "厨房", "教室", "办公室", "地下室", "停车场",
+    "街道", "巷子", "房间", "屋内", "门外", "窗边", "床边", "沙发", "车里", "院子",
+    "花园", "楼道", "阳台", "医院", "大厅", "仓库", "天台", "桥上", "街口",
+)
+
+#: 人物指代词（与空间词同时出现才算「有人在此处发生了什么」）。
+_DRAMATIC_PERSON_MARKERS: tuple[str, ...] = (
+    "他", "她", "他们", "她们", "有人", "那人", "此人", "二人", "两人", "众人",
+)
+
+#: 有效台词的净字数下限（去掉标点后仍要够长，纯拟声词「啪！」不算）。
+_DRAMATIC_DIALOGUE_MIN_CHARS = 3
 
 
 class VisionError(RuntimeError):
@@ -292,7 +333,6 @@ def describe_panel_shape(image_path: str | Path) -> str:
 
 def _tile_shape_text(tile: PanelTile) -> str:
     """描述当前切片在整格中的位置（提示词 ``{{PANEL_SHAPE}}`` 用）。"""
-    span = tile.bottom - tile.top
     ratio = (tile.bottom - tile.top) / max(1, tile.total_height)
     return (
         f"本格是**超高竖长画格**（总高 {tile.total_height}px）的第 "
@@ -592,6 +632,63 @@ async def extract_episode_vision(
     return VisionWindowOutput(panels=panels)
 
 
+def _strip_punct(text: str) -> str:
+    """去掉标点 / 空白后的净字符（判断「有效台词」用）。"""
+    return _PUNCT_ONLY_RE.sub("", coerce_str(text))
+
+
+def _has_dramatic_evidence(summary: str) -> bool:
+    """``scene_summary`` 里是否写明了人物 / 躯体动作 / 空间。
+
+    纯空间词（"走廊""病房"）不足以判定这是剧情格——空镜也会写地点，
+    必须同时出现人物指代；人物与动作词则可以直接判定。
+    """
+    text = coerce_str(summary)
+    if not text:
+        return False
+    if any(keyword in text for keyword in _DRAMATIC_PERSON_KEYWORDS):
+        return True
+    if any(keyword in text for keyword in _DRAMATIC_ACTION_KEYWORDS):
+        return True
+    if any(keyword in text for keyword in _DRAMATIC_SPACE_KEYWORDS) and any(
+        marker in text for marker in _DRAMATIC_PERSON_MARKERS
+    ):
+        return True
+    return False
+
+
+def protect_dramatic_panels(panels: list[PanelVisionInfo]) -> list[PanelVisionInfo]:
+    """暗黑高潮格护栏：把被误判成空页 / 纯字卡 / 纯拟声的高潮格救回来。
+
+    Patch v4.0 Patch 18：深黑底 + 血红警示光 / 火光剪影的高潮剧情格，
+    常被模型标成 ``is_transition_blank=true`` / ``is_pure_text_card=true`` /
+    ``non_story_type="sfx_only"``，Stage 4 就会整格剔除——结尾的反转
+    （绑匪倒下 → 火光后有人露脸 → 惊呼）就是这样被砍掉的。
+
+    判据（任一成立即恢复成普通剧情格）：
+
+    1. 该格有**有效台词**：去掉标点后仍 ≥ 3 字（纯拟声词「啪！」不算）；
+    2. ``scene_summary`` 写明了人物 / 躯体动作 / 空间。
+
+    版权声明页与推广尾页（``copyright_notice`` / ``promo_banner``）不在此列。
+    """
+    protected: list[PanelVisionInfo] = []
+    for panel in panels:
+        if panel.non_story_type in NON_STORY_BANNER_TYPES:
+            protected.append(panel)
+            continue
+        has_dialogue = any(
+            len(_strip_punct(bubble.text)) >= _DRAMATIC_DIALOGUE_MIN_CHARS
+            for bubble in panel.dialogues
+        )
+        if has_dialogue or _has_dramatic_evidence(panel.scene_summary):
+            panel.is_transition_blank = False
+            panel.is_pure_text_card = False
+            panel.non_story_type = "none"
+        protected.append(panel)
+    return protected
+
+
 def vision_dir_for(series_dir: str | Path, episode_no: int) -> Path:
     """``03_vision`` 目录路径。"""
     return Path(series_dir) / "episodes" / f"ep_{episode_no:03d}" / VISION_DIR_NAME
@@ -631,6 +728,9 @@ async def run_stage3(
     target_dir = vision_dir_for(series_root, episode_no)
     target_dir.mkdir(parents=True, exist_ok=True)
     path = target_dir / "vision.json"
+    # Patch v4.0 Patch 18：暗黑高潮格护栏——落盘前把被误判成空页 / 纯字卡 /
+    # 纯拟声格的高潮剧情格救回来（深黑底 + 红光剪影格最容易被整格剔除）。
+    protect_dramatic_panels(output.panels)
     # Patch v3.0-6：先清掉上一轮的 vision.json，避免新旧 ID 并存时下游
     # 读到两套分镜（那正是「同一话播两遍」的根因之一）。
     for stale in (path, target_dir / "vision_failures.json"):

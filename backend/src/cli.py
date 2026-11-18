@@ -44,7 +44,14 @@ from core.schemas import (
 )
 from providers.llm_base import LLMClient
 from providers.llm_bailian import BailianClient
-from stages import s0_catalog, s1_crawler, s2_segmenter, s3_vision, s4_scriptwriter
+from stages import (
+    s0_catalog,
+    s1_crawler,
+    s2_segmenter,
+    s3_vision,
+    s3b_scenes,
+    s4_scriptwriter,
+)
 
 #: 部级互斥锁仓库（规范第 1.1 节：``series_locks: dict[str, asyncio.Lock]``）。
 _SERIES_LOCKS: dict[str, asyncio.Lock] = {}
@@ -862,6 +869,228 @@ async def run_narrate_from_story(
     )
 
 
+async def run_storyboard_series(
+    series_id: str,
+    *,
+    config: AppConfig,
+    episodes_spec: str = "",
+    concurrency: int = 4,
+    client_factory: Any = None,
+    reset: bool = False,
+    enrich: bool = True,
+) -> dict[str, Any]:
+    """``w2v storyboard``：按 03_vision/vision.json 生成/重置镜头组编排。
+
+    产物：``episodes/ep_XXX/04_script/storyboard.json``。
+
+    * ``reset=True`` → 重新自动聚类并覆盖落盘；
+    * 默认还会对每一幕做一次「整幕视觉联看复核」（把结果写进
+      ``scene.visual_recap``），人工编排（``source="human"``）不会被覆写。
+    """
+    registry = s0_catalog.CatalogRegistry(config.workspace_root())
+    catalog = registry.load_catalog(series_id)
+    if catalog is None:
+        raise ConfigError(f"作品未登记：{series_id}（先执行 w2v download）")
+    episodes = select_episodes(catalog, episodes_spec)
+    episodes.sort(key=lambda episode: episode.episode_no)
+    series_dir = registry.series_dir(series_id)
+    series_config = load_series_config(series_dir)
+    vision_model = series_config.model_overrides.get("vision", config.models.vision)
+
+    factory = client_factory or (lambda: BailianClient(config=config))
+    client: LLMClient = factory()
+    boards: list[str] = []
+    try:
+        for episode in episodes:
+            vision_path = (
+                series_dir
+                / "episodes"
+                / f"ep_{episode.episode_no:03d}"
+                / "03_vision"
+                / "vision.json"
+            )
+            if not Path(vision_path).is_file():
+                raise ConfigError(
+                    f"第 {episode.episode_no} 话还没有识图结果：{vision_path}"
+                    "（先执行 w2v understand）"
+                )
+            vision = load_model(VisionWindowOutput, vision_path)
+            board_path = (
+                s4_scriptwriter.script_dir_for(series_dir, episode.episode_no)
+                / s3b_scenes.STORYBOARD_FILENAME
+            )
+            storyboard = s3b_scenes.load_or_build_storyboard(
+                episode.episode_id,
+                vision,
+                board_path,
+                reset=reset,
+            )
+            if enrich:
+                storyboard = await s3b_scenes.enrich_storyboard_with_vision(
+                    client,
+                    storyboard=storyboard,
+                    panels_dir=s2_segmenter.panels_dir_for(
+                        series_dir, episode.episode_no
+                    ),
+                    model=vision_model,
+                    force=False,
+                    vision=vision,
+                )
+                # 人工编排一律不覆写（只回写自动生成的清单）。
+                if storyboard.source == "auto":
+                    s3b_scenes.save_storyboard(storyboard, board_path)
+            boards.append(str(board_path))
+    finally:
+        close = getattr(client, "aclose", None)
+        if close is not None:
+            await close()
+
+    return {
+        "command": "storyboard",
+        "series_id": series_id,
+        "series_title": catalog.series_title,
+        "episodes": [episode.episode_no for episode in episodes],
+        "storyboards": boards,
+    }
+
+
+async def run_narrate_from_storyboard(
+    series_id: str,
+    *,
+    config: AppConfig,
+    episodes_spec: str = "",
+    concurrency: int = 4,
+    client_factory: Any = None,
+) -> dict[str, Any]:
+    """``w2v narrate-from-storyboard``：读已有 storyboard.json 跑 Stage 4 逐幕撰稿。
+
+    人工编排（``source="human"`` 的镜头组、必讲要点、必保原话）**原样保留**，
+    不会被自动重建覆盖。
+    """
+    registry = s0_catalog.CatalogRegistry(config.workspace_root())
+    catalog = registry.load_catalog(series_id)
+    if catalog is None:
+        raise ConfigError(f"作品未登记：{series_id}（先执行 w2v download）")
+    episodes = select_episodes(catalog, episodes_spec)
+    episodes.sort(key=lambda episode: episode.episode_no)
+    series_dir = registry.series_dir(series_id)
+    series_config = load_series_config(series_dir)
+    vision_model = series_config.model_overrides.get("vision", config.models.vision)
+    script_model = series_config.model_overrides.get("script", config.models.script)
+    story_model = (
+        series_config.model_overrides.get("story", config.models.story_model)
+        or script_model
+    )
+    manager = StoryBibleManager(
+        series_dir, series_id=series_id, series_title=catalog.series_title
+    )
+
+    factory = client_factory or (lambda: BailianClient(config=config))
+    client: LLMClient = factory()
+    scripts: list[str] = []
+    try:
+        for episode in episodes:
+            board_path = (
+                s4_scriptwriter.script_dir_for(series_dir, episode.episode_no)
+                / s3b_scenes.STORYBOARD_FILENAME
+            )
+            if not Path(board_path).is_file():
+                raise ConfigError(
+                    f"第 {episode.episode_no} 话还没有镜头组编排：{board_path}"
+                    "（先执行 w2v storyboard）"
+                )
+            vision_path = (
+                series_dir
+                / "episodes"
+                / f"ep_{episode.episode_no:03d}"
+                / "03_vision"
+                / "vision.json"
+            )
+            vision = (
+                load_model(VisionWindowOutput, vision_path)
+                if Path(vision_path).is_file()
+                else None
+            )
+            _script_obj, path = await s4_scriptwriter.run_stage4(
+                series_dir,
+                episode.episode_no,
+                client,
+                model=script_model,
+                episode_id=episode.episode_id,
+                series_title=catalog.series_title,
+                vision=vision,
+                manager=manager,
+                story_model=story_model,
+                storyboard_path=board_path,
+                panels_dir=s2_segmenter.panels_dir_for(series_dir, episode.episode_no),
+                vision_client=client,
+                vision_model=vision_model,
+            )
+            scripts.append(str(path))
+    finally:
+        close = getattr(client, "aclose", None)
+        if close is not None:
+            await close()
+
+    return {
+        "command": "narrate-from-storyboard",
+        "series_id": series_id,
+        "series_title": catalog.series_title,
+        "episodes": [episode.episode_no for episode in episodes],
+        "scripts": scripts,
+    }
+
+
+async def _storyboard_many(
+    series_ids: list[str],
+    *,
+    config: AppConfig,
+    episodes_spec: str = "",
+    concurrency: int = 4,
+    reset: bool = False,
+    enrich: bool = True,
+) -> list[dict[str, Any]]:
+    """多部漫画并发生成镜头组编排。"""
+    return list(
+        await asyncio.gather(
+            *(
+                run_storyboard_series(
+                    series_id,
+                    config=config,
+                    episodes_spec=episodes_spec,
+                    concurrency=concurrency,
+                    reset=reset,
+                    enrich=enrich,
+                )
+                for series_id in series_ids
+            )
+        )
+    )
+
+
+async def _narrate_from_storyboard_many(
+    series_ids: list[str],
+    *,
+    config: AppConfig,
+    episodes_spec: str = "",
+    concurrency: int = 4,
+) -> list[dict[str, Any]]:
+    """多部漫画并发按已有镜头组编排撰稿。"""
+    return list(
+        await asyncio.gather(
+            *(
+                run_narrate_from_storyboard(
+                    series_id,
+                    config=config,
+                    episodes_spec=episodes_spec,
+                    concurrency=concurrency,
+                )
+                for series_id in series_ids
+            )
+        )
+    )
+
+
 async def _story_draft_many(
     series_ids: list[str],
     *,
@@ -994,6 +1223,40 @@ def build_parser() -> argparse.ArgumentParser:
     narrate.add_argument("--out", default=None, help="成片额外复制到该目录")
     narrate.add_argument("--voice", default=None, help="TTS 音色")
     narrate.add_argument("--bgm", default=None, help="BGM 音频路径")
+
+    storyboard = sub.add_parser(
+        "storyboard",
+        help="Stage 3B：按 03_vision/vision.json 生成镜头组编排（storyboard.json）",
+    )
+    storyboard.add_argument(
+        "--series", action="append", required=True, help="已登记的 series_id（可重复传入）"
+    )
+    storyboard.add_argument("--episodes", default="", help="话次选择，如 1-5")
+    storyboard.add_argument(
+        "--episode", type=int, default=None, help="只处理指定话次（优先于 --episodes）"
+    )
+    storyboard.add_argument("--workspace", default=None, help="工作区根目录（默认取配置文件）")
+    storyboard.add_argument("--concurrency", type=int, default=4, help="单部漫画内的并发数")
+    storyboard.add_argument(
+        "--reset", action="store_true", help="忽略已有 storyboard.json，重新自动聚类"
+    )
+    storyboard.add_argument(
+        "--no-enrich", action="store_true", help="跳过整幕视觉联看复核"
+    )
+
+    narrate_board = sub.add_parser(
+        "narrate-from-storyboard",
+        help="读已有 storyboard.json 跑 Stage 4 逐幕撰稿（人工编排不被覆盖）",
+    )
+    narrate_board.add_argument(
+        "--series", action="append", required=True, help="已登记的 series_id（可重复传入）"
+    )
+    narrate_board.add_argument("--episodes", default="", help="话次选择，如 1-5")
+    narrate_board.add_argument(
+        "--episode", type=int, default=None, help="只处理指定话次（优先于 --episodes）"
+    )
+    narrate_board.add_argument("--workspace", default=None, help="工作区根目录（默认取配置文件）")
+    narrate_board.add_argument("--concurrency", type=int, default=4, help="单部漫画内的并发数")
     return parser
 
 
@@ -1001,6 +1264,14 @@ def _apply_workspace(config: AppConfig, workspace: str | None) -> AppConfig:
     if not workspace:
         return config
     return config.model_copy(update={"workspace": WorkspaceConfig(root=Path(workspace))})
+
+
+def _episode_spec(args: argparse.Namespace) -> str:
+    """``--episode``（单话）优先于 ``--episodes``（区间选择器）。"""
+    episode = getattr(args, "episode", None)
+    if episode is not None:
+        return str(episode)
+    return getattr(args, "episodes", "") or ""
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1060,6 +1331,26 @@ def main(argv: list[str] | None = None) -> int:
                     voice=args.voice,
                     bgm_path=args.bgm,
                     out_dir=args.out,
+                )
+            )
+        elif args.command == "storyboard":
+            results = asyncio.run(
+                _storyboard_many(
+                    args.series,
+                    config=config,
+                    episodes_spec=_episode_spec(args),
+                    concurrency=args.concurrency,
+                    reset=args.reset,
+                    enrich=not args.no_enrich,
+                )
+            )
+        elif args.command == "narrate-from-storyboard":
+            results = asyncio.run(
+                _narrate_from_storyboard_many(
+                    args.series,
+                    config=config,
+                    episodes_spec=_episode_spec(args),
+                    concurrency=args.concurrency,
                 )
             )
         else:

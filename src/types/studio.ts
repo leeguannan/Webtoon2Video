@@ -231,3 +231,53 @@ export interface PronunciationRule {
   replacement: string;
   note: string;
 }
+
+// ---------------------------------------------------------------------------
+// Patch v4.0 Patch 20：镜头编排（Storyboard）
+// ---------------------------------------------------------------------------
+/** 一幕（镜头组）的人工编排，落盘于 04_script/storyboard.json。 */
+export interface StoryboardScene {
+  scene_id: string;
+  scene_index: number;
+  title: string;
+  location: string;
+  panel_ids: string[];
+  /** 参与讲述：false 时 Stage 4 跳过本幕。 */
+  enabled: boolean;
+  /** 必讲不可漏：true 时覆盖率硬校验会拦截漏讲。 */
+  must_cover: boolean;
+  /** 编导必讲要点（纠正识图误差 / 补因果）。 */
+  user_note: string;
+  /** 必保原话：命中本幕的解说必须包含这些台词片段。 */
+  locked_quotes: string[];
+  /** Stage 3b 整幕视觉联看摘要（AI 生成，只读参考）。 */
+  visual_recap?: string;
+}
+
+/** panels_index 中单格的精简信息（后端 Storyboard 接口下发）。 */
+export interface StoryboardPanelInfo {
+  panel_id: string;
+  image_url: string;
+  scene_summary: string;
+  dialogues: DialogueBubble[];
+}
+
+/** GET /api/episodes/{id}/storyboard 的完整响应。 */
+export interface EpisodeStoryboard {
+  episode_id: string;
+  source: 'auto' | 'human';
+  scenes: StoryboardScene[];
+  panels_index?: Record<string, StoryboardPanelInfo>;
+}
+
+/** POST /storyboard/generate 的响应。 */
+export interface StoryboardGenerateResponse {
+  job: {
+    job_id: string;
+    episode_id: string;
+    series_id: string;
+    episode_no: number;
+    status: string;
+  };
+  storyboard: EpisodeStoryboard;
+}

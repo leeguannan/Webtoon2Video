@@ -50,7 +50,8 @@ render:
   background_darken: 0.55
   # Patch 14：BGM 先 loudnorm 响度归一（I=-16:TP=-1.5:LRA=11）再降增益，
   # -11.5dB 叠加侧链闪避后仍能听见；旧值 -18dB 实测会被压到 -45dB 以下
-  bgm_gain_db: -11.5
+  # Patch 18：侧链阈值放宽后 BGM 不再被压死，再抬到 -8.0dB
+  bgm_gain_db: -8.0
   # 没有显式 BGM 时，自动挂载 assets/bgm/ 下的默认氛围音乐
   auto_bgm: true
   # 默认氛围音乐名（对应 assets/bgm/{default_bgm}.*）
@@ -58,7 +59,8 @@ render:
   # 是否把时间轴里的音效事件（sfx_events）混进音轨
   enable_sfx: true
   # 音效相对人声的增益（dB）；Patch 14 起混入前先做 dynaudnorm 峰值归一
-  sfx_gain_db: -3.5
+  # Patch 18：抬到 -2.0dB，让扇耳光 / 摔碎这类关键音效听得见
+  sfx_gain_db: -2.0
 
 tts:
   # 主旁白音色（百炼系统音色 ID；切到 MiniMax 后会被自动换成 MiniMax 旁白音色）

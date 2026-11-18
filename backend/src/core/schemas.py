@@ -111,6 +111,39 @@ class VisionWindowOutput(BaseModel):
     panels: list[PanelVisionInfo]
 
 
+class StoryboardScene(BaseModel):
+    """Stage 3b/4 镜头组（一幕连续剧情）。
+
+    Patch v4.0 Patch 19：Scene-First 镜头组架构。一幕 = 一段连续剧情，
+    对应 ``04_script/storyboard.json`` 里的一个镜头组。人工可以在
+    ``user_note`` 里写编导要点、在 ``locked_quotes`` 里钉死必保原话，
+    用 ``enabled`` 关掉不想要的幕、用 ``must_cover`` 标记必须讲到���幕。
+    """
+
+    scene_id: str
+    scene_index: int
+    title: str = ""
+    location: str = ""
+    panel_ids: list[str] = Field(..., min_length=1)
+    enabled: bool = True
+    must_cover: bool = True
+    user_note: str = ""
+    locked_quotes: list[str] = Field(default_factory=list)
+    visual_recap: str = ""
+
+
+class EpisodeStoryboard(BaseModel):
+    """单话镜头编排清单（落盘于 04_script/storyboard.json）。
+
+    Patch v4.0 Patch 19。``source == "human"`` 表示这份编排是人工编辑过的，
+    自动重建流程**绝不覆写**它。
+    """
+
+    episode_id: str
+    source: Literal["auto", "human"] = "auto"
+    scenes: list[StoryboardScene] = Field(default_factory=list)
+
+
 class CharacterProfile(BaseModel):
     name: str
     aliases: list[str] = Field(default_factory=list)

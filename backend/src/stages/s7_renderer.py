@@ -86,18 +86,17 @@ _AUDIO_LAYOUT = "stereo"
 #: ``amix`` 单次混合的最大输入数（超过就分组再混，避免滤镜 pad 上限）。
 _MIX_GROUP_SIZE = 16
 
-#: BGM 闪避（``sidechaincompress``）参数（Patch v3.2 Patch 14：柔和自然的漫评闪避）。
+#: BGM 闪避（``sidechaincompress``）参数（Patch v4.0 Patch 18：更晚、更缓地退让）。
 #:
-#: **threshold=0.05 / ratio=2.8**：Patch 14 起 BGM 先经 ``loudnorm`` 统一到 -16 LUFS 再降
-#: -11.5dB，基线已规范化，不再需要深压。说话时 BGM 温和退让 4~6dB 即可，ratio=8 的深压
-#: 会让配乐忽大忽小。
+#: **threshold=0.06 / ratio=2.0**：Patch 18 起 BGM 抬到 -8.0dB，基线更高，
+#: 闪避阈值跟着抬一点、压缩比降下来，说话时 BGM 只温和退让，配乐不会忽大忽小。
 #:
-#: **attack=25ms / release=320ms**：25ms 起压避免音节开头的泵感；320ms 释放让句间停顿
-#: （250~400ms）结束时 BGM 自然托底，不会像 200ms 那样在长句尾音里频繁起伏。
-_SIDECHAIN_THRESHOLD = 0.05
-_SIDECHAIN_RATIO = 2.8
-_SIDECHAIN_ATTACK_MS = 25
-_SIDECHAIN_RELEASE_MS = 320
+#: **attack=30ms / release=350ms**：30ms 起压避免音节开头的泵感；350ms 释放让句间停顿
+#: （250~400ms）结束时 BGM 自然托底，长句尾音里也不会频繁起伏。
+_SIDECHAIN_THRESHOLD = 0.06
+_SIDECHAIN_RATIO = 2.0
+_SIDECHAIN_ATTACK_MS = 30
+_SIDECHAIN_RELEASE_MS = 350
 
 #: 错误信息里保留的 stderr 末尾长度（够定位问题，又不会把整份 ffmpeg 日志塞进异常）。
 _STDERR_TAIL_CHARS = 2000
@@ -117,12 +116,13 @@ SFX_DIR_NAME = "sfx"
 
 #: 音效默认增益（dB）。Patch v3.2 Patch 14 从 -10dB 提升到 -3.5dB：
 #: 旧值混入后心跳/甩门等音效几乎听不见；混入前另做 ``dynaudnorm`` 峰值归一防破音。
-DEFAULT_SFX_GAIN_DB = -3.5
+#: Patch v4.0 Patch 18 再抬到 -2.0dB：扇耳光 / 摔碎这类关键音效要听得见。
+DEFAULT_SFX_GAIN_DB = -2.0
 
 #: ``SfxEvent.gain_db`` 的 schema 默认值（``core/schemas.py`` 不在 Patch 14 的允许修改
 #: 清单内，不能直接改它）。事件增益等于该值视为「未显式指定」，沿用渲染配置的
 #: ``sfx_gain_db``；只有显式写成别的值才覆盖配置——否则 schema 默认的 -10.0 会让
-#: 配置里的新默认值 -3.5dB 永远不生效。
+#: 配置里的新默认值 -2.0dB 永远不生效。
 _SFX_EVENT_SCHEMA_DEFAULT_GAIN = float(SfxEvent.model_fields["gain_db"].default)
 
 #: 文件名里不允许出现的字符（Windows/macOS 通用安全集）。

@@ -35,6 +35,7 @@ from stages import (
     s1_crawler,
     s2_segmenter,
     s3_vision,
+    s3b_scenes,
     s4_scriptwriter,
     s5_tts,
     s6_timeline,
@@ -464,6 +465,7 @@ class JobRunner:
                     script_model,
                     story_model,
                     series_title,
+                    vision_model,
                 )
             elif stage == "s5_tts":
                 await self._stage_tts(state, series_dir, episode, tts_client)
@@ -568,11 +570,17 @@ class JobRunner:
         script_model: str,
         story_model: str,
         series_title: str,
+        vision_model: str = "",
     ) -> None:
         """Stage 4：必须按话升序 + 部级互斥锁执行（防剧透与写入竞态）。"""
         arc_compressor = s4_scriptwriter.build_arc_compressor(
             llm_client, model=script_model
         )
+        # Patch v4.0 Patch 19：按镜头组编排（storyboard.json）逐幕撰稿；
+        # 人工编排（source="human"）原样保留，不会被自动重建覆盖。
+        episode_dir = series_dir / "episodes" / f"ep_{episode.episode_no:03d}"
+        storyboard_path = s3b_scenes.storyboard_path_for(episode_dir)
+        panels_dir = s2_segmenter.panels_dir_for(series_dir, episode.episode_no)
 
         async def _run() -> None:
             await s4_scriptwriter.run_stage4(
@@ -585,6 +593,10 @@ class JobRunner:
                 series_title=series_title,
                 manager=manager,
                 arc_compressor=arc_compressor,
+                storyboard_path=storyboard_path,
+                panels_dir=panels_dir,
+                vision_client=llm_client,
+                vision_model=vision_model,
             )
 
         await self.gate(state.series_id).run(episode.episode_no, _run)

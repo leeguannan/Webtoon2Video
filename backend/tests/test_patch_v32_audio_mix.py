@@ -3,7 +3,8 @@
 对应 ``PATCH_v3.2_VOICE_CAST_AND_AUDIO_UX.md`` Patch 14 的两条验收：
 
 1. ``_prepare_audio`` 的 ffmpeg 命令里，BGM 链先 ``loudnorm=I=-16:TP=-1.5:LRA=11``
-   再施加默认 ``-11.5dB`` 增益；SFX 链含 ``adelay``、``dynaudnorm`` 与 ``-3.5dB``，
+   再施加默认增益（Patch v4.0 Patch 18 起由 ``-11.5dB`` 提为 ``-8.0dB``）；SFX 链含
+   ``adelay``、``dynaudnorm`` 与增益（Patch v4.0 Patch 18 起由 ``-3.5dB`` 提为 ``-2.0dB``），
    真实 ffmpeg 跑出来的音效轨非静音。
 2. ``s6_timeline`` 把 ``sfx_list`` 里的「心驚 / 嘎咿 / 啪」分别匹配为
    ``heart_thump`` / ``whoosh`` / ``door_slam``，且遵守 6000ms 节流与 8 条上限。
@@ -122,19 +123,19 @@ class _RecordingFFmpeg:
 # 1. 配置默认值与侧链参数
 # --------------------------------------------------------------------------
 def test_render_config_defaults_bumped_v32() -> None:
-    """BGM -18→-11.5dB、SFX -10→-3.5dB，三处默认值必须一致。"""
+    """BGM -8.0dB、SFX -2.0dB，三处默认值必须一致（Patch v4.0 Patch 18 再次上调）。"""
     config = AppConfig()
-    assert config.render.bgm_gain_db == -11.5
-    assert config.render.sfx_gain_db == -3.5
-    assert s7_renderer.DEFAULT_SFX_GAIN_DB == -3.5
+    assert config.render.bgm_gain_db == -8.0
+    assert config.render.sfx_gain_db == -2.0
+    assert s7_renderer.DEFAULT_SFX_GAIN_DB == -2.0
 
 
 def test_sidechain_uses_gentle_v32_ducking() -> None:
-    """侧链压缩钉死为柔和漫评闪避四参数。"""
-    assert s7_renderer._SIDECHAIN_THRESHOLD == 0.05
-    assert s7_renderer._SIDECHAIN_RATIO == 2.8
-    assert s7_renderer._SIDECHAIN_ATTACK_MS == 25
-    assert s7_renderer._SIDECHAIN_RELEASE_MS == 320
+    """侧链压缩钉死为柔和漫评闪避四参数（Patch v4.0 Patch 18 微调）。"""
+    assert s7_renderer._SIDECHAIN_THRESHOLD == 0.06
+    assert s7_renderer._SIDECHAIN_RATIO == 2.0
+    assert s7_renderer._SIDECHAIN_ATTACK_MS == 30
+    assert s7_renderer._SIDECHAIN_RELEASE_MS == 350
 
 
 # --------------------------------------------------------------------------
@@ -171,7 +172,7 @@ def _prepare_with_bgm_and_sfx(
 def test_prepare_audio_bgm_chain_loudnorm_before_gain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BGM 链：loudnorm 响度归一在前，-11.5dB 增益在后。"""
+    """BGM 链：loudnorm 响度归一在前，-8.0dB 增益在后。"""
     recorder, _, _ = _prepare_with_bgm_and_sfx(
         tmp_path,
         monkeypatch,
@@ -179,7 +180,7 @@ def test_prepare_audio_bgm_chain_loudnorm_before_gain(
     )
     joined = recorder.joined
     assert "loudnorm=I=-16:TP=-1.5:LRA=11" in joined
-    assert "volume=-11.5dB" in joined
+    assert "volume=-8.0dB" in joined
     # 顺序契约：同一条 BGM 链里 loudnorm 必须出现在 volume 之前。
     bgm_chain = next(part for part in joined.split(";") if "loudnorm" in part)
     assert bgm_chain.index("loudnorm") < bgm_chain.index("volume=")
@@ -188,7 +189,7 @@ def test_prepare_audio_bgm_chain_loudnorm_before_gain(
 def test_prepare_audio_sfx_chain_adelay_dynaudnorm_and_gain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """SFX 链：adelay 对齐 → dynaudnorm 峰值归一 → -3.5dB 增益，并单独成轨。"""
+    """SFX 链：adelay 对齐 → dynaudnorm 峰值归一 → -2.0dB 增益，并单独成轨。"""
     recorder, _, _ = _prepare_with_bgm_and_sfx(
         tmp_path,
         monkeypatch,
@@ -197,7 +198,7 @@ def test_prepare_audio_sfx_chain_adelay_dynaudnorm_and_gain(
     joined = recorder.joined
     assert "adelay=200|200" in joined
     assert "dynaudnorm" in joined
-    assert "volume=-3.5dB" in joined
+    assert "volume=-2.0dB" in joined
     assert "[sfx]" in joined
     sfx_chain = next(part for part in joined.split(";") if "adelay=200|200" in part)
     assert (
@@ -210,11 +211,11 @@ def test_prepare_audio_sfx_chain_adelay_dynaudnorm_and_gain(
 def test_schema_default_event_falls_back_to_config_gain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """SfxEvent 不带显式增益（schema 默认 -10.0）时沿用渲染配置 -3.5dB。"""
+    """SfxEvent 不带显式增益（schema 默认 -10.0）时沿用渲染配置 -2.0dB。"""
     recorder, _, _ = _prepare_with_bgm_and_sfx(
         tmp_path, monkeypatch, sfx_events=[SfxEvent(sfx_key="heart_thump", start_ms=0)]
     )
-    assert "volume=-3.5dB" in recorder.joined
+    assert "volume=-2.0dB" in recorder.joined
     assert "volume=-10.0dB" not in recorder.joined
 
 
@@ -240,7 +241,7 @@ def test_mix_log_prints_bgm_name_and_sfx_count(
         sfx_events=[SfxEvent(sfx_key="heart_thump", start_ms=200)],
     )
     out = capsys.readouterr().out
-    assert "[s7] 音频混合：bgm=bgm.wav (-11.5dB), sfx=1/1 条" in out
+    assert "[s7] 音频混合：bgm=bgm.wav (-8.0dB), sfx=1/1 条" in out
 
     # 无 BGM、且音效素材缺失（usable=0，total=1）的日志形态。
     recorder = _RecordingFFmpeg()

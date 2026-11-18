@@ -118,7 +118,8 @@ class RenderConfig(_StrictModel):
     background_darken: float = 0.55
     #: Patch v3.2 Patch 14：BGM 增益从 -18dB 提升到 -11.5dB。
     #: 旧值在 loudnorm 之前再叠加侧链闪避会跌到 -45dB 以下，实测几乎听不到。
-    bgm_gain_db: float = -11.5
+    #: Patch v4.0 Patch 18：再抬到 -8.0dB——侧链参数放宽后 BGM 不再被压死。
+    bgm_gain_db: float = -8.0
     #: Patch v3.1 Patch 11 B4：没有显式 BGM 时是否自动挂载默认氛围音乐。
     auto_bgm: bool = True
     #: Patch v3.1 Patch 11 B4：默认氛围音乐名（对应 ``assets/bgm/{name}.*``）。
@@ -126,7 +127,8 @@ class RenderConfig(_StrictModel):
     #: Patch v3.1 Patch 11 B3/B4：是否把时间轴里的音效事件混进音轨。
     enable_sfx: bool = True
     #: Patch v3.2 Patch 14：音效增益从 -10dB 提升到 -3.5dB（混前再做 dynaudnorm 峰值归一）。
-    sfx_gain_db: float = -3.5
+    #: Patch v4.0 Patch 18：再抬到 -2.0dB，让扇耳光 / 摔碎这类关键音效听得见。
+    sfx_gain_db: float = -2.0
 
 
 class VoiceSpec(_StrictModel):
