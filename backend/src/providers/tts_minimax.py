@@ -25,7 +25,9 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import re
+import time
 from typing import Any, Awaitable, Callable
 
 import httpx
@@ -75,6 +77,10 @@ RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
 #: 可重试的 ``base_resp.status_code``（限流 / 繁忙 / 上游临时故障）。
 RETRYABLE_CODES = frozenset({1000, 1002, 1024, 1039})
+
+#: ``1002`` = RPM 限流（rate limit exceeded(RPM)）。Patch v4.3：命中它要
+#: 全局降速 + 冷却，而不是各自退避后一起再撞。
+RATE_LIMIT_CODE = 1002
 
 #: 不可重试的 ``base_resp.status_code``（鉴权失败 / 余额不足 / voice_id 非法）。
 #: - 1004：鉴权失败；1008：余额不足；2013：voice_id 非法；2054：voice_id 不存在。
@@ -449,12 +455,94 @@ def _voice_description(description: Any, fallback: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+class _RateLimiter:
+    """MiniMax t2a_v2 的进程内 RPM 节流闸门（Patch v4.3）。
+
+    MiniMax 对单账号的每分钟请求数有上限，超限会返回
+    ``base_resp.status_code=1002 rate limit exceeded(RPM)``；继续猛打还会
+    出现连接被断 / 超时。实测：连续 17 条成功后即触发限流。
+
+    这里做两件事：
+
+    1. **节流**：每分钟最多 ``rpm`` 次请求（令牌桶），主动不撞限；
+    2. **自适应降速**：真撞到 1002 时立刻全局冷却并把速率减半，连续成功
+       若干次后再缓慢加性恢复——避免多个 worker 一起退避又一起重试的惊群。
+    """
+
+    def __init__(
+        self,
+        rpm: int,
+        *,
+        min_rpm: int = 2,
+        cooldown_s: float = 30.0,
+    ) -> None:
+        self._rpm = max(0, int(rpm))
+        self._min_rpm = max(1, int(min_rpm))
+        #: 恢复上限 = 初始速率（只在被降速后往回加，不超过配置值）。
+        self._max_rpm = self._rpm
+        self._cooldown_s = max(0.0, float(cooldown_s))
+        self._interval = (60.0 / self._rpm) if self._rpm > 0 else 0.0
+        self._next_allowed = 0.0
+        self._cooldown_until = 0.0
+        self._success_streak = 0
+        self._lock: asyncio.Lock | None = None
+
+    @property
+    def rpm(self) -> int:
+        """当前生效的每分钟请求上限（0 表示不限流）。"""
+        return self._rpm
+
+    @property
+    def cooldown_remaining(self) -> float:
+        """全局冷却剩余秒数（0 表示已解除）。"""
+        return max(0.0, self._cooldown_until - time.monotonic())
+
+    async def acquire(self) -> None:
+        """占用一次请求额度；必要时等待到下一个允许发起的时刻。"""
+        if self._rpm <= 0:
+            return
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        async with self._lock:
+            now = time.monotonic()
+            base = max(self._next_allowed, self._cooldown_until)
+            self._next_allowed = max(now, self._next_allowed) + self._interval
+            wait = base - now
+        if wait > 0:
+            await asyncio.sleep(wait)
+
+    def penalize(self) -> None:
+        """撞到限流：全局冷却 + 速率减半。"""
+        now = time.monotonic()
+        self._cooldown_until = max(self._cooldown_until, now + self._cooldown_s)
+        if self._rpm > 0:
+            self._rpm = max(self._min_rpm, self._rpm // 2)
+            self._interval = 60.0 / self._rpm
+        self._success_streak = 0
+
+    def on_success(self) -> None:
+        """成功一次：连续若干次后缓慢恢复速率（加性增）。"""
+        self._success_streak += 1
+        if self._rpm <= 0 or self._success_streak < 10:
+            return
+        self._success_streak = 0
+        if self._rpm < self._max_rpm:
+            self._rpm += 1
+            self._interval = 60.0 / self._rpm
+
+
 class MiniMaxTTS:
     """MiniMax Speech 2.8 合成器（``speech-2.8-hd`` / ``speech-2.8-turbo``）。"""
 
     #: 原生支持语速：Stage 5 命中该标记时把 speed 交给服务端，
     #: **不再**用 ffmpeg ``atempo`` 二次变速（避免音色被拉糊）。
     supports_native_speed: bool = True
+
+    #: Patch v4.3：要求 Stage 5 严格串行调度（一次只允许一条 beat 在途）。
+    #: MiniMax 对并发与瞬时速率极敏感：多协程排队时，一次限流重试的长冷却
+    #: 会让后续请求的节流时隙脱节、冷却结束后突发连打，引发 1002 雪崩。
+    #: 串行 + provider 内 RPM 闸门与时隙始终和真实时间同步，实测 12 RPM 可稳定跑完。
+    serial_requests: bool = True
 
     def __init__(
         self,
@@ -467,6 +555,10 @@ class MiniMaxTTS:
         timeout_s: float = 120.0,
         max_retries: int = 3,
         retry_backoff_s: float = 1.0,
+        rate_limit_rpm: int = 20,
+        rate_limit_min_rpm: int = 5,
+        rate_limit_cooldown_s: float = 90.0,
+        max_concurrency: int = 1,
         env: dict[str, str] | None = None,
         env_file: str | None = None,
         api_key_env: str = DEFAULT_API_KEY_ENV,
@@ -488,6 +580,15 @@ class MiniMaxTTS:
         self._group_id_env = group_id_env
         self._http_client = http_client
         self._sleep = sleep
+        # Patch v4.3：MiniMax 有 RPM 限流，这里加进程内节流闸门。
+        self._limiter = _RateLimiter(
+            rate_limit_rpm,
+            min_rpm=rate_limit_min_rpm,
+            cooldown_s=rate_limit_cooldown_s,
+        )
+        # Patch v4.3：同一 client 的在途请求上限（默认串行）。
+        self._max_concurrency = max(1, int(max_concurrency))
+        self._semaphore: asyncio.Semaphore | None = None
 
     # -- 只读属性 ---------------------------------------------------------
     @property
@@ -586,9 +687,36 @@ class MiniMaxTTS:
         }
         client = self._client()
         url = self._endpoint()
+
+        # Patch v4.3：同一 client 的在途请求数硬上限（默认 1）。
+        # MiniMax 对并发极敏感：多条请求同时在途会触发 1002，甚至连接被断；
+        # 上层给的并发度在这里统一退化为串行，再由 RPM 闸门控速。
+        async with self._request_slot():
+            return await self._synthesize_with_retries(
+                client, url, headers, payload, effective_voice
+            )
+
+    def _request_slot(self) -> asyncio.Semaphore:
+        """返回并发闸门（懒创建，避免跨事件循环复用）。"""
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(max(1, int(self._max_concurrency)))
+        return self._semaphore
+
+    async def _synthesize_with_retries(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, Any],
+        effective_voice: str,
+    ) -> TTSResult:
+        """在并发闸门内执行请求 + 退避重试（Patch v4.3）。"""
         last_error: Exception | None = None
 
         for attempt in range(self._max_retries + 1):
+            # Patch v4.3：先过 RPM 闸门（限流时会被推迟到允许发起的时刻）。
+            await self._limiter.acquire()
+            rate_limited = False
             try:
                 response = await client.post(url, headers=headers, json=payload)
             except httpx.TimeoutException as exc:
@@ -606,10 +734,15 @@ class MiniMaxTTS:
                     base_resp = data.get("base_resp") or {}
                     code = int(base_resp.get("status_code", 0) or 0)
                     if code == 0:
+                        self._limiter.on_success()
                         return await self._extract_audio(client, data, effective_voice)
                     message = str(base_resp.get("status_msg") or "").strip()
                     if code in RETRYABLE_CODES:
                         # 可重试错误码（限流/繁忙/上游临时故障）：退避后重试。
+                        if code == RATE_LIMIT_CODE:
+                            # 撞到 RPM 限流：全局冷却 + 降速，避免继续惊群。
+                            rate_limited = True
+                            self._limiter.penalize()
                         last_error = TTSError(
                             f"MiniMax TTS 返回可重试错误码 {code}"
                             f"（第 {attempt + 1} 次）：{message or _brief(response.text)}"
@@ -634,7 +767,12 @@ class MiniMaxTTS:
                     )
 
             if attempt < self._max_retries:
-                await self._sleep(self._retry_backoff_s * (2**attempt))
+                # Patch v4.3：退避加抖动；撞到限流时额外等全局冷却结束。
+                delay = self._retry_backoff_s * (2**attempt)
+                delay += random.uniform(0.0, max(0.1, delay * 0.3))
+                if rate_limited:
+                    delay += self._limiter.cooldown_remaining
+                await self._sleep(delay)
 
         raise TTSError(f"MiniMax TTS 重试耗尽：{last_error}")
 

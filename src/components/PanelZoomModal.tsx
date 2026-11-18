@@ -7,7 +7,8 @@ import {
   Loader2,
   X,
 } from 'lucide-react';
-import type { PanelItem, ScriptBeat } from '../types/studio';
+import type { PanelItem, ScriptBeat, VoiceOption } from '../types/studio';
+import { VoicePreviewButton, findVoiceOption, useVoicePreview } from './VoicePicker';
 
 /** 字幕原文自动保存的状态机。 */
 export type SaveStatus = 'idle' | 'dirty' | 'saving' | 'saved' | 'error';
@@ -19,9 +20,19 @@ interface PanelZoomModalProps {
   activeBeatId: string | null;
   saveStatus: SaveStatus;
   saveMessage?: string;
+  /** 可选说话人（与审核台表格同一份候选：不指定 / 讲解者 / 通用男声 / 通用女声 / 各角色名）。 */
+  roleOptions: { value: string; label: string }[];
+  /** 本句配音预览（角色 → 音色），由审核台统一计算。 */
+  voiceInfo: { label: string; voice: string; hint: string };
+  /** 全部可选音色（仅用于试听当前生效音色的样例）。 */
+  voiceOptions: VoiceOption[];
   onClose: () => void;
   onSelectBeat: (beatId: string) => void;
   onChangeNarration: (beatId: string, text: string) => void;
+  /** 改本句说话人；音色由角色自动带出，不直接挑音色。 */
+  onChangeRole: (beatId: string, role: string) => void;
+  /** 情绪指令（送音时的语气提示）。 */
+  onChangeEmotion: (beatId: string, text: string) => void;
 }
 
 const SAVE_STATUS_TEXT: Record<SaveStatus, string> = {
@@ -31,6 +42,12 @@ const SAVE_STATUS_TEXT: Record<SaveStatus, string> = {
   saved: '已保存',
   error: '保存失败',
 };
+
+/** 说话人下拉的候选项（value 落库到 speaker_role，label 只用于显示）。 */
+export interface RoleOption {
+  value: string;
+  label: string;
+}
 
 /**
  * 分镜大图 + 字幕原文编辑弹窗。
@@ -46,11 +63,17 @@ export const PanelZoomModal: React.FC<PanelZoomModalProps> = ({
   activeBeatId,
   saveStatus,
   saveMessage,
+  roleOptions,
+  voiceInfo,
+  voiceOptions,
   onClose,
   onSelectBeat,
   onChangeNarration,
+  onChangeRole,
+  onChangeEmotion,
 }) => {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const { playingKey, preview, stop } = useVoicePreview();
 
   const index = beats.findIndex((b) => b.beat_id === activeBeatId);
   const beat = index >= 0 ? beats[index] : undefined;
@@ -95,6 +118,11 @@ export const PanelZoomModal: React.FC<PanelZoomModalProps> = ({
   if (!open || !beat) return null;
 
   const charLen = beat.narration_text.trim().length;
+
+  // Patch v4.2：说话人由「角色」决定，音色自动带出，不再让用户直接挑音色。
+  // voiceOverride 只用于提示历史遗留的强制指定（改角色时会被清掉）。
+  const voiceOverride = beat.voice_override ?? '';
+  const previewOption = findVoiceOption(voiceOptions, voiceInfo.voice);
   const isLengthWarn = charLen < 8 || charLen > 30;
   const canPrev = index > 0;
   const canNext = index < beats.length - 1;
@@ -182,6 +210,83 @@ export const PanelZoomModal: React.FC<PanelZoomModalProps> = ({
               </div>
             </div>
 
+            {/* Patch v4.2：说话人角色（音色自动带出）+ 情绪指令 */}
+            <div className="space-y-2 border-t border-slate-100 pt-3">
+              <div>
+                <label
+                  htmlFor="zoom-role-select"
+                  className="block text-xs font-medium text-slate-700 mb-1.5"
+                >
+                  配音角色（speaker_role · 本句说话人）
+                </label>
+                <select
+                  id="zoom-role-select"
+                  aria-label="本句配音角色"
+                  value={beat.speaker_role ?? ''}
+                  onChange={(event) =>
+                    onChangeRole(beat.beat_id, event.target.value)
+                  }
+                  className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 focus:border-blue-600 focus:outline-none cursor-pointer"
+                >
+                  {roleOptions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+                <div className="mt-1.5 flex items-start justify-between gap-2">
+                  <p className="text-[11px] text-slate-500 leading-relaxed">
+                    本句配音：{voiceInfo.label} · {voiceInfo.voice}
+                    {voiceOverride && (
+                      <span className="text-amber-600">
+                        （本句曾被强制指定音色 {voiceOverride}，改角色后将按角色解析）
+                      </span>
+                    )}
+                  </p>
+                  <VoicePreviewButton
+                    playing={playingKey === 'zoomVoice'}
+                    sampleReady={!!previewOption?.sample_ready}
+                    onPreview={() =>
+                      preview(
+                        'zoomVoice',
+                        {
+                          voice: voiceInfo.voice,
+                          speed: beat.resolved_voice?.speed ?? 1,
+                        },
+                        voiceOptions
+                      )
+                    }
+                    onStop={stop}
+                  />
+                </div>
+                {voiceInfo.hint && (
+                  <p className="mt-1 text-[11px] text-slate-400 leading-relaxed">
+                    {voiceInfo.hint}
+                  </p>
+                )}
+              </div>
+
+              <div>
+                <label
+                  htmlFor="zoom-emotion-input"
+                  className="block text-xs font-medium text-slate-700 mb-1.5"
+                >
+                  情绪指令（emotion_instruction · 送音语气）
+                </label>
+                <input
+                  id="zoom-emotion-input"
+                  type="text"
+                  aria-label="情绪指令"
+                  value={beat.emotion_instruction ?? ''}
+                  onChange={(event) =>
+                    onChangeEmotion(beat.beat_id, event.target.value)
+                  }
+                  placeholder="例如：急切、颤抖地低语"
+                  className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 focus:border-blue-600 focus:outline-none"
+                />
+              </div>
+            </div>
+
             {/* 保存状态 */}
             <div
               className="flex items-center gap-1.5 text-[11px]"
@@ -246,7 +351,7 @@ export const PanelZoomModal: React.FC<PanelZoomModalProps> = ({
             <p className="text-[11px] text-slate-400 leading-relaxed">
               快捷键：Esc 关闭 · ←/→ 翻格（焦点在输入框内时为移动光标）
               <br />
-              修改字幕原文后，在切换分镜或关闭弹窗时自动保存，不会触发重新配音；如需重出配音请回审核台点「保存并从 Stage 5 重跑配音」。
+              修改字幕原文、配音角色、情绪指令后，在切换分镜或关闭弹窗时自动保存，不会触发重新配音；如需重出配音请回审核台点「保存并从 Stage 5 重跑配音」。
             </p>
           </div>
         </div>

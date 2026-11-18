@@ -64,6 +64,8 @@ export interface BeatVoiceAssignment {
   role: string;
   /** 解析出的说话人性别。 */
   gender: string;
+  /** 逐句指定音色（voice_override）时，附上「清空指定后按角色会用哪个音色」。 */
+  role_voice?: BeatVoiceAssignment;
 }
 
 export interface ScriptBeat {
@@ -85,6 +87,8 @@ export interface ScriptBeat {
   focus_hint?: string;
   /** Patch v3.4：后端解析出的「本句配音」（音色 + 来源），审核台直接展示。 */
   resolved_voice?: BeatVoiceAssignment;
+  /** Patch v4.2：逐句指定音色（空串 / 缺省 = 跟随角色解析）。 */
+  voice_override?: string;
 }
 
 /** 百炼官方音色的一条配音规格（Patch v3.2 Patch 13）。 */

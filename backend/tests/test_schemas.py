@@ -146,6 +146,8 @@ FIELD_LOCKS: list[tuple[type, tuple[str, ...]]] = [
             "sfx_cue",
             # Patch v3.2 Patch 12：说话人性别（默认 "unknown"，向后兼容旧剧本）
             "speaker_gender",
+            # Patch v4.2：逐句指定音色（默认空串 = 跟随角色解析）
+            "voice_override",
         ),
     ),
     (

@@ -564,6 +564,9 @@ async def _produce_media_from_scripts(
                     series_tts=series_tts,
                     characters=characters,
                     concurrency=concurrency,
+                    # Patch v4.3：限流失败的 beat 串行补齐，避免成片缺句。
+                    retry_rounds=config.tts.retry_failed_rounds,
+                    placeholder_on_failure=config.tts.silence_placeholder_on_failure,
                     ffmpeg_bin=config.render.ffmpeg_bin,
                     tts_model=config.models.tts,
                 )

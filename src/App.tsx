@@ -726,11 +726,17 @@ export default function App() {
     }
   };
 
+  /**
+   * 保存解说稿。
+   *
+   * 返回是否落盘成功：审核台据此决定要不要清掉「有未保存改动」标记，
+   * 保存失败时必须保留草稿与标记，别让用户以为改好了其实没存上。
+   */
   const handleUpdateBeats = async (
     episodeId: string,
     beats: ScriptBeat[],
     triggerFromStage5: boolean
-  ) => {
+  ): Promise<boolean> => {
     try {
       await apiFetch(`/episodes/${encodeURIComponent(episodeId)}/script`, {
         method: 'PUT',
@@ -751,8 +757,10 @@ export default function App() {
       showToast(
         triggerFromStage5 ? '已保存脚本修改，并从 Stage 5 重新出片' : '已保存脚本修改'
       );
+      return true;
     } catch (err) {
       reportError('保存脚本失败', err);
+      return false;
     }
   };
 

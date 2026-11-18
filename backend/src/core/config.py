@@ -70,6 +70,12 @@ class ApiConfig(_StrictModel):
     minimax_group_id_env: str = DEFAULT_MINIMAX_GROUP_ID_ENV
     #: 直接写死 GroupId 的兜底位置（留空表示不传 GroupId）。
     minimax_group_id: str = ""
+    #: Patch v4.3：MiniMax t2a_v2 每分钟请求上限（RPM）。超限会返回
+    #: ``1002 rate limit exceeded(RPM)``，整条 beat 会缺音频 → 成片少句。
+    #: 实测单账号约 17~30 次/分钟即触发，这里默认留出余量；填 0 = 不限流。
+    minimax_rate_limit_rpm: int = 20
+    #: Patch v4.3：MiniMax 同一 client 的在途请求上限（1 = 串行）。
+    minimax_max_concurrency: int = 1
 
 
 class ModelConfig(_StrictModel):
@@ -188,6 +194,13 @@ class TTSConfig(_StrictModel):
         default_factory=lambda: VoiceSpec(voice="Cherry", speed=1.15)
     )
     character_voices: dict[str, VoiceSpec] = Field(default_factory=dict)
+    #: Patch v4.3：合成失败的 beat 额外**串行**补齐几轮（0 = 不补齐）。
+    #: 限流场景下并发补齐只会更快撞限，串行补齐才能把缺的句子补回来；
+    #: 补齐仍失败的 beat 用等长静音占位，保证时间轴与字幕不错位。
+    retry_failed_rounds: int = 1
+    #: Patch v4.3：合成（及补齐）仍失败的 beat 是否写入等长静音占位，
+    #: 让时间轴与字幕不错位；问题仍会写进 05_audio/audio_issues.json。
+    silence_placeholder_on_failure: bool = False
 
 
 class ConcurrencyConfig(_StrictModel):
@@ -678,6 +691,9 @@ def create_tts_client(config: AppConfig, *, voice: str | None = None) -> Any:
             timeout_s=config.api.timeout_s,
             max_retries=config.api.max_retries,
             retry_backoff_s=config.api.retry_backoff_s,
+            # Patch v4.3：MiniMax 有 RPM 限流，交给 provider 内的节流闸门。
+            rate_limit_rpm=config.api.minimax_rate_limit_rpm,
+            max_concurrency=config.api.minimax_max_concurrency,
             api_key_env=config.api.minimax_api_key_env,
             group_id_env=config.api.minimax_group_id_env,
         )

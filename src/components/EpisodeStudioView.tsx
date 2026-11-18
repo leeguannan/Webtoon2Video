@@ -25,9 +25,10 @@ import type {
   SeriesTtsConfigResponse,
   StageId,
   StudioConfig,
+  VoiceOption,
 } from '../types/studio';
 import { formatMs, playPreviewTone, resolveSpokenText } from '../utils/pronunciation';
-import { PanelZoomModal, type SaveStatus } from './PanelZoomModal';
+import { PanelZoomModal, type RoleOption, type SaveStatus } from './PanelZoomModal';
 import { StoryboardEditor } from './StoryboardEditor';
 
 interface EpisodeStudioViewProps {
@@ -43,7 +44,15 @@ interface EpisodeStudioViewProps {
     includeHumanStoryboard?: boolean
   ) => Promise<void> | void;
   onTogglePanelBlank: (episodeId: string, panelId: string) => void;
-  onUpdateBeats: (episodeId: string, beats: ScriptBeat[], triggerFromStage5: boolean) => void;
+  /**
+   * 保存解说稿。返回是否落盘成功（审核台据此决定是否清掉「未保存改动」标记）。
+   * triggerFromStage5=true 表示保存后顺带从 Stage 5 重跑配音与出片。
+   */
+  onUpdateBeats: (
+    episodeId: string,
+    beats: ScriptBeat[],
+    triggerFromStage5: boolean
+  ) => Promise<boolean> | boolean;
   /** 分镜大图弹窗里的字幕原文自动保存（不触发重跑配音）。缺省时退化为本地草稿保存。 */
   onAutoSaveBeats?: (episodeId: string, beats: ScriptBeat[]) => Promise<void>;
   onExportEpisode: (episodeId: string, format: 'mp4' | 'ass' | 'script') => void;
@@ -91,9 +100,17 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   );
   const [showFocusOverlay, setShowFocusOverlay] = useState(true);
   const [draftBeats, setDraftBeats] = useState<ScriptBeat[]>(episode.beats);
+  /** 表格内是否有未落盘的改动（改字 / 改角色 / 增删句）。 */
+  const [tableDirty, setTableDirty] = useState(false);
+  /** 保存中状态，避免重复点击。 */
+  const [savingBeats, setSavingBeats] = useState(false);
+  /** 表格保存失败或校验失败时的提示文案。 */
+  const [saveHint, setSaveHint] = useState('');
   const [playingBeatId, setPlayingBeatId] = useState<string | null>(null);
   /** 作品级配音设置（角色清单 + 各角色音色），用于「本句配音」的角色下拉。 */
   const [seriesTts, setSeriesTts] = useState<SeriesTtsConfigResponse | null>(null);
+  /** Patch v4.2：全部可选音色（百炼 + MiniMax），供弹窗逐句指定音色。 */
+  const [voiceOptions, setVoiceOptions] = useState<VoiceOption[]>([]);
   /** Patch v4.1 Patch 21：待确认的「清理重置」目标阶段（内联确认横幅）。 */
   const [resetTarget, setResetTarget] = useState<StageId | null>(null);
   const [resetIncludeHuman, setResetIncludeHuman] = useState(false);
@@ -101,11 +118,18 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
 
   // 分镜大图弹窗 + 字幕原文保存（切换分镜 / 关闭弹窗时落盘，编辑过程中不写库）
   const [zoomBeatId, setZoomBeatId] = useState<string | null>(null);
+  /** 当前弹窗打开的那一条解说（弹窗里的角色候选与配音预览都基于它）。 */
+  const zoomBeat = useMemo(
+    () => draftBeats.find((b) => b.beat_id === zoomBeatId),
+    [draftBeats, zoomBeatId]
+  );
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle');
   const [saveMessage, setSaveMessage] = useState('');
   const draftBeatsRef = useRef<ScriptBeat[]>(episode.beats);
   /** 待保存的草稿：{ episode_id, beats }；只在弹窗里改字时写入，落盘后清空 */
   const pendingRef = useRef<{ episodeId: string; beats: ScriptBeat[] } | null>(null);
+  /** 表格未保存标记的 ref 副本：后台回填 effect 里读它，避免把 dirty 塞进依赖导致回填反复触发。 */
+  const tableDirtyRef = useRef(false);
 
   // Video simulator state (9:16 standard)
   const [isPlayingVideo, setIsPlayingVideo] = useState(false);
@@ -115,10 +139,11 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   const localOutputPath = `workspace/${seriesId}/episodes/${epFolderName}/07_out/${episode.episode_id}.mp4`;
 
   useEffect(() => {
-    // 后台会定时刷新剧集数据并回填 episode.beats；只要本话还有未保存的改动，
-    // 就保留本地草稿，别让用户正在改的字被服务端数据冲掉。
+    // 后台会定时刷新剧集数据并回填 episode.beats；只要本话还有未保存的改动
+    // （表格内编辑或弹窗改字），就保留本地草稿，别让用户正在改的内容被服务端数据冲掉。
     const pending = pendingRef.current;
-    if (!pending || pending.episodeId !== episode.episode_id) {
+    const dirty = tableDirtyRef.current;
+    if ((!pending || pending.episodeId !== episode.episode_id) && !dirty) {
       setDraftBeats(episode.beats);
       draftBeatsRef.current = episode.beats;
     }
@@ -147,6 +172,29 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     };
   }, [seriesId]);
 
+  /** Patch v4.2：拉全部可选音色（百炼 + MiniMax），弹窗里可逐句指定音色。 */
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const res = await fetch('/api/tts/voices');
+        if (!res.ok) return;
+        const data = (await res.json()) as {
+          voices?: VoiceOption[];
+          minimax_voices?: VoiceOption[];
+        };
+        if (cancelled) return;
+        setVoiceOptions([...(data.voices ?? []), ...(data.minimax_voices ?? [])]);
+      } catch {
+        // 拉不到就退回「只显示后端已解析结果」的降级模式。
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   /** 可选角色名（作品角色表 + 已单独配置音色的角色）。 */
   const roleNames = useMemo(() => {
     const names = new Set<string>();
@@ -173,6 +221,41 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     );
     const gender = (character?.gender ?? '').toLowerCase();
     return gender === 'male' || gender === 'female' ? gender : 'unknown';
+  };
+
+  /**
+   * 说话人候选（审核台表格与分镜弹窗共用同一份）。
+   *
+   * 只让用户选**角色**，音色由角色自动带出（讲解者 / 通用男声 / 通用女声 / 角色专属），
+   * 避免在一堆音色 ID 里挑花眼。当前角色可能是旧槽位代号（如 male_antagonist），
+   * 不在候选里时补一条，免得下拉显示空白、用户看不出这一句到底是谁在念。
+   */
+  const roleOptionsFor = (beat: ScriptBeat): RoleOption[] => {
+    const currentRole = (beat.speaker_role ?? '').trim();
+    const options: RoleOption[] = [];
+    if (
+      currentRole &&
+      !['narrator', 'male', 'female'].includes(currentRole) &&
+      !roleNames.includes(currentRole)
+    ) {
+      options.push({
+        value: currentRole,
+        label: `当前角色 ${currentRole}（旧槽位）`,
+      });
+    }
+    options.push({ value: '', label: '不指定（按性别兜底）' });
+    options.push({ value: 'narrator', label: '讲解者（旁白）' });
+    options.push({ value: 'male', label: '通用男声' });
+    options.push({ value: 'female', label: '通用女声' });
+    roleNames.forEach((name) => {
+      options.push({
+        value: name,
+        label: seriesTts?.character_voices?.[name]
+          ? name
+          : `${name}（未单独配置音色）`,
+      });
+    });
+    return options;
   };
 
   /**
@@ -336,14 +419,29 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     return '';
   }, [currentVideoSegment, videoTimeMs]);
 
+  /** 标记表格里有未落盘的改动。 */
+  const markTableDirty = useCallback(() => {
+    tableDirtyRef.current = true;
+    setTableDirty(true);
+  }, []);
+
+  /**
+   * 表格里改一个字段。
+   *
+   * 统一以 draftBeatsRef 为单一数据源：ref 与 state 必须同步更新，
+   * 否则「表格改字 → 再开弹窗改字」会拿旧的 ref 当基线，把表格的改动整份覆盖掉。
+   */
   const updateBeatField = <K extends keyof ScriptBeat>(
     beatId: string,
     key: K,
     value: ScriptBeat[K]
   ) => {
-    setDraftBeats((prev) =>
-      prev.map((b) => (b.beat_id === beatId ? { ...b, [key]: value } : b))
+    const next = draftBeatsRef.current.map((b) =>
+      b.beat_id === beatId ? { ...b, [key]: value } : b
     );
+    draftBeatsRef.current = next;
+    setDraftBeats(next);
+    markTableDirty();
   };
 
   // ── 分镜大图弹窗：字幕原文改完，在切换分镜 / 关闭弹窗时落盘 ────────────
@@ -354,16 +452,22 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   const flushSave = useCallback(async (): Promise<boolean> => {
     const pending = pendingRef.current;
     if (!pending) return true;
-    const { episodeId, beats } = pending;
+    const { episodeId } = pending;
+    // 提交当前**最新**草稿而不是 pending 里的快照：弹窗打开期间表格可能又改了字，
+    // 用旧快照落盘会把表格里的改动整份丢掉。
+    const beats = draftBeatsRef.current;
     setSaveStatus('saving');
     try {
       if (!onAutoSaveBeats) {
         // 没有独立通道时退化为普通保存（不触发重跑配音）
-        onUpdateBeats(episodeId, beats, false);
+        const ok = await onUpdateBeats(episodeId, beats, false);
+        if (ok === false) throw new Error('保存失败，请检查后端服务后重试');
       } else {
         await onAutoSaveBeats(episodeId, beats);
       }
       pendingRef.current = null;
+      tableDirtyRef.current = false;
+      setTableDirty(false);
       setSaveStatus('saved');
       setSaveMessage(new Date().toLocaleTimeString('zh-CN', { hour12: false }));
       return true;
@@ -374,16 +478,49 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     }
   }, [onAutoSaveBeats, onUpdateBeats]);
 
-  /** 弹窗内改字：只改本地草稿，落盘交给切格 / 关闭时统一做 */
-  const handleZoomNarrationChange = (beatId: string, text: string) => {
+  /** 弹窗内改一个字段：只改本地草稿，落盘交给切格 / 关闭时统一做 */
+  const updateZoomBeat = <K extends keyof ScriptBeat>(
+    beatId: string,
+    key: K,
+    value: ScriptBeat[K]
+  ) => {
     const next = draftBeatsRef.current.map((b) =>
-      b.beat_id === beatId ? { ...b, narration_text: text } : b
+      b.beat_id === beatId ? { ...b, [key]: value } : b
     );
     draftBeatsRef.current = next;
     setDraftBeats(next);
     pendingRef.current = { episodeId: episode.episode_id, beats: next };
+    markTableDirty();
     setSaveStatus('dirty');
     setSaveMessage('切换分镜或关闭弹窗时自动保存');
+  };
+
+  /** 弹窗内改字：只改本地草稿，落盘交给切格 / 关闭时统一做 */
+  const handleZoomNarrationChange = (beatId: string, text: string) => {
+    updateZoomBeat(beatId, 'narration_text', text);
+  };
+
+  /**
+   * Patch v4.2：弹窗内改说话人角色。
+   *
+   * 角色决定音色（讲解者 / 通用男声 / 通用女声 / 角色专属），所以只改角色就够；
+   * 同步写 speaker_gender，避免沿用上一个角色的性别；顺手清掉历史遗留的
+   * 强制指定音色（voice_override），否则界面显示的角色与实际合成音色会不一致。
+   */
+  const handleZoomRoleChange = (beatId: string, role: string) => {
+    updateZoomBeat(beatId, 'speaker_role', role);
+    updateZoomBeat(
+      beatId,
+      'speaker_gender',
+      role ? genderForRole(role) : 'unknown'
+    );
+    const beat = draftBeatsRef.current.find((b) => b.beat_id === beatId);
+    if (beat?.voice_override) updateZoomBeat(beatId, 'voice_override', '');
+  };
+
+  /** Patch v4.2：弹窗内改情绪指令（送音语气）。 */
+  const handleZoomEmotionChange = (beatId: string, text: string) => {
+    updateZoomBeat(beatId, 'emotion_instruction', text);
   };
 
   /** 上一格 / 下一格：先把当前格的改动存下来，再翻页 */
@@ -432,20 +569,22 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   };
 
   const handleAddBeat = () => {
-    setDraftBeats((prev) => {
-      const firstPanel = episode.panels[0]?.panel_id ?? 'p_001';
-      const newBeat: ScriptBeat = {
-        beat_id: uniqueBeatId(prev),
-        narration_text: '请在此输入新的短句解说文案。',
-        tts_text: '',
-        emotion_instruction: '用自然平稳的漫评解说语气说出',
-        target_panel_ids: [firstPanel],
-        motion: 'zoom_in',
-        pause_after_ms: 250,
-        audio_duration_ms: 0,
-      };
-      return [...prev, newBeat];
-    });
+    const prev = draftBeatsRef.current;
+    const firstPanel = episode.panels[0]?.panel_id ?? 'p_001';
+    const newBeat: ScriptBeat = {
+      beat_id: uniqueBeatId(prev),
+      narration_text: '请在此输入新的短句解说文案。',
+      tts_text: '',
+      emotion_instruction: '用自然平稳的漫评解说语气说出',
+      target_panel_ids: [firstPanel],
+      motion: 'zoom_in',
+      pause_after_ms: 250,
+      audio_duration_ms: 0,
+    };
+    const next = [...prev, newBeat];
+    draftBeatsRef.current = next;
+    setDraftBeats(next);
+    markTableDirty();
   };
 
   /**
@@ -456,33 +595,80 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
    * 新句尚未合成，时长记 0；落盘需要点「保存并从 Stage 5 重跑配音」。
    */
   const handleInsertBeat = (afterBeatId: string) => {
-    setDraftBeats((prev) => {
-      const index = prev.findIndex((b) => b.beat_id === afterBeatId);
-      if (index < 0) return prev;
-      const current = prev[index];
-      const next = prev[index + 1];
-      const newBeat: ScriptBeat = {
-        beat_id: uniqueBeatId(prev),
-        narration_text: '请在此输入新的短句解说文案。',
-        tts_text: '',
-        emotion_instruction: current.emotion_instruction,
-        target_panel_ids: next
-          ? [...next.target_panel_ids]
-          : [...current.target_panel_ids],
-        motion: current.motion,
-        pause_after_ms: current.pause_after_ms,
-        audio_duration_ms: 0,
-        speaker_role: current.speaker_role,
-      };
-      const nextBeats = [...prev];
-      nextBeats.splice(index + 1, 0, newBeat);
-      return nextBeats;
-    });
+    const prev = draftBeatsRef.current;
+    const index = prev.findIndex((b) => b.beat_id === afterBeatId);
+    if (index < 0) return;
+    const current = prev[index];
+    const next = prev[index + 1];
+    const newBeat: ScriptBeat = {
+      beat_id: uniqueBeatId(prev),
+      narration_text: '请在此输入新的短句解说文案。',
+      tts_text: '',
+      emotion_instruction: current.emotion_instruction,
+      target_panel_ids: next
+        ? [...next.target_panel_ids]
+        : [...current.target_panel_ids],
+      motion: current.motion,
+      pause_after_ms: current.pause_after_ms,
+      audio_duration_ms: 0,
+      speaker_role: current.speaker_role,
+    };
+    const nextBeats = [...prev];
+    nextBeats.splice(index + 1, 0, newBeat);
+    draftBeatsRef.current = nextBeats;
+    setDraftBeats(nextBeats);
+    markTableDirty();
   };
 
   const handleDeleteBeat = (beatId: string) => {
-    setDraftBeats((prev) => prev.filter((b) => b.beat_id !== beatId));
+    const next = draftBeatsRef.current.filter((b) => b.beat_id !== beatId);
+    draftBeatsRef.current = next;
+    setDraftBeats(next);
+    markTableDirty();
   };
+
+  /**
+   * 保存解说稿。
+   *
+   * triggerFromStage5=false：只落盘剧本（不重跑配音）；
+   * triggerFromStage5=true ：落盘后顺带从 Stage 5 重跑配音与出片。
+   * 保存失败时保留草稿与「未保存改动」标记，别让用户以为已经存上了。
+   */
+  const handleSaveBeats = async (triggerFromStage5: boolean) => {
+    const beats = draftBeatsRef.current;
+    const invalid = beats.find((b) => (b.narration_text ?? '').trim().length < 2);
+    if (invalid) {
+      setSaveHint(
+        `「${invalid.beat_id}」的字幕原文为空或不足 2 字，后端会拒收整批，请先补齐再保存。`
+      );
+      return;
+    }
+    setSaveHint('');
+    setSavingBeats(true);
+    try {
+      const ok = await onUpdateBeats(episode.episode_id, beats, triggerFromStage5);
+      if (ok === false) {
+        setSaveHint('保存失败：后端拒绝了这次保存，草稿仍保留在本地，请检查后重试。');
+        return;
+      }
+      tableDirtyRef.current = false;
+      setTableDirty(false);
+      pendingRef.current = null;
+    } finally {
+      setSavingBeats(false);
+    }
+  };
+
+  // 有未落盘的改动时，刷新 / 关页面前提醒一次，避免草稿被静默丢掉。
+  useEffect(() => {
+    if (!tableDirty) return;
+    const handler = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, [tableDirty]);
 
   const handlePreviewAudio = (beatId: string) => {
     playPreviewTone();
@@ -759,17 +945,52 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                 <Plus className="w-3.5 h-3.5" />
                 新增解说句
               </button>
+              {tableDirty && (
+                <span className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg whitespace-nowrap shrink-0">
+                  <AlertCircle className="w-3.5 h-3.5" />
+                  有未保存的改动
+                </span>
+              )}
               <button
                 type="button"
-                onClick={() => onUpdateBeats(episode.episode_id, draftBeats, true)}
-                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 whitespace-nowrap shrink-0 cursor-pointer"
+                disabled={savingBeats}
+                onClick={() => void handleSaveBeats(false)}
+                className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium rounded-lg whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed ${
+                  tableDirty
+                    ? 'text-blue-700 bg-blue-50 border border-blue-300 hover:bg-blue-100'
+                    : 'text-slate-700 bg-white border border-slate-200 hover:bg-slate-50'
+                }`}
               >
-                <RotateCcw className="w-3.5 h-3.5" />
+                {savingBeats ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <FileText className="w-3.5 h-3.5" />
+                )}
+                保存解说稿
+              </button>
+              <button
+                type="button"
+                disabled={savingBeats}
+                onClick={() => void handleSaveBeats(true)}
+                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
+              >
+                {savingBeats ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <RotateCcw className="w-3.5 h-3.5" />
+                )}
                 保存并从 Stage 5 重跑配音
               </button>
             </div>
           )}
         </div>
+
+        {activeTab === 'script' && saveHint && (
+          <div className="mt-2 flex items-start gap-2 px-3 py-2 text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg">
+            <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+            <span>{saveHint}</span>
+          </div>
+        )}
 
         {/* Empty State if Episode not crawled yet */}
         {episode.panels.length === 0 ? (
@@ -964,15 +1185,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                       );
                       const { spokenText, matchedRules } = resolveSpokenText(beat, rules);
                       const voiceInfo = beatVoiceInfo(beat);
-                      const currentRole = (beat.speaker_role ?? '').trim();
-                      // 当前角色可能是旧槽位代号（如 male_antagonist），不在候选里时补一条，
-                      // 免得下拉显示空白、用户看不出这一句到底是谁在念。
-                      const currentRoleOption =
-                        currentRole &&
-                        !['narrator', 'male', 'female'].includes(currentRole) &&
-                        !roleNames.includes(currentRole)
-                          ? { value: currentRole, label: `当前角色 ${currentRole}（旧槽位）` }
-                          : null;
+                      const roleOptions = roleOptionsFor(beat);
                       const charLen = beat.narration_text.trim().length;
                       const isLengthWarn = charLen < 8 || charLen > 30;
                       return (
@@ -1098,19 +1311,12 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                                 aria-label={`${beat.beat_id} 配音角色`}
                                 className="w-full px-2 py-1 text-[11px] bg-white border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
                               >
-                                {currentRoleOption && (
-                                  <option value={currentRoleOption.value}>
-                                    {currentRoleOption.label}
-                                  </option>
-                                )}
-                                <option value="">不指定（按性别兜底）</option>
-                                <option value="narrator">讲解者（旁白）</option>
-                                <option value="male">通用男声</option>
-                                <option value="female">通用女声</option>
-                                {roleNames.map((name) => (
-                                  <option key={name} value={name}>
-                                    {name}
-                                    {seriesTts?.character_voices[name] ? '' : '（未单独配置音色）'}
+                                {roleOptions.map((option) => (
+                                  <option
+                                    key={option.value || '__none__'}
+                                    value={option.value}
+                                  >
+                                    {option.label}
                                   </option>
                                 ))}
                               </select>
@@ -1547,9 +1753,18 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         activeBeatId={zoomBeatId}
         saveStatus={saveStatus}
         saveMessage={saveMessage}
+        roleOptions={zoomBeat ? roleOptionsFor(zoomBeat) : []}
+        voiceInfo={
+          zoomBeat
+            ? beatVoiceInfo(zoomBeat)
+            : { label: '待解析', voice: '—', hint: '' }
+        }
+        voiceOptions={voiceOptions}
         onClose={handleZoomClose}
         onSelectBeat={handleZoomSelectBeat}
         onChangeNarration={handleZoomNarrationChange}
+        onChangeRole={handleZoomRoleChange}
+        onChangeEmotion={handleZoomEmotionChange}
       />
     </div>
   );

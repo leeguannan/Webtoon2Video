@@ -213,6 +213,9 @@ class ScriptBeat(BaseModel):
     #: Patch v3.2 Patch 12：说话人性别。与 ``speaker_role`` 配套，
     #: 用于把「未在作品词典里单独指定音色的角色」路由到通用男声 / 通用女声。
     speaker_gender: Literal["male", "female", "unknown"] = "unknown"
+    #: Patch v4.2：逐句指定音色（审核台分镜大图弹窗里设置）。空串 = 按角色解析
+    #: （旁白 / 角色专属 / 通用男女声），非空则强制使用该音色 ID。
+    voice_override: str = ""
 
 
 class NarrationScript(BaseModel):

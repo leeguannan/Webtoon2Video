@@ -461,6 +461,8 @@ PRESERVED_BEAT_FIELDS: tuple[str, ...] = (
     "focus_hint",
     # Patch v3.2 Patch 12：说话人性别（前端还没回传该字段，别被前端保存抹掉）
     "speaker_gender",
+    # Patch v4.2：逐句指定音色（前端未回传时继承旧值；回传空串 = 改回「跟随角色」）
+    "voice_override",
 )
 
 #: 上面这些字段里允许显式置 ``None``（清空）的，其余字段 ``None`` 非法，按「未提供」处理。
@@ -826,6 +828,8 @@ class WorkspaceView:
                 "audio_duration_ms": durations.get(beat.beat_id, 0),
                 "speaker_role": beat.speaker_role,
                 "speaker_gender": str(getattr(beat, "speaker_gender", "") or ""),
+                # Patch v4.2：逐句指定音色（空串 = 跟随角色解析）。
+                "voice_override": str(getattr(beat, "voice_override", "") or ""),
                 "sfx_cue": beat.sfx_cue,
                 "focus_hint": beat.focus_hint,
             }
@@ -868,7 +872,7 @@ class WorkspaceView:
             default_voice=self.config.tts.default_voice,
             voice_cast=voice_cast,
         )
-        return {
+        payload: dict[str, Any] = {
             "voice": assignment.spec.voice,
             "speed": assignment.spec.speed,
             "source": assignment.source,
@@ -876,6 +880,24 @@ class WorkspaceView:
             "role": assignment.role,
             "gender": assignment.gender,
         }
+        if assignment.source == "voice_override":
+            # 逐句指定音色时，同时给出「清空指定后按角色会用哪个音色」。
+            base = s5_tts.resolve_beat_voice_assignment_without_override(
+                beat,
+                series_tts=series_tts,
+                characters=characters,
+                default_voice=self.config.tts.default_voice,
+                voice_cast=voice_cast,
+            )
+            payload["role_voice"] = {
+                "voice": base.spec.voice,
+                "speed": base.spec.speed,
+                "source": base.source,
+                "label": base.label,
+                "role": base.role,
+                "gender": base.gender,
+            }
+        return payload
 
     @staticmethod
     def _audio_durations(episode_dir: Path) -> dict[str, int]:

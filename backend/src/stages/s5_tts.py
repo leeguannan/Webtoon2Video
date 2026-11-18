@@ -517,7 +517,7 @@ class BeatVoiceAssignment:
     #: 最终使用的音色 + 语速。
     spec: VoiceSpec
     #: 来源代号：``narrator`` / ``character`` / ``default_male`` / ``default_female`` /
-    #: ``legacy_male`` / ``legacy_female`` / ``legacy_cast``。
+    #: ``legacy_male`` / ``legacy_female`` / ``legacy_cast`` / ``voice_override``。
     source: str
     #: 人类可读的来源说明，例如「讲解者（旁白）」「角色专属 · 恩彗」「通用女声」。
     label: str
@@ -528,6 +528,64 @@ class BeatVoiceAssignment:
 
 
 def resolve_beat_voice_assignment(
+    beat: ScriptBeat,
+    *,
+    series_tts: SeriesTTSConfig | None = None,
+    characters: Sequence[CharacterProfile] | None = None,
+    default_voice: str | None = None,
+    voice_cast: Mapping[str, str] | None = None,
+) -> BeatVoiceAssignment:
+    """解析「音色 + 语速 + 来源」，并处理逐句指定音色（Patch v4.2）。
+
+    先按四级规则解析（见 :func:`_resolve_beat_voice_assignment_base`），再叠加
+    ``beat.voice_override``：非空时强制使用该音色（语速沿用解析结果），
+    来源标记为 ``voice_override``，界面显示「指定音色」。
+
+    跨供应商兜底不在这里做：MiniMax 模型收到百炼音色时，统一在合成阶段
+    （:func:`resolve_voice_for_tts_model`）换成同定位的 MiniMax 音色。
+    """
+    assignment = _resolve_beat_voice_assignment_base(
+        beat,
+        series_tts=series_tts,
+        characters=characters,
+        default_voice=default_voice,
+        voice_cast=voice_cast,
+    )
+    override = str(getattr(beat, "voice_override", "") or "").strip()
+    if not override:
+        return assignment
+    return BeatVoiceAssignment(
+        spec=VoiceSpec(voice=override, speed=assignment.spec.speed),
+        source="voice_override",
+        label="指定音色",
+        role=assignment.role,
+        gender=assignment.gender,
+    )
+
+
+def resolve_beat_voice_assignment_without_override(
+    beat: ScriptBeat,
+    *,
+    series_tts: SeriesTTSConfig | None = None,
+    characters: Sequence[CharacterProfile] | None = None,
+    default_voice: str | None = None,
+    voice_cast: Mapping[str, str] | None = None,
+) -> BeatVoiceAssignment:
+    """忽略 ``beat.voice_override`` 的角色解析结果（Patch v4.2）。
+
+    审核台需要同时展示「本句指定的音色」和「如果清空指定、按角色会用哪个音色」，
+    这里单独暴露一份不含 override 的解析结果，避免前端另写一套角色判定。
+    """
+    return _resolve_beat_voice_assignment_base(
+        beat,
+        series_tts=series_tts,
+        characters=characters,
+        default_voice=default_voice,
+        voice_cast=voice_cast,
+    )
+
+
+def _resolve_beat_voice_assignment_base(
     beat: ScriptBeat,
     *,
     series_tts: SeriesTTSConfig | None = None,
@@ -748,7 +806,9 @@ async def _synthesize_beat(
     if voice:
         beat_voice: str | None = voice
     elif series_tts is None:
-        beat_voice = resolve_beat_voice(
+        # Patch v4.2：逐句指定音色优先于旧槽位表。
+        override = str(getattr(beat, "voice_override", "") or "").strip()
+        beat_voice = override or resolve_beat_voice(
             beat, default_voice=default_voice, voice_cast=voice_cast
         )
     else:
@@ -902,12 +962,16 @@ async def synthesize_episode(
     series_tts: SeriesTTSConfig | None = None,
     characters: Sequence[CharacterProfile] | None = None,
     concurrency: int = 4,
+    retry_rounds: int = 1,
+    placeholder_on_failure: bool = False,
     ffmpeg_bin: str = "ffmpeg",
     trim_silence: bool = True,
     tts_model: str | None = None,
 ) -> list[AudioClipMeta]:
-    """并发合成整话音频，返回音频清单（顺序与剧本 beats 一致）。
+    """合成整话音频，返回音频清单（顺序与剧本 beats 一致）。
 
+    * 普通 provider 按 ``concurrency`` 并发；带 ``serial_requests`` 标记的
+      provider（MiniMax）严格串行，配合其进程内 RPM 闸门避免限流雪崩。
     * 单条 beat 失败只记录问题并跳过；**全部**失败才抛 :class:`TTSStageError`。
     * ``overrides`` 是发音词典，只作用于送音文本。
     * ``voice`` 为显式指定音色（优先）；否则按 ``beat.speaker_role`` 查
@@ -916,6 +980,9 @@ async def synthesize_episode(
       ``characters`` 用于按角色表判定性别。
     * ``tts_model`` 是当前 TTS 模型名（Patch v3.4 Patch 16）；用于跨模型音色兜底，
       缺省时从 client 的 ``model`` 属性推断。
+    * ``retry_rounds`` 是失败 beat 的**串行**补齐轮数（Patch v4.3）。
+    * ``placeholder_on_failure`` 打开后，补齐仍失败的 beat 用等长静音占位，
+      保证时间轴与字幕不错位（默认关闭，保持"失败 beat 不进音频清单"的既有契约）。
     """
     if not script.beats:
         raise TTSStageError("剧本里没有任何 beat，无法合成音频")
@@ -930,55 +997,186 @@ async def synthesize_episode(
     # 目录里混着编号错位的旧文件（下游按文件名引用会拿到旧音频）。
     clean_stale_audio(target_dir)
 
+    # Patch v4.3：同时清掉上一轮的问题记录。否则整轮全部成功（或补齐成功）后，
+    # 旧的 audio_issues.json 会原地残留，让人误以为仍有 beat 合成失败。
+    stale_issues = target_dir / AUDIO_ISSUES_FILENAME
+    try:
+        if stale_issues.is_file():
+            stale_issues.unlink()
+    except OSError as exc:  # pragma: no cover - 清理失败不应阻断合成
+        logger.warning("[s5_tts] 删除旧问题记录失败（%s）：%s", stale_issues, exc)
+
     # Patch v3.4 Patch 17：连续对白说话人继承（没写「XX说：」的纯引号对白
     # 继承上一句的说话人与性别），在这里先算好，供各 beat 合成时套用。
     inheritance = resolve_dialogue_speaker_inheritance(
         [beat.model_dump() for beat in script.beats]
     )
 
-    semaphore = asyncio.Semaphore(max(1, int(concurrency)))
+    async def synth_one(beat: ScriptBeat) -> tuple[AudioClipMeta | None, list[_Issue]]:
+        return await _synthesize_beat(
+            client,
+            beat,
+            audio_dir=target_dir,
+            overrides=overrides,
+            voice=voice,
+            default_voice=default_voice,
+            voice_cast=voice_cast,
+            series_tts=series_tts,
+            characters=characters,
+            ffmpeg_bin=ffmpeg_bin,
+            trim_silence=trim_silence,
+            tts_model=tts_model,
+            inheritance=inheritance,
+        )
 
-    async def worker(beat: ScriptBeat) -> tuple[AudioClipMeta | None, list[_Issue]]:
-        async with semaphore:
-            return await _synthesize_beat(
-                client,
-                beat,
-                audio_dir=target_dir,
-                overrides=overrides,
-                voice=voice,
-                default_voice=default_voice,
-                voice_cast=voice_cast,
-                series_tts=series_tts,
-                characters=characters,
-                ffmpeg_bin=ffmpeg_bin,
-                trim_silence=trim_silence,
-                tts_model=tts_model,
-                inheritance=inheritance,
-            )
+    # Patch v4.3：带进程内 RPM 闸门的 provider（MiniMax）要求严格串行。
+    # 79 个协程 gather + 双层信号量时，一次限流重试的长冷却会独占 provider 闸门，
+    # 排队协程预先分到的节流时隙在冷却结束后全部过期，进而突发连打触发 1002 雪崩
+    # （实测 6 路并发下前 21 条成功、其后整批 1002）。串行调度下 limiter 时隙始终
+    # 与真实时间同步，与独立探针「12 RPM 连续 60/60 成功」的节奏一致。
+    serial_mode = bool(getattr(client, "serial_requests", False)) or int(concurrency) <= 1
+    if serial_mode:
+        results: list[tuple[AudioClipMeta | None, list[_Issue]] | BaseException] = []
+        for beat in script.beats:
+            try:
+                results.append(await synth_one(beat))
+            except BaseException as exc:  # noqa: BLE001 - 对齐 gather(return_exceptions=True)
+                results.append(exc)
+    else:
+        semaphore = asyncio.Semaphore(max(1, int(concurrency)))
 
-    results = await asyncio.gather(
-        *(worker(beat) for beat in script.beats), return_exceptions=True
-    )
+        async def worker(beat: ScriptBeat) -> tuple[AudioClipMeta | None, list[_Issue]]:
+            async with semaphore:
+                return await synth_one(beat)
 
-    metas: list[AudioClipMeta] = []
+        results = await asyncio.gather(
+            *(worker(beat) for beat in script.beats), return_exceptions=True
+        )
+
+    # metas 与 script.beats **同序**：缺音频的 beat 先留 None，
+    # 补齐 / 占位后再回填，保证下游时间轴与字幕不错位。
+    metas: list[AudioClipMeta | None] = []
     issues: list[_Issue] = []
-    for beat, outcome in zip(script.beats, results):
+    failed: list[tuple[int, ScriptBeat, list[_Issue]]] = []
+    for index, (beat, outcome) in enumerate(zip(script.beats, results)):
         if isinstance(outcome, BaseException):
-            issues.append(
-                _Issue(beat.beat_id, "synthesize", f"合成异常：{type(outcome).__name__}: {outcome}")
+            issue = _Issue(
+                beat.beat_id, "synthesize", f"合成异常：{type(outcome).__name__}: {outcome}"
             )
+            issues.append(issue)
+            metas.append(None)
+            failed.append((index, beat, [issue]))
             continue
         meta, beat_issues = outcome
-        if meta is not None:
-            metas.append(meta)
+        metas.append(meta)
         issues.extend(beat_issues)
+        if meta is None:
+            failed.append((index, beat, list(beat_issues)))
 
-    if not metas:
+    # Patch v4.3：失败 beat **串行**补齐。并发补齐在限流场景只会更快撞限，
+    # 串行 + provider 侧的 RPM 闸门才能稳定把缺的句子补回来。
+    # 补齐成功的 beat 其首轮失败记录随后从 issues 清除，避免 audio_issues.json
+    # 里残留「已救回的假警报」误导排查（只保留真正没救回来的问题）。
+    resolved_by_retry: set[str] = set()
+    for round_index in range(max(0, int(retry_rounds))):
+        if not failed:
+            break
+        pending = failed
+        failed = []
+        logger.info(
+            "[s5_tts] 第 %d 轮补齐 %d 条失败 beat（串行）",
+            round_index + 1,
+            len(pending),
+        )
+        for index, beat, _beat_issues in pending:
+            meta, extra_issues = await synth_one(beat)
+            issues.extend(extra_issues)
+            if meta is not None:
+                metas[index] = meta
+                resolved_by_retry.add(beat.beat_id)
+            else:
+                failed.append((index, beat, list(extra_issues)))
+
+    if resolved_by_retry:
+        before = len(issues)
+        issues = [
+            item
+            for item in issues
+            if not (item.beat_id in resolved_by_retry and item.stage == "synthesize")
+        ]
+        logger.info(
+            "[s5_tts] 补齐轮救回 %d 条 beat，已清除其首轮失败记录（%d → %d 条 issue）",
+            len(resolved_by_retry),
+            before,
+            len(issues),
+        )
+
+    # Patch v4.3：仍然失败的 beat 用等长静音占位，保住时间轴与字幕不错位，
+    # 同时把问题写进 audio_issues.json（不静默吞掉）。
+    # 占位是**可选**行为（默认关闭，保持"失败 beat 不进音频清单"的既有契约）；
+    # 打开后时间轴与字幕不再因个别句子失败而错位。
+    if placeholder_on_failure:
+        for index, beat, beat_issues in failed:
+            placeholder = _write_silence_placeholder(
+                target_dir,
+                beat,
+                text=build_spoken_text(beat, overrides),
+            )
+            if placeholder is None:
+                continue
+            metas[index] = placeholder
+            detail = beat_issues[-1].message if beat_issues else "未知原因"
+            issues.append(
+                _Issue(
+                    beat.beat_id,
+                    "synthesize",
+                    f"合成失败且补齐未成功，已用静音占位（时间轴/字幕不错位）：{detail}",
+                )
+            )
+
+    final_metas = [meta for meta in metas if meta is not None]
+    if not final_metas:
         detail = "\n".join(f"- [{item.stage}] {item.beat_id}：{item.message}" for item in issues)
         raise TTSStageError(f"本话所有 beat 合成失败（共 {len(script.beats)} 条）：\n{detail}")
 
     _write_issues(target_dir, issues)
-    return metas
+    return final_metas
+
+
+def _write_silence_placeholder(
+    audio_dir: Path,
+    beat: ScriptBeat,
+    *,
+    text: str,
+) -> AudioClipMeta | None:
+    """为合成失败的 beat 写一段等长静音（Patch v4.3）。
+
+    目的不是"假装合成成功"，而是让下游时间轴与字幕**不错位**：缺失的一句
+    仍然占住它应有的时长，问题同时写进 ``audio_issues.json``。
+    """
+    duration_ms = max(400, int(len(text.strip()) / 4.5 * 1000))
+    path = Path(audio_dir) / f"beat_{safe_beat_id(beat.beat_id)}.wav"
+    frames = int(32000 * duration_ms / 1000)
+    try:
+        with wave.open(str(path), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(32000)
+            handle.writeframes(b"\x00\x00" * frames)
+    except (OSError, wave.Error) as exc:
+        logger.warning(
+            "[s5_tts] 静音占位写入失败（%s）：%s", beat.beat_id, exc
+        )
+        return None
+    return AudioClipMeta(
+        beat_id=beat.beat_id,
+        audio_path=path.name,
+        duration_ms=duration_ms,
+        pause_after_ms=(
+            beat.pause_after_ms if beat.pause_after_ms is not None else DEFAULT_PAUSE_AFTER_MS
+        ),
+        word_timestamps=[],
+    )
 
 
 def _write_issues(audio_dir: Path, issues: Sequence[_Issue]) -> None:
@@ -1013,6 +1211,8 @@ async def run_stage5(
     series_tts: SeriesTTSConfig | None = None,
     characters: Sequence[CharacterProfile] | None = None,
     concurrency: int = 4,
+    retry_rounds: int = 1,
+    placeholder_on_failure: bool = False,
     ffmpeg_bin: str = "ffmpeg",
     trim_silence: bool = True,
     tts_model: str | None = None,
@@ -1026,6 +1226,8 @@ async def run_stage5(
     （Patch v3.1 Patch 11 A3）。``series_tts`` / ``characters`` 启用作品级
     四级音色 + 语速路由（Patch v3.2 Patch 13 B2）。
     ``tts_model`` 是当前 TTS 模型名（Patch v3.4 Patch 16），用于跨模型音色兜底。
+    ``retry_rounds`` 是失败 beat 的串行补齐轮数（Patch v4.3）。
+    ``placeholder_on_failure`` 打开后，失败的 beat 用等长静音占位保住时间轴（Patch v4.3）。
     """
     series_root = Path(series_dir)
     script_path = series_root / "episodes" / f"ep_{episode_no:03d}" / "04_script" / "script.json"
@@ -1049,6 +1251,8 @@ async def run_stage5(
         series_tts=series_tts,
         characters=characters,
         concurrency=concurrency,
+        retry_rounds=retry_rounds,
+        placeholder_on_failure=placeholder_on_failure,
         ffmpeg_bin=ffmpeg_bin,
         trim_silence=trim_silence,
         tts_model=tts_model,

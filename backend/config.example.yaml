@@ -21,6 +21,13 @@ api:
   # 新版 Platform API Key 不需要 GroupId，留空即可
   minimax_group_id_env: MINIMAX_GROUP_ID
   minimax_group_id: ""
+  # Patch v4.3：MiniMax t2a_v2 每分钟请求上限（RPM）。超限会返回
+  # 1002 rate limit exceeded(RPM)，该句就没有音频 → 成片缺句。
+  # 实测单账号约 17~30 次/分钟即触发，这里留余量；填 0 = 不限流。
+  minimax_rate_limit_rpm: 20
+  # Patch v4.3：同一 client 的在途请求上限。MiniMax 对并发极敏感
+  # （多条在途会 1002 / 断连），1 = 串行；2 以上要非常保守。
+  minimax_max_concurrency: 1
 
 models:
   # Stage 3 识图（密集文字可用 qwen-vl-max）
@@ -92,6 +99,11 @@ tts:
   #   继母:
   #     voice: Katerina
   #     speed: 1.05
+  # Patch v4.3：合成失败的 beat 额外串行补齐几轮（限流时靠它把缺的句子补回来）；0 = 不补齐。
+  retry_failed_rounds: 1
+  # Patch v4.3：补齐仍失败时，是否用等长静音占位保住时间轴与字幕（问题会写进
+  # 05_audio/audio_issues.json，不会静默吞掉）。false = 失败句不进音频清单（默认）。
+  silence_placeholder_on_failure: false
 
 concurrency:
   # 跨作品并发度

@@ -688,6 +688,9 @@ class JobRunner:
             series_tts=series_tts,
             characters=characters,
             concurrency=self.config.concurrency.stage,
+            # Patch v4.3：限流导致的失败 beat 串行补齐，避免成片缺句。
+            retry_rounds=self.config.tts.retry_failed_rounds,
+            placeholder_on_failure=self.config.tts.silence_placeholder_on_failure,
             ffmpeg_bin=self.config.render.ffmpeg_bin,
             tts_model=self.config.models.tts,
         )
