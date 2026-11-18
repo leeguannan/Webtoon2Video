@@ -281,3 +281,14 @@ export interface StoryboardGenerateResponse {
   };
   storyboard: EpisodeStoryboard;
 }
+
+/** POST /api/episodes/{id}/reset 的响应（按步向后级联清理）。 */
+export interface EpisodeResetResponse {
+  episode_id: string;
+  from_stage: StageId;
+  cleared_stages: StageId[];
+  removed_count: number;
+  preserved_human_storyboard: boolean;
+  stages: StageProgress[];
+  logs?: string[];
+}

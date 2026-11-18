@@ -89,7 +89,7 @@ from providers.tts_qwen import (
     voice_sample_filename,
 )
 from stages import s0_catalog, s3b_scenes, s5_tts, s6_timeline, s7_renderer
-from web.job_runner import STAGE_DEFS, EpisodeState, JobError, JobRunner
+from web.job_runner import STAGE_DEFS, STAGE_IDS, EpisodeState, JobError, JobRunner
 
 #: 面板图片后缀。
 PANEL_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp"})
@@ -323,6 +323,13 @@ class RerunRequest(BaseModel):
     mode: str = "phase1_only"
 
 
+class EpisodeResetRequest(BaseModel):
+    """``POST /api/episodes/{ep_id}/reset`` 请求体（Patch v4.1 Patch 21）。"""
+
+    from_stage: str
+    include_human_storyboard: bool = False
+
+
 class ScriptUpdateRequest(BaseModel):
     """``PUT /api/episodes/{ep_id}/script`` 请求体。"""
 
@@ -381,12 +388,15 @@ def _validate_storyboard_scenes(
     * 至少保留一幕，每幕 ``panel_ids`` 非空；
     * 同一分镜不允许跨幕重复引用；
     * 所有分镜必须属于本话；
-    * 幕内分镜按 :func:`panel_sort_key` 单调不减排列。
+    * 幕内分镜按 :func:`panel_sort_key` 单调不减排列；
+    * 跨幕顺序：后一幕的起始分镜必须排在上一幕末尾分镜之后
+      （Patch v4.0 Patch 20.1），否则按剧情时间倒序了。
     """
     if not raw_scenes:
         raise HTTPException(status_code=400, detail="至少保留一个镜头组")
     seen: set[str] = set()
     scenes: list[StoryboardScene] = []
+    previous_last_key: tuple[str, int, str] | None = None
     for index, raw in enumerate(raw_scenes):
         if not isinstance(raw, dict):
             raise HTTPException(status_code=400, detail=f"第 {index + 1} 幕格式不正确")
@@ -413,6 +423,15 @@ def _validate_storyboard_scenes(
                 status_code=400,
                 detail=f"第 {index + 1} 幕的分镜顺序必须单调不减",
             )
+        if previous_last_key is not None and ordered[0] <= previous_last_key:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"第 {index + 1} 幕与前一幕分镜顺序交叉，"
+                    "请按剧情时间顺序排列镜头组"
+                ),
+            )
+        previous_last_key = ordered[-1]
         seen.update(panel_ids)
         scenes.append(
             StoryboardScene(
@@ -1152,6 +1171,45 @@ def create_app(
         except JobError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return job
+
+    @app.post("/api/episodes/{episode_id}/reset")
+    async def reset_episode(
+        episode_id: str, payload: EpisodeResetRequest
+    ) -> dict[str, Any]:
+        """清空该话指定阶段及其下游的产物与完成标记（Patch v4.1 Patch 21）。"""
+        located = view.find_episode(episode_id)
+        if located is None:
+            raise HTTPException(status_code=404, detail=f"找不到话次：{episode_id}")
+        series_id, episode_no = located
+        if payload.from_stage not in STAGE_IDS or payload.from_stage == "s0_catalog":
+            raise HTTPException(
+                status_code=400, detail="只能从 S1 ~ S7 清理单话下游阶段"
+            )
+        state = job_runner.state_of(series_id, episode_no)
+        if state.status in {"queued", "running"}:
+            raise HTTPException(
+                status_code=409, detail="该话正在后台执行任务，请等待完成后再清理"
+            )
+        try:
+            summary = job_runner.reset_episode_from_stage(
+                series_id,
+                episode_no,
+                payload.from_stage,
+                include_human_storyboard=payload.include_human_storyboard,
+            )
+        except JobError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "episode_id": episode_id,
+            "from_stage": payload.from_stage,
+            "cleared_stages": summary.get("cleared_stages", []),
+            "removed_count": summary.get("removed_count", 0),
+            "preserved_human_storyboard": bool(
+                summary.get("preserved_human_storyboard")
+            ),
+            "stages": view.stage_progress(series_id, episode_no, state),
+            "logs": list(state.logs),
+        }
 
     @app.put("/api/episodes/{episode_id}/script")
     async def update_script(episode_id: str, payload: ScriptUpdateRequest) -> dict[str, Any]:

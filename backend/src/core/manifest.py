@@ -11,8 +11,11 @@
 
 from __future__ import annotations
 
+import json
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -186,6 +189,116 @@ class ManifestManager:
 
     def is_stage_done(self, episode_no: int, stage: str) -> bool:
         return self.stage_status(episode_no, stage) is StageStatus.DONE
+
+    # ------------------------------------------------------------------
+    # 按步向后级联清理（Patch v4.1 Patch 21）
+    # ------------------------------------------------------------------
+    #: ``04_script`` 下「重跑必然作废」的文件（人工稿、镜头组之外的产物）。
+    SCRIPT_STAGE_TRANSIENT_FILES: tuple[str, ...] = (
+        "script.json",
+        "script_readable.md",
+        "story_draft.json",
+        "story_draft.md",
+    )
+
+    def reset_from_stage(
+        self,
+        episode_no: int,
+        from_stage: str,
+        *,
+        include_human_storyboard: bool = False,
+    ) -> dict[str, Any]:
+        """清空 ``from_stage`` 及其之后所有阶段的产物，并把状态重置为「待执行」。
+
+        **为什么需要**：manifest 记录的是「跑过没有」，磁盘上留着的是「昨天的旧片」。
+        只重跑某一步时，下游的旧产物与旧绿色完成标记会混在一起，让人分不清
+        哪些是这次重做的、哪些还是老的。这里把该步及下游的磁盘产物、成片导出、
+        manifest 记录一并清空，让状态重新回到「待执行」。
+
+        规则：
+
+        * ``from_stage`` 必须是 ``s1_crawler`` ~ ``s7_renderer`` 之一；
+        * 阶段目录只清空内部文件与子目录，目录本身保留；
+        * Stage 4 精细清理：剧本 / 故事稿一律删；人工编排的镜头组
+          （``storyboard.json`` 的 ``source == "human"``）默认保留，
+          传 ``include_human_storyboard=True`` 才连它一起删；
+        * Stage 7 额外清掉作品级 ``exports/EP{话次}_*`` 导出成片。
+        """
+        if from_stage not in STAGE_KEYS:
+            raise ValueError(
+                f"只能从 S1 ~ S7 清理单话下游阶段，非法阶段：{from_stage}"
+            )
+        affected = STAGE_KEYS[STAGE_KEYS.index(from_stage) :]
+        removed = 0
+        preserved_human_storyboard = False
+
+        def _remove_file(path: Path) -> None:
+            nonlocal removed
+            if path.is_file():
+                try:
+                    path.unlink()
+                    removed += 1
+                except OSError:  # pragma: no cover - 权限异常不应阻断清理
+                    pass
+
+        def _clear_dir(path: Path) -> None:
+            nonlocal removed
+            if not path.is_dir():
+                return
+            for child in sorted(path.iterdir()):
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                    removed += 1
+                else:
+                    _remove_file(child)
+
+        for stage in affected:
+            stage_dir = self.stage_dir(episode_no, stage)
+            if stage == "s4_scriptwriter":
+                for name in self.SCRIPT_STAGE_TRANSIENT_FILES:
+                    _remove_file(stage_dir / name)
+                board_path = stage_dir / "storyboard.json"
+                if board_path.is_file():
+                    source = ""
+                    try:
+                        payload = json.loads(board_path.read_text(encoding="utf-8"))
+                        source = str(payload.get("source") or "")
+                    except (OSError, ValueError):
+                        source = ""
+                    if (
+                        from_stage == "s4_scriptwriter"
+                        and source == "human"
+                        and not include_human_storyboard
+                    ):
+                        preserved_human_storyboard = True
+                    else:
+                        _remove_file(board_path)
+                _remove_file(
+                    self.series_dir / "bible_snapshots" / f"ep_{episode_no:03d}.json"
+                )
+            else:
+                _clear_dir(stage_dir)
+                if stage == "s7_renderer":
+                    exports_dir = self.series_dir / "exports"
+                    prefix = f"EP{episode_no:03d}_"
+                    if exports_dir.is_dir():
+                        for child in sorted(exports_dir.iterdir()):
+                            if child.is_file() and child.name.startswith(prefix):
+                                _remove_file(child)
+
+        manifest = self.load(episode_no)
+        for stage in affected:
+            manifest.stages.pop(stage, None)
+        self.save(manifest)
+
+        return {
+            "episode_id": self.episode_id(episode_no),
+            "episode_no": episode_no,
+            "from_stage": from_stage,
+            "cleared_stages": list(affected),
+            "removed_count": removed,
+            "preserved_human_storyboard": preserved_human_storyboard,
+        }
 
 
 # --------------------------------------------------------------------------

@@ -128,6 +128,7 @@ export const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [confirmReset, setConfirmReset] = useState(false);
+  const [jobNotice, setJobNotice] = useState('');
   const [openRecap, setOpenRecap] = useState<Set<number>>(new Set());
   const [quoteDraft, setQuoteDraft] = useState<Record<string, string>>({});
 
@@ -174,6 +175,15 @@ export const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
     // 切换话次时重新拉取；onScenesLoaded 引用稳定即可。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [episode.episode_id]);
+
+  // Patch v4.0 Patch 20.1：二次确认 3 秒后自动复位。
+  // 否则「恢复自动分组」按钮会一直停在「确认恢复？」状态，
+  // 用户忘记点取消就只能一直看着危险提示。
+  useEffect(() => {
+    if (!confirmReset) return;
+    const timer = window.setTimeout(() => setConfirmReset(false), 3000);
+    return () => window.clearTimeout(timer);
+  }, [confirmReset]);
 
   const dirty = useMemo(() => {
     if (!data) return false;
@@ -262,6 +272,7 @@ export const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
       setBusy(mode === 'phase1_only' ? 'phase1' : 'full');
       setError('');
       setNotice('');
+      setJobNotice('');
       try {
         // 有未保存的人工编排先落盘，保证后台任务读到的就是当前版本。
         if (dirty) {
@@ -283,6 +294,11 @@ export const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
           mode === 'phase1_only'
             ? `后台任务已提交（job_id=${payload.job.job_id}），正在按镜头组重生成 Stage 4 剧本。`
             : `后台任务已提交（job_id=${payload.job.job_id}），正在从 Stage 4 一路制片到 Stage 7。`
+        );
+        setJobNotice(
+          mode === 'phase1_only'
+            ? `镜头组剧本重生成任务已提交（job_id=${payload.job.job_id}）。`
+            : `镜头组一键制片任务已提交（job_id=${payload.job.job_id}）。`
         );
         onJobSubmitted(payload.job);
       } catch (err) {
@@ -401,8 +417,33 @@ export const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
               onClick={onSwitchToScriptTab}
               className="mt-1 font-medium underline cursor-pointer"
             >
-              前往「解说与多音字审核」查看进度
+              前往剧本审核 →
             </button>
+          </div>
+        </div>
+      )}
+
+      {jobNotice && !error && (
+        <div className="flex items-start gap-2 p-3 text-xs text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg">
+          <Film className="w-4 h-4 shrink-0 mt-0.5" />
+          <div className="flex-1 flex flex-wrap items-center gap-3">
+            <p>{jobNotice}</p>
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                onClick={onSwitchToScriptTab}
+                className="font-medium underline cursor-pointer"
+              >
+                前往剧本审核 →
+              </button>
+              <button
+                type="button"
+                onClick={() => setJobNotice('')}
+                className="text-emerald-700/70 hover:text-emerald-900 cursor-pointer"
+              >
+                知道了
+              </button>
+            </div>
           </div>
         </div>
       )}

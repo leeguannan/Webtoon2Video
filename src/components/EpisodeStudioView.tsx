@@ -36,6 +36,12 @@ interface EpisodeStudioViewProps {
   config: StudioConfig;
   rules: PronunciationRule[];
   onRerunFromStage: (episodeId: string, stageId: StageId) => void;
+  /** 按步向后级联清理（Patch v4.1 Patch 21）：清空该步及下游旧产物与完成标记。 */
+  onResetFromStage?: (
+    episodeId: string,
+    stageId: StageId,
+    includeHumanStoryboard?: boolean
+  ) => Promise<void> | void;
   onTogglePanelBlank: (episodeId: string, panelId: string) => void;
   onUpdateBeats: (episodeId: string, beats: ScriptBeat[], triggerFromStage5: boolean) => void;
   /** 分镜大图弹窗里的字幕原文自动保存（不触发重跑配音）。缺省时退化为本地草稿保存。 */
@@ -44,6 +50,17 @@ interface EpisodeStudioViewProps {
 }
 
 type StudioTab = 'panels' | 'storyboard' | 'script' | 'timeline' | 'preview';
+
+/** 单话流水线顺序（S1 ~ S7）；S0 是作品级，不参与「向后清理」。 */
+const STAGE_SEQUENCE: StageId[] = [
+  's1_crawler',
+  's2_segmenter',
+  's3_vision',
+  's4_scriptwriter',
+  's5_tts',
+  's6_timeline',
+  's7_renderer',
+];
 
 const MOTION_LABELS: Record<CameraMotion, string> = {
   zoom_in: 'ZOOM_IN 缓推',
@@ -60,6 +77,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   config,
   rules,
   onRerunFromStage,
+  onResetFromStage,
   onTogglePanelBlank,
   onUpdateBeats,
   onAutoSaveBeats,
@@ -76,6 +94,10 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   const [playingBeatId, setPlayingBeatId] = useState<string | null>(null);
   /** 作品级配音设置（角色清单 + 各角色音色），用于「本句配音」的角色下拉。 */
   const [seriesTts, setSeriesTts] = useState<SeriesTtsConfigResponse | null>(null);
+  /** Patch v4.1 Patch 21：待确认的「清理重置」目标阶段（内联确认横幅）。 */
+  const [resetTarget, setResetTarget] = useState<StageId | null>(null);
+  const [resetIncludeHuman, setResetIncludeHuman] = useState(false);
+  const [resetBusy, setResetBusy] = useState(false);
 
   // 分镜大图弹窗 + 字幕原文保存（切换分镜 / 关闭弹窗时落盘，编辑过程中不写库）
   const [zoomBeatId, setZoomBeatId] = useState<string | null>(null);
@@ -502,6 +524,41 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     return { transform: 'scale(1)' };
   };
 
+  /* ------------------------------------------------------------------
+   * Patch v4.1 Patch 21：按步向后级联清理（内联确认，不用 window.confirm）
+   * ---------------------------------------------------------------- */
+  const resetAffectedStages = useMemo(() => {
+    if (!resetTarget) return [] as StageId[];
+    const index = STAGE_SEQUENCE.indexOf(resetTarget);
+    return index < 0 ? [] : STAGE_SEQUENCE.slice(index);
+  }, [resetTarget]);
+
+  const resetAffectedCodes = useMemo(
+    () =>
+      resetAffectedStages.map((stageId) => {
+        const found = episode.stages.find((item) => item.id === stageId);
+        return found ? `${found.code} ${found.label}` : stageId;
+      }),
+    [episode.stages, resetAffectedStages]
+  );
+
+  const resetStageLabel = (stageId: StageId): string => {
+    const found = episode.stages.find((item) => item.id === stageId);
+    return found ? `${found.code} ${found.label}` : stageId;
+  };
+
+  const handleConfirmReset = useCallback(async () => {
+    if (!resetTarget || !onResetFromStage) return;
+    setResetBusy(true);
+    try {
+      await onResetFromStage(episode.episode_id, resetTarget, resetIncludeHuman);
+      setResetTarget(null);
+      setResetIncludeHuman(false);
+    } finally {
+      setResetBusy(false);
+    }
+  }, [episode.episode_id, onResetFromStage, resetIncludeHuman, resetTarget]);
+
   return (
     <div className="space-y-6">
       {/* 8-Step Interactive Pipeline Stepper */}
@@ -512,7 +569,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
               流水线执行状态与断点重跑（manifest.json）
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              点击任意步骤右侧的「从此步重跑」，系统会自动跳过上游已完成产物
+              点击「从此步重跑」或「向后清理」都会先清空该步及全部下游旧产物与完成标记，保证状态与真实成片一致。
             </p>
           </div>
           <div className="text-xs font-mono-tabular text-slate-500">
@@ -568,17 +625,94 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                   </div>
                 </div>
 
-                <button
-                  type="button"
-                  onClick={() => onRerunFromStage(episode.episode_id, st.id)}
-                  className="w-full py-1 px-2 text-[11px] font-medium text-slate-700 bg-white border border-slate-200 rounded hover:border-blue-400 hover:text-blue-600 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                >
-                  从此步重跑
-                </button>
+                <div className="flex flex-col gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => onRerunFromStage(episode.episode_id, st.id)}
+                    className="w-full py-1 px-2 text-[11px] font-medium text-slate-700 bg-white border border-slate-200 rounded hover:border-blue-400 hover:text-blue-600 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    从此步重跑
+                  </button>
+                  {st.id !== 's0_catalog' && (
+                    <button
+                      type="button"
+                      disabled={isRunning}
+                      onClick={() => {
+                        setResetIncludeHuman(false);
+                        setResetTarget(st.id);
+                      }}
+                      className="w-full py-1 px-2 text-[11px] font-medium text-slate-500 bg-white border border-slate-200 rounded hover:border-red-300 hover:text-red-600 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                    >
+                      清理重置
+                    </button>
+                  )}
+                </div>
               </div>
             );
           })}
         </div>
+
+        {/* Patch v4.1 Patch 21：清理重置的内联确认（不用 window.confirm） */}
+        {resetTarget && (
+          <div className="mt-3 p-3.5 rounded-lg border border-red-200 bg-red-50/60 text-xs text-red-900">
+            <div className="flex items-start gap-2">
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-red-600" />
+              <div className="flex-1 space-y-2">
+                <p className="font-medium">
+                  确认清理并重置「{resetStageLabel(resetTarget)}」及之后全部阶段（
+                  {resetAffectedCodes.join(' → ')}）？
+                </p>
+                <ul className="list-disc pl-4 space-y-0.5 text-red-800/90">
+                  <li>将删除该阶段及其下游的磁盘产物（脚本 / 配音 / 时间轴 / 成片）与绿色完成标记。</li>
+                  {resetTarget === 's4_scriptwriter' && (
+                    <li>剧本、故事稿会被删除；人工编排的镜头组默认保留。</li>
+                  )}
+                  {(resetTarget === 's1_crawler' ||
+                    resetTarget === 's2_segmenter' ||
+                    resetTarget === 's3_vision') && (
+                    <li>会一并清除旧分镜与识图结果，下游镜头组编排也会被重新生成。</li>
+                  )}
+                  {resetTarget === 's7_renderer' && (
+                    <li>作品目录下的导出成片（EP{episode.episode_no}_*）也会被删除。</li>
+                  )}
+                </ul>
+                {resetTarget === 's4_scriptwriter' && (
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={resetIncludeHuman}
+                      onChange={(event) => setResetIncludeHuman(event.target.checked)}
+                      className="accent-red-600"
+                    />
+                    同时清空人工编排的镜头组（storyboard.json）（默认保留）
+                  </label>
+                )}
+                <div className="flex items-center gap-2 pt-0.5">
+                  <button
+                    type="button"
+                    disabled={resetBusy}
+                    onClick={() => void handleConfirmReset()}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-red-600 rounded hover:bg-red-700 transition-colors cursor-pointer disabled:opacity-50"
+                  >
+                    {resetBusy && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                    确认清理
+                  </button>
+                  <button
+                    type="button"
+                    disabled={resetBusy}
+                    onClick={() => {
+                      setResetTarget(null);
+                      setResetIncludeHuman(false);
+                    }}
+                    className="px-3 py-1.5 text-xs font-medium text-slate-600 bg-white border border-slate-200 rounded hover:bg-slate-50 transition-colors cursor-pointer disabled:opacity-50"
+                  >
+                    取消
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
       </section>
 
       {/* Main Studio Workspace Tabs */}

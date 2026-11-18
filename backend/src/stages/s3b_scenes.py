@@ -256,7 +256,6 @@ def auto_build_storyboard(
     current: list[str] = []
     current_location = ""
     pending_boundary = False
-    usable_count = 0
 
     for panel in all_panels:
         if _is_boundary_panel(panel):
@@ -285,7 +284,6 @@ def auto_build_storyboard(
         pending_boundary = False
 
         current.append(panel.panel_id)
-        usable_count += 1
         if location and not current_location:
             current_location = location
 
@@ -301,13 +299,28 @@ def auto_build_storyboard(
 
     if current:
         if len(current) < MIN_SCENE_PANELS:
-            # 末尾残余：含对白或处于全话最后 5 格内 → 独立成收尾幕。
+            # 末尾残余：含对白 / 至少 2 格 / 前一组已满 8 格 → 独立成收尾幕。
+            #
+            # Patch v4.0 Patch 20.1：原判据 ``usable_count - len(current) < 5``
+            # 是笔误——usable_count 累加的是**全话**可用格数，减掉残余长度
+            # 得到的是「前面所有幕的总格数」，与「是否在全话末尾」无关。
+            # 循环结束处的 current 本身就是整话最后一组剩余格（距末尾 0 格），
+            # 因此改用三个与位置无关的判据：含对白、格数 ≥ 2（前一组之外的
+            # 纯动作反转 / 定格）、或前一组已满 8 格。
             has_dialogue = any(
                 panels.get(panel_id) and panels[panel_id].dialogues
                 for panel_id in current
             )
-            near_tail = usable_count - len(current) < 5
-            if not (has_dialogue or near_tail) and scene_panel_ids:
+            keep_tail = (
+                has_dialogue
+                or len(current) >= 2
+                or (bool(scene_panel_ids) and len(scene_panel_ids[-1]) >= 8)
+            )
+            if (
+                not keep_tail
+                and scene_panel_ids
+                and len(scene_panel_ids[-1]) + len(current) <= MAX_SCENE_PANELS
+            ):
                 scene_panel_ids[-1].extend(current)
                 current = []
         if current:

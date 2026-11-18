@@ -246,6 +246,47 @@ class JobRunner:
         return state
 
     # ------------------------------------------------------------------
+    # 按步向后级联清理（Patch v4.1 Patch 21）
+    # ------------------------------------------------------------------
+    def reset_episode_from_stage(
+        self,
+        series_id: str,
+        episode_no: int,
+        from_stage: str,
+        *,
+        include_human_storyboard: bool = False,
+    ) -> dict[str, Any]:
+        """清空该话 ``from_stage`` 及下游的产物与完成标记，状态回到「待执行」。
+
+        **为什么需要**：重跑到一半或改完某一步后，下游旧产物和旧绿色完成状态
+        混在一起，分不清哪些重做了、哪些还是昨天的旧片。手动清理与
+        「从此步重跑」共用同一条清理路径，行为完全一致。
+        """
+        state = self.state_of(series_id, episode_no)
+        if state.status in {"queued", "running"}:
+            raise JobError("该话正在后台执行任务，请等待完成后再清理")
+        manager = ManifestManager(self.series_dir(series_id), series_id=series_id)
+        summary = manager.reset_from_stage(
+            episode_no,
+            from_stage,
+            include_human_storyboard=include_human_storyboard,
+        )
+        affected = set(summary.get("cleared_stages") or ())
+        for stage in list(state.stages):
+            if stage in affected:
+                state.stages.pop(stage, None)
+        if state.current_stage in affected:
+            state.current_stage = ""
+        state.status = "idle"
+        state.error = ""
+        self._log(
+            state,
+            f"[清理重置] 已清空 {from_stage} 及下游 {len(affected)} 个阶段产物，状态恢复待执行",
+        )
+        self._publish_state(state)
+        return summary
+
+    # ------------------------------------------------------------------
     # 提交任务
     # ------------------------------------------------------------------
     async def submit_episode(
@@ -367,6 +408,17 @@ class JobRunner:
         llm_client: Any = None
         tts_client: Any = None
         try:
+            # Patch v4.1 Patch 21：真正开跑前先清空 from_stage 及下游的旧产物，
+            # 免得「昨天的旧成片 + 旧绿色完成标记」和本次重跑混在一起。
+            try:
+                ManifestManager(series_dir, series_id=series_id).reset_from_stage(
+                    episode.episode_no,
+                    from_stage,
+                    include_human_storyboard=False,
+                )
+                self._log(state, f"[清理重置] 已清空 {from_stage} 及下游的旧产物")
+            except Exception as exc:  # noqa: BLE001 - 清理失败不应阻断重跑
+                self._log(state, f"[清理重置] 跳过（{exc}）")
             llm_client = (self.client_factory or (lambda: _default_llm(self.config)))()
             if end_index >= STAGE_IDS.index("s5_tts"):
                 tts_client = self._make_tts_client()

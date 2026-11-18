@@ -327,6 +327,12 @@ async def produce_scripts(
                 with _manifest_stage(
                     manifests, episode.episode_no, "s4_scriptwriter", episode_id=episode.episode_id
                 ):
+                    # Patch v4.0 Patch 20.1：``w2v understand`` / ``w2v run`` 同样接入
+                    # Scene-Grounded 流程；storyboard.json 不存在时自动聚类落盘，
+                    # 已有的 source="human" 编排由 run_stage4 原样保留、绝不覆写。
+                    episode_dir = (
+                        Path(series_dir) / "episodes" / f"ep_{episode.episode_no:03d}"
+                    )
                     _script_obj, path = await s4_scriptwriter.run_stage4(
                         series_dir,
                         episode.episode_no,
@@ -340,6 +346,12 @@ async def produce_scripts(
                         story_model=story_model,
                         story_source_markdown=story_source_markdown,
                         require_story_source=mode == "narrate_from_story",
+                        storyboard_path=s3b_scenes.storyboard_path_for(episode_dir),
+                        panels_dir=s2_segmenter.panels_dir_for(
+                            series_dir, episode.episode_no
+                        ),
+                        vision_client=client,
+                        vision_model=vision_model,
                     )
                 return path
 
@@ -1041,6 +1053,46 @@ async def run_narrate_from_storyboard(
     }
 
 
+def run_clean_series(
+    series_id: str,
+    *,
+    config: AppConfig,
+    episodes_spec: str = "",
+    from_stage: str = "s4_scriptwriter",
+    include_human_storyboard: bool = False,
+) -> dict[str, Any]:
+    """``w2v clean``：清空指定阶段及其下游的产物，把状态重置为「待执行」。
+
+    与 Web 端「清理重置」按钮同一条路径（``ManifestManager.reset_from_stage``）：
+    磁盘旧产物、作品级成片导出、manifest 里的绿色完成标记一并清掉，
+    人工编排的镜头组（``source="human"``）默认保留。
+    """
+    registry = s0_catalog.CatalogRegistry(config.workspace_root())
+    catalog = registry.load_catalog(series_id)
+    if catalog is None:
+        raise ConfigError(f"作品未登记：{series_id}（先执行 w2v download）")
+    episodes = select_episodes(catalog, episodes_spec)
+    episodes.sort(key=lambda episode: episode.episode_no)
+    manager = ManifestManager(registry.series_dir(series_id), series_id=series_id)
+    summaries: list[dict[str, Any]] = []
+    for episode in episodes:
+        summaries.append(
+            manager.reset_from_stage(
+                episode.episode_no,
+                from_stage,
+                include_human_storyboard=include_human_storyboard,
+            )
+        )
+    return {
+        "command": "clean",
+        "series_id": series_id,
+        "series_title": catalog.series_title,
+        "from_stage": from_stage,
+        "include_human_storyboard": include_human_storyboard,
+        "episodes": summaries,
+    }
+
+
 async def _storyboard_many(
     series_ids: list[str],
     *,
@@ -1257,6 +1309,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     narrate_board.add_argument("--workspace", default=None, help="工作区根目录（默认取配置文件）")
     narrate_board.add_argument("--concurrency", type=int, default=4, help="单部漫画内的并发数")
+
+    clean = sub.add_parser(
+        "clean",
+        help="按步向后级联清理：清空指定阶段及其下游的旧产物与完成标记",
+    )
+    clean.add_argument(
+        "--series", action="append", required=True, help="已登记的 series_id（可重复传入）"
+    )
+    clean.add_argument("--episodes", default="", help="话次选择，如 1-3,5")
+    clean.add_argument("--episode", type=int, default=None, help="只清理指定话次（优先于 --episodes）")
+    clean.add_argument("--workspace", default=None, help="工作区根目录（默认取配置文件）")
+    clean.add_argument(
+        "--from-stage",
+        default="s4_scriptwriter",
+        help="起始阶段（s1_crawler ~ s7_renderer），该步及下游全部清理",
+    )
+    clean.add_argument(
+        "--include-human-storyboard",
+        action="store_true",
+        help="同时清空人工编排的镜头组 storyboard.json（默认保留）",
+    )
     return parser
 
 
@@ -1353,6 +1426,17 @@ def main(argv: list[str] | None = None) -> int:
                     concurrency=args.concurrency,
                 )
             )
+        elif args.command == "clean":
+            results = [
+                run_clean_series(
+                    series_id,
+                    config=config,
+                    episodes_spec=_episode_spec(args),
+                    from_stage=args.from_stage,
+                    include_human_storyboard=args.include_human_storyboard,
+                )
+                for series_id in args.series
+            ]
         else:
             results = asyncio.run(
                 _export_many(

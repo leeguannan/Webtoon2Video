@@ -16,6 +16,7 @@ import type {
   CharacterProfile,
   EpisodeDigest,
   EpisodeItem,
+  EpisodeResetResponse,
   PlotThread,
   PronunciationRule,
   RunMode,
@@ -664,6 +665,38 @@ export default function App() {
     void rerunEpisode(episodeId, stageId, mode);
   };
 
+  /** 按步向后级联清理：清空该步及下游的旧产物与完成标记，状态回到「待执行」。 */
+  const handleResetFromStage = async (
+    episodeId: string,
+    stageId: StageId,
+    includeHumanStoryboard = false
+  ) => {
+    try {
+      const result = await apiFetch<EpisodeResetResponse>(
+        `/episodes/${encodeURIComponent(episodeId)}/reset`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            from_stage: stageId,
+            include_human_storyboard: includeHumanStoryboard,
+          }),
+        }
+      );
+      patchEpisode(episodeId, (ep) => ({
+        ...ep,
+        stages: result.stages ?? ep.stages,
+        panels: [],
+        beats: [],
+        video_duration_ms: 0,
+        logs: result.logs ?? ep.logs,
+      }));
+      showToast(`已清理 ${stageId} 起的旧产物并重置为待执行`);
+      void refreshSeries(seriesIdOf(episodeId));
+    } catch (err) {
+      reportError('清理重置失败', err);
+    }
+  };
+
   const handleTogglePanelBlank = async (episodeId: string, panelId: string) => {
     const episode = seriesRef.current
       .flatMap((s) => s.episodes)
@@ -1221,6 +1254,7 @@ export default function App() {
               config={config ?? FALLBACK_CONFIG}
               rules={activeSeriesRules}
               onRerunFromStage={handleRerunFromStage}
+              onResetFromStage={handleResetFromStage}
               onTogglePanelBlank={handleTogglePanelBlank}
               onUpdateBeats={handleUpdateBeats}
               onAutoSaveBeats={handleAutoSaveBeats}
