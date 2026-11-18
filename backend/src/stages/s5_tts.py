@@ -29,7 +29,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from core.config import SeriesTTSConfig, VoiceSpec
+from core.config import SeriesTTSConfig, VoiceSpec, resolve_voice_for_tts_model
+from core.normalize import resolve_dialogue_speaker_inheritance
 from core.schemas import (
     AudioClipMeta,
     CharacterProfile,
@@ -47,17 +48,23 @@ __all__ = [
     "AUDIO_DIR_NAME",
     "AUDIO_MANIFEST_FILENAME",
     "AUDIO_ISSUES_FILENAME",
+    "BeatVoiceAssignment",
     "MAX_SPEED",
     "MIN_SPEED",
+    "LOUDNESS_RESAMPLE_FILTER",
+    "LOUDNESS_TRIM_FILTER",
+    "LOUDNORM_FILTER",
     "SILENCE_TRIM_FILTER",
     "TTSStageError",
     "apply_pronunciation",
     "audio_dir_for",
     "build_spoken_text",
+    "clean_stale_audio",
     "load_audio_manifest",
     "load_bible_characters",
     "normalize_speed",
     "resolve_beat_voice",
+    "resolve_beat_voice_assignment",
     "resolve_beat_voice_spec",
     "run_stage5",
     "synthesize_episode",
@@ -90,6 +97,31 @@ SILENCE_TRIM_FILTER = (
     "silenceremove=start_periods=1:start_threshold=-50dB:start_silence=0:detection=peak,"
     "areverse,"
     "silenceremove=start_periods=1:start_threshold=-50dB:start_silence=0.05:detection=peak,"
+    "areverse"
+)
+
+#: 单句响度归一滤镜（Patch v3.4 Patch 17）。
+#:
+#: 目标响度 ``-16 LUFS``（播客 / 有声书常用值）、峰值上限 ``-1.5 dBTP``、
+#: 响度范围 ``LRA=7``。放在同一条滤镜链末尾，**逐句**归一——
+#: 逐句归一比整话归一更稳：整话归一会被最响的一句拉低，正常句反而变轻。
+LOUDNORM_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=7"
+
+#: ``loudnorm`` 会把输出采样率强制拉高到 192kHz（体积膨胀约 6 倍），
+#: 因此归一后立刻重采样回 24kHz（与既有百炼链路保持一致：不改变下游对
+#: 时长 / 采样率的既有假设，也避免 192kHz 的体积膨胀）。
+LOUDNESS_RESAMPLE_FILTER = "aresample=24000"
+
+#: 归一之后的二次首尾裁剪（Patch v3.4 Patch 17）。
+#:
+#: ``loudnorm`` 的升采样滤波会在音频开头/结尾留下约 ``-43dB`` 的极低电平振铃，
+#: 破坏「裁完的第一个采样就是人声」这个不变式（实测首采样从 9830 掉到 218）。
+#: 归一后再裁一次即可清掉振铃：阈值取 ``-35dB``（约 1.8% 幅度，远低于人声
+#: 起音电平），正常人声的首尾样本都在 ``-30dB`` 以上，不会被误裁。
+LOUDNESS_TRIM_FILTER = (
+    "silenceremove=start_periods=1:start_threshold=-35dB:start_silence=0:detection=peak,"
+    "areverse,"
+    "silenceremove=start_periods=1:start_threshold=-35dB:start_silence=0.05:detection=peak,"
     "areverse"
 )
 
@@ -324,12 +356,16 @@ async def _trim_silence(
     timeout: float = FFMPEG_TIMEOUT_S,
     speed: float = 1.0,
 ) -> tuple[Path | None, str | None]:
-    """裁掉首尾静音（并按需变速），返回 ``(处理后文件, 问题描述)``。
+    """裁掉首尾静音（并按需变速 + 响度归一），返回 ``(处理后文件, 问题描述)``。
 
     失败时返回 ``(None, 原因)``，调用方保留原音频——单条裁剪失败不允许拖垮整话。
 
     Patch v3.2 Patch 13 B3：变速用 ffmpeg ``atempo`` 滤镜（不变调、不发尖），
     并**合并进同一条滤镜链**（裁剪 + 变速只跑一次 ffmpeg，零额外子进程开销）。
+
+    Patch v3.4 Patch 17：链尾再串 ``loudnorm=I=-16:TP=-1.5:LRA=7`` 做**单句**
+    响度归一（-16 LUFS），归一后用 ``aresample=24000`` 把 ``loudnorm`` 撑到
+    192kHz 的输出拉回 24kHz，再补一次 ``-35dB`` 首尾裁剪清掉归一带来的振铃。
     """
     ffmpeg = _resolve_binary(ffmpeg_bin)
     if not ffmpeg:
@@ -339,6 +375,12 @@ async def _trim_silence(
     audio_filter = SILENCE_TRIM_FILTER
     if abs(normalized_speed - 1.0) > 1e-6:
         audio_filter = f"{audio_filter},atempo={normalized_speed:.4f}".rstrip("0").rstrip(".")
+    # Patch v3.4 Patch 17：同一条滤镜链末尾串上单句 -16 LUFS 归一 + 重采样，
+    # 仍然是「裁剪 + 变速 + 归一」一次 ffmpeg 跑完，零额外子进程开销。
+    # 归一后再做一次首尾裁剪：清掉 loudnorm 升采样留下的 -47dB 振铃。
+    audio_filter = (
+        f"{audio_filter},{LOUDNORM_FILTER},{LOUDNESS_RESAMPLE_FILTER},{LOUDNESS_TRIM_FILTER}"
+    )
 
     tmp_path = src.with_name(f".trim_{src.stem}.wav")
     cmd = [
@@ -428,24 +470,191 @@ def _character_gender_index(
     return index
 
 
+def _role_gender(role: str, gender_index: Mapping[str, str]) -> str:
+    """角色名/性别槽位 → 性别；说不清时返回空串。
+
+    Patch v3.4 审核台：用户在审核台把一句改成「通用女声」或某个角色名之后，
+    ``beat.speaker_gender`` 往往还留着 Stage 4 写下的旧值（男角色改成女角色后
+    仍然是 ``male``）。所以角色（角色名 / 性别槽位）优先于 ``speaker_gender``，
+    后者只当角色说不清时的兜底。
+    """
+    lowered = str(role or "").strip().lower()
+    if not lowered:
+        return ""
+    found = gender_index.get(lowered)
+    if found:
+        return found
+    return _SLOT_GENDER.get(lowered, "")
+
+
+def _explicit_gender(beat: ScriptBeat) -> str:
+    """``beat.speaker_gender`` 里的合法性别值（非法值当空）。"""
+    value = str(getattr(beat, "speaker_gender", "") or "").lower()
+    return value if value in {"male", "female"} else ""
+
+
 def _resolve_gender(
     beat: ScriptBeat,
     *,
     gender_index: Mapping[str, str],
 ) -> str:
-    """按 ``beat.speaker_gender`` → 角色表 → 旧槽位推断说话人性别。"""
-    explicit = str(getattr(beat, "speaker_gender", "") or "").lower()
-    if explicit in {"male", "female"}:
-        return explicit
+    """按「角色 → ``beat.speaker_gender``」推断说话人性别。"""
     role = str(getattr(beat, "speaker_role", "") or "").strip()
-    if role:
-        found = gender_index.get(role.lower())
-        if found:
-            return found
-        slot = _SLOT_GENDER.get(role.lower())
-        if slot:
-            return slot
-    return "unknown"
+    role_gender = _role_gender(role, gender_index)
+    if role_gender:
+        return role_gender
+    return _explicit_gender(beat) or "unknown"
+
+
+@dataclass(frozen=True)
+class BeatVoiceAssignment:
+    """一个 beat 的配音落点：音色 + 来源说明（Patch v3.4 审核台用）。
+
+    Stage 5 解析音色时顺手留下「这句话是谁在念」的出处，审核台直接渲染这份结果，
+    避免前端另写一套判定，导致「界面上看到的」和「实际听到的」不一致。
+    """
+
+    #: 最终使用的音色 + 语速。
+    spec: VoiceSpec
+    #: 来源代号：``narrator`` / ``character`` / ``default_male`` / ``default_female`` /
+    #: ``legacy_male`` / ``legacy_female`` / ``legacy_cast``。
+    source: str
+    #: 人类可读的来源说明，例如「讲解者（旁白）」「角色专属 · 恩彗」「通用女声」。
+    label: str
+    #: 命中的角色名（没命中则空串）。
+    role: str
+    #: 解析出的说话人性别：``male`` / ``female`` / ``unknown``。
+    gender: str
+
+
+def resolve_beat_voice_assignment(
+    beat: ScriptBeat,
+    *,
+    series_tts: SeriesTTSConfig | None = None,
+    characters: Sequence[CharacterProfile] | None = None,
+    default_voice: str | None = None,
+    voice_cast: Mapping[str, str] | None = None,
+) -> BeatVoiceAssignment:
+    """四级解析「音色 + 语速 + 来源」（Patch v3.2 Patch 13 B2 的来源可解释版）。
+
+    解析顺序：
+
+    1. ``beat.speaker_role`` 是旁白（``narrator`` / ``旁白``）→ ``series_tts.narrator``；
+    2. ``series_tts.character_voices`` 命中该角色（精确 → 忽略大小写）
+       → 该角色的专属音色；
+    3. 按性别兜底：``male`` → ``series_tts.default_male``，``female`` →
+       ``series_tts.default_female``（性别取自 ``beat.speaker_gender``、
+       StoryBible 角色表或旧槽位）；作品级槽位没配音色时才回落到全局
+       ``voice_cast`` 的旧音色（Patch v3.1 旧行为）。
+    4. 仍判不出 → 回退 ``series_tts.narrator``。
+
+    ``series_tts`` 为 ``None``（没配作品级模板）时退化为 Patch v3.1 的旧行为：
+    只按 ``voice_cast`` 查音色、语速恒为 1.0（原速，不改变既有产物）。
+    """
+    role = str(getattr(beat, "speaker_role", "") or "").strip()
+    lowered = role.lower()
+
+    if series_tts is None:
+        voice = resolve_beat_voice(beat, default_voice=default_voice, voice_cast=voice_cast)
+        return BeatVoiceAssignment(
+            spec=VoiceSpec(voice=voice or DEFAULT_VOICE, speed=1.0),
+            source="legacy_cast",
+            label="旧槽位音色",
+            role=role,
+            gender="unknown",
+        )
+
+    gender_index = _character_gender_index(characters)
+    role_gender = _role_gender(role, gender_index)
+    explicit_gender = _explicit_gender(beat)
+    # 角色名（作品级专属音色 / 角色表里的名字）说明「这句是谁说的」，
+    # 比 Stage 4 留下的 speaker_gender 更可信；角色名判不出性别时宁可回到
+    # 旁白，也不要用陈旧的性别把它错配成男声 / 女声。
+    role_is_character = bool(role) and (
+        role in series_tts.character_voices
+        or lowered in {str(name).strip().lower() for name in series_tts.character_voices}
+        or lowered in gender_index
+    )
+    if role_is_character:
+        gender = role_gender or "unknown"
+    else:
+        gender = role_gender or explicit_gender or "unknown"
+
+    if lowered in _NARRATOR_ROLES or role in _NARRATOR_ROLES:
+        return BeatVoiceAssignment(
+            spec=series_tts.narrator,
+            source="narrator",
+            label="讲解者（旁白）",
+            role=role,
+            gender=gender,
+        )
+
+    # 2) 已识别角色的专属音色：精确 → 忽略大小写。
+    if role and role in series_tts.character_voices:
+        return BeatVoiceAssignment(
+            spec=series_tts.character_voices[role],
+            source="character",
+            label=f"角色专属 · {role}",
+            role=role,
+            gender=gender,
+        )
+    if lowered:
+        for name, spec in series_tts.character_voices.items():
+            if str(name).strip().lower() == lowered:
+                return BeatVoiceAssignment(
+                    spec=spec,
+                    source="character",
+                    label=f"角色专属 · {name}",
+                    role=str(name),
+                    gender=gender,
+                )
+
+    # 3) 按性别兜底。
+    #
+    # 作品级配置优先：作品已经配了「通用男声 / 通用女声」时，就用作品里的音色，
+    # 这样在审核台改作品配音设置（或在这里改角色）能真正生效；作品级没配音色
+    # 才回落到全局旧槽位表 ``voice_cast``（保持 Patch v3.1 的旧行为）。
+    if gender in {"male", "female"}:
+        spec = series_tts.default_male if gender == "male" else series_tts.default_female
+        slot_label = "通用男声" if gender == "male" else "通用女声"
+        if spec.voice:
+            return BeatVoiceAssignment(
+                spec=spec,
+                source="default_male" if gender == "male" else "default_female",
+                label=slot_label,
+                role=role,
+                gender=gender,
+            )
+        legacy_voice = None
+        cast = {str(k): str(v) for k, v in (voice_cast or {}).items()}
+        if role and role in cast:
+            legacy_voice = cast[role]
+        elif lowered and lowered in cast:
+            legacy_voice = cast[lowered]
+        if legacy_voice:
+            return BeatVoiceAssignment(
+                spec=VoiceSpec(voice=legacy_voice, speed=spec.speed),
+                source="legacy_male" if gender == "male" else "legacy_female",
+                label=f"{slot_label}（旧槽位音色）",
+                role=role,
+                gender=gender,
+            )
+        return BeatVoiceAssignment(
+            spec=spec,
+            source="default_male" if gender == "male" else "default_female",
+            label=slot_label,
+            role=role,
+            gender=gender,
+        )
+
+    # 4) 判不出性别 → 回退旁白。
+    return BeatVoiceAssignment(
+        spec=series_tts.narrator,
+        source="narrator",
+        label="讲解者（旁白）",
+        role=role,
+        gender=gender,
+    )
 
 
 def resolve_beat_voice_spec(
@@ -458,54 +667,40 @@ def resolve_beat_voice_spec(
 ) -> VoiceSpec:
     """四级解析「音色 + 语速」（Patch v3.2 Patch 13 B2）。
 
-    解析顺序：
+    解析顺序见 :func:`resolve_beat_voice_assignment`；本函数只取其中的音色部分，
+    保证「审核台展示的来源」与「Stage 5 实际合成的音色」出自同一份逻辑。
+    """
+    return resolve_beat_voice_assignment(
+        beat,
+        series_tts=series_tts,
+        characters=characters,
+        default_voice=default_voice,
+        voice_cast=voice_cast,
+    ).spec
 
-    1. ``beat.speaker_role`` 是旁白（``narrator`` / ``旁白``）→ ``series_tts.narrator``；
-    2. ``series_tts.character_voices`` 命中该角色（精确 → 别名 → 忽略大小写）
-       → 该角色的专属音色；
-    3. 按性别兜底：``male`` → ``series_tts.default_male``，``female`` →
-       ``series_tts.default_female``（性别取自 ``beat.speaker_gender``、
-       StoryBible 角色表或旧槽位）；
-    4. 仍判不出 → 回退 ``series_tts.narrator``。
 
-    ``series_tts`` 为 ``None``（没配作品级模板）时退化为 Patch v3.1 的旧行为：
-    只按 ``voice_cast`` 查音色、语速恒为 1.0（原速，不改变既有产物）。
+def _voice_role_kind(
+    beat: ScriptBeat,
+    *,
+    characters: Sequence[CharacterProfile] | None = None,
+) -> str:
+    """判定 beat 的音色角色定位（``narrator`` / ``male`` / ``female``）。
+
+    Patch v3.4 Patch 16：跨模型音色兜底时需要知道「这个音色本来是给谁用的」，
+    才能换成同定位的 MiniMax 音色（旁白 / 男配 / 女配）。
     """
     role = str(getattr(beat, "speaker_role", "") or "").strip()
-    lowered = role.lower()
-
-    if series_tts is None:
-        voice = resolve_beat_voice(beat, default_voice=default_voice, voice_cast=voice_cast)
-        return VoiceSpec(voice=voice or DEFAULT_VOICE, speed=1.0)
-
-    if lowered in _NARRATOR_ROLES or role in _NARRATOR_ROLES:
-        return series_tts.narrator
-
-    # 2) 已识别角色的专属音色：精确 → 忽略大小写。
-    if role and role in series_tts.character_voices:
-        return series_tts.character_voices[role]
-    if lowered:
-        for name, spec in series_tts.character_voices.items():
-            if str(name).strip().lower() == lowered:
-                return spec
-
-    gender = _resolve_gender(beat, gender_index=_character_gender_index(characters))
-
-    # 3) 按性别兜底；若旧音色表里有该角色，优先沿用旧表里的音色 ID。
-    if gender in {"male", "female"}:
-        spec = series_tts.default_male if gender == "male" else series_tts.default_female
-        legacy_voice = None
-        cast = {str(k): str(v) for k, v in (voice_cast or {}).items()}
-        if role and role in cast:
-            legacy_voice = cast[role]
-        elif lowered and lowered in cast:
-            legacy_voice = cast[lowered]
-        if legacy_voice:
-            return VoiceSpec(voice=legacy_voice, speed=spec.speed)
-        return spec
-
-    # 4) 判不出性别 → 回退旁白。
-    return series_tts.narrator
+    if role.lower() in _NARRATOR_ROLES or role in _NARRATOR_ROLES:
+        return "narrator"
+    gender_index = _character_gender_index(characters)
+    role_gender = _role_gender(role, gender_index)
+    if role_gender:
+        return role_gender
+    if role and role.lower() in gender_index:
+        # 角色名但角色表没写性别：不采信可能过期的 speaker_gender，按旁白定位。
+        return "narrator"
+    explicit = _explicit_gender(beat)
+    return explicit if explicit in {"male", "female"} else "narrator"
 
 
 async def _synthesize_beat(
@@ -521,9 +716,24 @@ async def _synthesize_beat(
     characters: Sequence[CharacterProfile] | None = None,
     ffmpeg_bin: str,
     trim_silence: bool,
+    tts_model: str | None = None,
+    inheritance: Mapping[str, tuple[str, str]] | None = None,
 ) -> tuple[AudioClipMeta | None, list[_Issue]]:
     """合成单个 beat 的音频，返回 ``(清单项, 问题列表)``。"""
     issues: list[_Issue] = []
+    # Patch v3.4 Patch 17：连续对白说话人继承。没写「XX说：」的纯引号对白
+    # 继承上一句对白的说话人 / 性别，避免「男角色说一半突然变女声」。
+    inherited = (inheritance or {}).get(beat.beat_id)
+    if inherited:
+        logger.info(
+            "[s5_tts] %s：继承对白说话人 %s（%s）",
+            beat.beat_id,
+            inherited[0],
+            inherited[1],
+        )
+        beat = beat.model_copy(
+            update={"speaker_role": inherited[0], "speaker_gender": inherited[1]}
+        )
     spoken = build_spoken_text(beat, overrides)
     if not spoken.strip():
         issues.append(_Issue(beat.beat_id, "synthesize", "送音文本为空，已跳过"))
@@ -552,6 +762,16 @@ async def _synthesize_beat(
         beat_voice = spec.voice
         speed = normalize_speed(spec.speed)
     if beat_voice:
+        # Patch v3.4 Patch 16：跨模型音色兜底。把百炼/Edge 音色（如 Cherry）
+        # 发给 MiniMax 会直接返回 2013 invalid voice_id 并让整话失败，
+        # 这里统一换成同定位（旁白/男配/女配）的 MiniMax 音色。
+        model_name = tts_model or str(getattr(client, "model", "") or "")
+        if model_name:
+            beat_voice = resolve_voice_for_tts_model(
+                beat_voice,
+                tts_model=model_name,
+                role_kind=_voice_role_kind(beat, characters=characters),
+            )
         extra["voice"] = beat_voice
         logger.info(
             "[s5_tts] %s：speaker_role=%s → 音色 %s（语速 %.2fx）",
@@ -560,6 +780,16 @@ async def _synthesize_beat(
             beat_voice,
             speed,
         )
+
+    # Patch v3.4 Patch 16：provider 自带语速控制（MiniMax）时把语速交给它，
+    # ffmpeg 不再二次变速，避免「两段变速」导致语速失真。
+    native_speed = bool(getattr(client, "supports_native_speed", False))
+    if native_speed:
+        extra["speed"] = speed
+        trim_speed = 1.0
+    else:
+        trim_speed = speed
+
     try:
         result: TTSResult = await client.synthesize(
             spoken,
@@ -588,7 +818,7 @@ async def _synthesize_beat(
         # 静音裁剪与变速合并在同一条 ffmpeg 滤镜链里（Patch v3.2 Patch 13 B3）：
         # 一次子进程同时完成「去首尾静音」+「atempo 不变调变速」。
         trimmed, problem = await _trim_silence(
-            raw_path, ffmpeg_bin=ffmpeg_bin, speed=speed
+            raw_path, ffmpeg_bin=ffmpeg_bin, speed=trim_speed
         )
         if trimmed is not None:
             final_path = trimmed
@@ -629,6 +859,37 @@ def load_bible_characters(series_dir: str | Path) -> list[CharacterProfile]:
     return list(bible.characters)
 
 
+#: 上一轮遗留音频的文件名模式（Patch v3.4 Patch 17）。
+_STALE_AUDIO_PATTERNS: tuple[str, ...] = ("beat_*.wav", "beat_*.mp3")
+
+
+def clean_stale_audio(audio_dir: Path) -> list[str]:
+    """清理 ``05_audio`` 里上一轮遗留的 beat 音频（Patch v3.4 Patch 17）。
+
+    重跑撰稿后 beat 编号会变（相邻去重少几条、拆拍多几条都会让编号错位），
+    上一轮的 ``beat_*.wav`` 会原地留下：下游按文件名引用时会拿到**旧音频**，
+    音频清单与目录内容也会对不上。
+
+    只删 ``beat_`` 前缀的音频文件，不碰其它素材。
+    """
+    removed: list[str] = []
+    for pattern in _STALE_AUDIO_PATTERNS:
+        for path in sorted(audio_dir.glob(pattern)):
+            if not path.is_file():
+                continue
+            try:
+                path.unlink()
+            except OSError as exc:
+                logger.warning("[s5_tts] 删除旧音频失败（%s）：%s", path.name, exc)
+                continue
+            removed.append(path.name)
+    if removed:
+        logger.info(
+            "[s5_tts] 清理旧音频 %d 个：%s", len(removed), ", ".join(removed[:10])
+        )
+    return removed
+
+
 async def synthesize_episode(
     client: Any,
     *,
@@ -643,6 +904,7 @@ async def synthesize_episode(
     concurrency: int = 4,
     ffmpeg_bin: str = "ffmpeg",
     trim_silence: bool = True,
+    tts_model: str | None = None,
 ) -> list[AudioClipMeta]:
     """并发合成整话音频，返回音频清单（顺序与剧本 beats 一致）。
 
@@ -652,6 +914,8 @@ async def synthesize_episode(
       ``voice_cast``，再回退 ``default_voice``（Patch v3.1 Patch 11 A3）。
     * ``series_tts`` 存在时改走四级音色 + 语速解析（Patch v3.2 Patch 13 B2），
       ``characters`` 用于按角色表判定性别。
+    * ``tts_model`` 是当前 TTS 模型名（Patch v3.4 Patch 16）；用于跨模型音色兜底，
+      缺省时从 client 的 ``model`` 属性推断。
     """
     if not script.beats:
         raise TTSStageError("剧本里没有任何 beat，无法合成音频")
@@ -661,6 +925,16 @@ async def synthesize_episode(
         target_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise TTSStageError(f"音频目录不可写：{target_dir}：{exc}") from exc
+
+    # Patch v3.4 Patch 17：先清掉上一轮遗留的 beat 音频，避免重跑后
+    # 目录里混着编号错位的旧文件（下游按文件名引用会拿到旧音频）。
+    clean_stale_audio(target_dir)
+
+    # Patch v3.4 Patch 17：连续对白说话人继承（没写「XX说：」的纯引号对白
+    # 继承上一句的说话人与性别），在这里先算好，供各 beat 合成时套用。
+    inheritance = resolve_dialogue_speaker_inheritance(
+        [beat.model_dump() for beat in script.beats]
+    )
 
     semaphore = asyncio.Semaphore(max(1, int(concurrency)))
 
@@ -678,6 +952,8 @@ async def synthesize_episode(
                 characters=characters,
                 ffmpeg_bin=ffmpeg_bin,
                 trim_silence=trim_silence,
+                tts_model=tts_model,
+                inheritance=inheritance,
             )
 
     results = await asyncio.gather(
@@ -739,6 +1015,7 @@ async def run_stage5(
     concurrency: int = 4,
     ffmpeg_bin: str = "ffmpeg",
     trim_silence: bool = True,
+    tts_model: str | None = None,
 ) -> Path:
     """执行 Stage 5，返回 ``05_audio/audio_manifest.json`` 路径。
 
@@ -748,6 +1025,7 @@ async def run_stage5(
     ``voice`` 是显式音色；``voice_cast`` 是角色音色表；``default_voice`` 是兜底音色
     （Patch v3.1 Patch 11 A3）。``series_tts`` / ``characters`` 启用作品级
     四级音色 + 语速路由（Patch v3.2 Patch 13 B2）。
+    ``tts_model`` 是当前 TTS 模型名（Patch v3.4 Patch 16），用于跨模型音色兜底。
     """
     series_root = Path(series_dir)
     script_path = series_root / "episodes" / f"ep_{episode_no:03d}" / "04_script" / "script.json"
@@ -773,6 +1051,7 @@ async def run_stage5(
         concurrency=concurrency,
         ffmpeg_bin=ffmpeg_bin,
         trim_silence=trim_silence,
+        tts_model=tts_model,
     )
 
     audio_dir.mkdir(parents=True, exist_ok=True)

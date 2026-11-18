@@ -24,3 +24,6 @@ build/
 
 # ===== 运行时工作区（漫画素材、音频、成片，体积大且属本地数据）=====
 workspace/
+
+# ===== 本机实例配置（含本机绝对路径，模板见 backend/config.example.yaml）=====
+backend/config.yaml

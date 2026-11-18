@@ -14,15 +14,27 @@ api:
   timeout_s: 180.0
   max_retries: 3
   retry_backoff_s: 1.0
+  # Patch v3.4 Patch 16：MiniMax Speech 2.8 独立于百炼的一套凭据
+  # （Key 放在项目根 .env 的 MINIMAX_API_KEY 里，不落在本文件）
+  minimax_base_url: https://api.minimaxi.com/v1
+  minimax_api_key_env: MINIMAX_API_KEY
+  # 新版 Platform API Key 不需要 GroupId，留空即可
+  minimax_group_id_env: MINIMAX_GROUP_ID
+  minimax_group_id: ""
 
 models:
   # Stage 3 识图（密集文字可用 qwen-vl-max）
   vision: qwen3-vl-plus
   # Stage 4B 拆拍配图（快、便宜、JSON 稳定）
-  script: qwen-plus
+  script: qwen3.7-plus
   # Stage 4A 故事编剧（说书体正文，最吃文笔与逻辑；留空则回退到 script）
-  story_model: qwen3.8-max
-  # Stage 5 配音
+  story_model: qwen4-max
+  # Stage 5 配音。可选值：
+  #   百炼：  qwen3-tts-flash / qwen-audio-3.1-tts-plus
+  #   MiniMax：speech-2.8-hd（高质量）/ speech-2.8-turbo（快速）
+  #   Edge：   edge-tts
+  # 切到 MiniMax 后，下面的百炼音色（Elias/Cherry…）会被自动替换成
+  # 同角色定位的 MiniMax 音色，不会再报 2013 invalid voice_id。
   tts: qwen3-tts-flash
 
 video:
@@ -49,7 +61,7 @@ render:
   sfx_gain_db: -3.5
 
 tts:
-  # 主旁白音色（百炼系统音色 ID）
+  # 主旁白音色（百炼系统音色 ID；切到 MiniMax 后会被自动换成 MiniMax 旁白音色）
   default_voice: Elias
   # 角色 → 音色映射；键是解说句里的 speaker_role
   # 作品级 series_config.yaml 的 voice_cast 可覆盖同名角色

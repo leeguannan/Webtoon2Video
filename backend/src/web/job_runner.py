@@ -48,7 +48,7 @@ STAGE_DEFS: tuple[dict[str, Any], ...] = (
     {"id": "s2_segmenter", "code": "S2", "label": "智能切图", "phase": 1},
     {"id": "s3_vision", "code": "S3", "label": "百炼识图", "phase": 1},
     {"id": "s4_scriptwriter", "code": "S4", "label": "解说撰稿", "phase": 1},
-    {"id": "s5_tts", "code": "S5", "label": "Qwen配音", "phase": 2},
+    {"id": "s5_tts", "code": "S5", "label": "配音", "phase": 2},
     {"id": "s6_timeline", "code": "S6", "label": "时间轴字幕", "phase": 2},
     {"id": "s7_renderer", "code": "S7", "label": "FFmpeg合成", "phase": 2},
 )
@@ -625,6 +625,7 @@ class JobRunner:
             characters=characters,
             concurrency=self.config.concurrency.stage,
             ffmpeg_bin=self.config.render.ffmpeg_bin,
+            tts_model=self.config.models.tts,
         )
 
     # ------------------------------------------------------------------
@@ -633,15 +634,11 @@ class JobRunner:
     def _make_tts_client(self) -> Any:
         if self.tts_factory is not None:
             return self.tts_factory()
-        from providers.tts_qwen import DEFAULT_VOICE, QwenTTS
+        # Patch v3.4 Patch 16：按 ``config.models.tts`` 路由到 MiniMax / 百炼 / Edge，
+        # 并统一过跨模型音色兜底（避免把百炼音色发给 MiniMax 导致 2013）。
+        from core.config import create_tts_client
 
-        return QwenTTS(
-            base_url=self.config.api.base_url,
-            model=self.config.models.tts,
-            # Patch v3.1 Patch 11 A1/A2：默认音色来自 ``config.tts.default_voice``。
-            voice=self.config.tts.default_voice or DEFAULT_VOICE,
-            timeout_s=self.config.api.timeout_s,
-        )
+        return create_tts_client(self.config)
 
     def _log(self, state: EpisodeState, message: str) -> None:
         line = f"[{time.strftime('%H:%M:%S')}] {message}"

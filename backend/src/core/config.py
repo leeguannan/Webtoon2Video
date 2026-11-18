@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Mapping
 from pathlib import Path
@@ -23,8 +24,14 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_API_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_API_KEY_ENV = "DASHSCOPE_API_KEY"
+#: MiniMax Speech 2.8（Patch v3.4 Patch 16）：与百炼完全独立的第二套凭据。
+DEFAULT_MINIMAX_BASE_URL = "https://api.minimaxi.com/v1"
+DEFAULT_MINIMAX_API_KEY_ENV = "MINIMAX_API_KEY"
+DEFAULT_MINIMAX_GROUP_ID_ENV = "MINIMAX_GROUP_ID"
 CONFIG_FILENAME = "config.yaml"
 CONFIG_PATH_ENV = "W2V_CONFIG"
 SERIES_CONFIG_FILENAME = "series_config.yaml"
@@ -55,17 +62,33 @@ class ApiConfig(_StrictModel):
     timeout_s: float = 180.0
     max_retries: int = 3
     retry_backoff_s: float = 1.0
+    #: Patch v3.4 Patch 16：MiniMax Speech 2.8 接口根地址（与百炼互不影响）。
+    minimax_base_url: str = DEFAULT_MINIMAX_BASE_URL
+    #: MiniMax API Key 的环境变量名（值写在进程环境或项目根 ``.env``）。
+    minimax_api_key_env: str = DEFAULT_MINIMAX_API_KEY_ENV
+    #: MiniMax GroupId 的环境变量名（仅老版本企业/分组账号需要）。
+    minimax_group_id_env: str = DEFAULT_MINIMAX_GROUP_ID_ENV
+    #: 直接写死 GroupId 的兜底位置（留空表示不传 GroupId）。
+    minimax_group_id: str = ""
 
 
 class ModelConfig(_StrictModel):
     """各阶段使用的模型名。"""
 
     vision: str = "qwen3-vl-plus"
-    script: str = "qwen-plus"
+    #: Patch v3.3 Patch 15：Step 4B 拆拍配图升级新一代均衡主力 qwen3.7-plus。
+    script: str = "qwen3.7-plus"
     #: Patch v3.0-7：Step 4A（故事编剧）专用的「说书体」模型。
     #: 故事创作最吃文笔、逻辑与沉浸感，与 4B 的拆拍配图分开选型；
     #: 留空则回退到 ``script``（兼容单模型部署）。
-    story_model: str = "qwen3.8-max"
+    #: Patch v3.3 Patch 15：默认升级百炼新旗舰 qwen4-max；账号未开通时
+    #: s4_scriptwriter 按 qwen3.8-max → qwen3.7-plus → qwen-plus 自动降级。
+    story_model: str = "qwen4-max"
+    #: TTS 模型名（Patch v3.4 Patch 16 支持三套 provider）：
+    #:
+    #: - ``speech-2.8-hd`` / ``speech-2.8-turbo`` / ``speech-2.6-*`` → MiniMax；
+    #: - ``qwen3-tts-flash`` / ``qwen-audio-3.1-tts-plus`` → 百炼；
+    #: - ``edge-tts`` → Edge TTS。
     tts: str = "qwen3-tts-flash"
 
 
@@ -109,7 +132,7 @@ class RenderConfig(_StrictModel):
 class VoiceSpec(_StrictModel):
     """一个音色的「音色 ID + 语速」组合（Patch v3.2 Patch 13 B1）。"""
 
-    #: 百炼系统音色 ID（见 ``providers.tts_qwen.BAILIAN_VOICE_CATALOG``）。
+    #: 百炼系统音色 ID（见 ``providers.tts_qwen.QWEN3_TTS_VOICES``，也可手填目录外官方 ID）。
     voice: str = "Elias"
     #: 语速倍率（1.0 = 原速）；ffmpeg ``atempo`` 的安全区间是 0.6 ~ 1.8。
     speed: float = Field(default=1.18, ge=0.6, le=1.8)
@@ -236,8 +259,25 @@ def _load_yaml_mapping(path: Path) -> dict[str, Any]:
     return raw
 
 
+def _is_within(root: Path, target: Path) -> bool:
+    """``target`` 是否在 ``root`` 之内（含相等）。"""
+    try:
+        target.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
 def find_config_path(explicit: str | Path | None = None) -> Path | None:
-    """按优先级定位全局配置文件；找不到返回 ``None``（使用内置默认值）。"""
+    """按优先级定位全局配置文件；找不到返回 ``None``（使用内置默认值）。
+
+    优先级：显式路径 → ``W2V_CONFIG`` 环境变量 → 当前目录 → 包根目录。
+
+    Patch v3.4 Patch 16：包根兜底只在**当前目录与包根同属一个项目目录树**时
+    生效（cwd 在包根内，或 cwd 是包根的上级目录）。这样「从项目里任何位置
+    运行都能读到仓库配置」依旧成立，而从无关目录（测试临时目录等）运行不会
+    误读仓库里真实部署的 ``config.yaml``，默认值断言保持稳定。
+    """
     if explicit is not None:
         path = Path(explicit).expanduser()
         if not path.is_file():
@@ -251,7 +291,12 @@ def find_config_path(explicit: str | Path | None = None) -> Path | None:
             raise ConfigError(f"环境变量 {CONFIG_PATH_ENV} 指向的配置文件不存在：{path}")
         return path
 
-    for candidate in (Path.cwd() / CONFIG_FILENAME, _package_root() / CONFIG_FILENAME):
+    cwd = Path.cwd()
+    package_root = _package_root()
+    candidates = [cwd / CONFIG_FILENAME]
+    if _is_within(package_root, cwd) or _is_within(cwd, package_root):
+        candidates.append(package_root / CONFIG_FILENAME)
+    for candidate in candidates:
         if candidate.is_file():
             return candidate
     return None
@@ -444,3 +489,210 @@ def resolve_api_key_with_env_file(
     if value:
         return value
     raise ConfigError(f"未配置环境变量 {env_name}（{target} 中也没有），无法调用百炼接口")
+
+
+# ---------------------------------------------------------------------------
+# MiniMax Speech 2.8：凭据读取 + 统一 TTS 工厂 + 跨模型音色兜底
+# ---------------------------------------------------------------------------
+
+
+def resolve_minimax_api_key_with_env_file(
+    config: AppConfig | None = None,
+    env: Mapping[str, str] | None = None,
+    env_file: str | Path | None = None,
+    *,
+    env_name: str | None = None,
+) -> str:
+    """读取 MiniMax API Key：先进程环境变量，再项目根 ``.env`` 文件。
+
+    与百炼的 ``DASHSCOPE_API_KEY`` 完全独立（两套 provider 可以共存）；
+    缺失时抛 :class:`ConfigError`，避免静默失败。
+    """
+    name = env_name or (
+        config.api.minimax_api_key_env if config is not None else DEFAULT_MINIMAX_API_KEY_ENV
+    )
+    source: Mapping[str, str] = env if env is not None else os.environ
+    value = (source.get(name) or "").strip()
+    if value:
+        return value
+    target = Path(env_file).expanduser() if env_file is not None else project_root() / ENV_FILENAME
+    value = (read_env_file(target).get(name) or "").strip()
+    if value:
+        return value
+    raise ConfigError(f"未配置环境变量 {name}（{target} 中也没有），无法调用 MiniMax 接口")
+
+
+def resolve_minimax_group_id(
+    config: AppConfig | None = None,
+    env: Mapping[str, str] | None = None,
+    env_file: str | Path | None = None,
+    *,
+    env_name: str | None = None,
+) -> str:
+    """读取 MiniMax GroupId：进程环境变量 → ``.env`` → 配置内明文。
+
+    新版 Platform API Key 不需要 GroupId，因此**缺失时返回空串**（不抛错），
+    调用方据此决定要不要往 URL 上拼 ``?GroupId=``。
+    """
+    name = env_name or (
+        config.api.minimax_group_id_env if config is not None else DEFAULT_MINIMAX_GROUP_ID_ENV
+    )
+    source: Mapping[str, str] = env if env is not None else os.environ
+    value = (source.get(name) or "").strip()
+    if value:
+        return value
+    target = Path(env_file).expanduser() if env_file is not None else project_root() / ENV_FILENAME
+    value = (read_env_file(target).get(name) or "").strip()
+    if value:
+        return value
+    if config is not None:
+        return (config.api.minimax_group_id or "").strip()
+    return ""
+
+
+#: 各 provider 的推荐音色（兜底用；与 provider 内置默认值保持一致）。
+_QWEN_DEFAULT_VOICE = "Elias"
+_EDGE_DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural"
+#: MiniMax 默认旁白音色（真实存在于 MiniMax system_voice 清单）。
+_MINIMAX_NARRATOR_VOICE = "Chinese (Mandarin)_Radio_Host"
+_MINIMAX_MALE_VOICE = "male-qn-jingying"
+_MINIMAX_FEMALE_VOICE = "female-yujie"
+
+#: Edge TTS 音色的前缀（``zh-CN-XiaoxiaoNeural`` 之类）。
+_EDGE_VOICE_PREFIXES = ("zh-CN-", "zh-TW-", "zh-HK-", "zh-MO-")
+
+
+def is_minimax_tts_model(tts_model: str) -> bool:
+    """判断 TTS 模型名是否走 MiniMax（``speech-2.8-hd`` / ``speech-2.6-turbo`` …）。"""
+    return (tts_model or "").strip().startswith("speech-")
+
+
+def recommended_voice_for_tts_model(
+    tts_model: str,
+    role_kind: Literal["narrator", "male", "female"] = "narrator",
+) -> str:
+    """当前 TTS 模型下推荐使用的音色 ID。"""
+    model = (tts_model or "").strip()
+    if is_minimax_tts_model(model):
+        if role_kind == "male":
+            return _MINIMAX_MALE_VOICE
+        if role_kind == "female":
+            return _MINIMAX_FEMALE_VOICE
+        return _MINIMAX_NARRATOR_VOICE
+    if model == "edge-tts":
+        return _EDGE_DEFAULT_VOICE
+    return _QWEN_DEFAULT_VOICE
+
+
+def resolve_voice_for_tts_model(
+    voice: str | None,
+    *,
+    tts_model: str,
+    role_kind: Literal["narrator", "male", "female"] = "narrator",
+) -> str:
+    """跨供应商音色防踩坑兜底（Patch v3.4 Patch 16）。
+
+    背景：用户把 ``models.tts`` 从 ``qwen3-tts-flash`` 改成 ``speech-2.8-hd`` 之后，
+    作品目录 ``series_config.yaml`` 或全局配置里往往还留着百炼/Edge 的音色
+    （``Cherry``、``Elias``、``Ethan``、``Serena``、``Eldric Sage``、``zh-CN-*``）。
+    这些 ID 发给 MiniMax 会返回 ``2013 invalid voice_id`` 并让**整话**失败，
+    因此这里统一做平滑替换：
+
+    * 当前模型是 MiniMax 而音色属于 Qwen/Edge → WARNING + 换成对应的 MiniMax 音色
+      （旁白 → ``Chinese (Mandarin)_Radio_Host``，男配 → ``male-qn-jingying``，
+      女配 → ``female-yujie``）；
+    * 反向（当前模型是百炼/Edge 而音色来自 MiniMax 目录）→ 同样平滑替换；
+    * 自定义克隆 ID（如 ``my_cloned_voice_01``，不在任何已知列表里）→ 原样透传。
+    """
+    model = (tts_model or "").strip()
+    chosen = (voice or "").strip()
+    if not chosen:
+        return recommended_voice_for_tts_model(model, role_kind)
+
+    # 延迟导入：providers 反向依赖 core.config，顶层 import 会成环。
+    from providers.tts_minimax import MINIMAX_VOICE_IDS
+    from providers.tts_qwen import QWEN3_VOICE_IDS
+
+    minimax_ids = set(MINIMAX_VOICE_IDS)
+    qwen_ids = set(QWEN3_VOICE_IDS)
+    is_edge_voice = chosen.startswith(_EDGE_VOICE_PREFIXES)
+
+    if is_minimax_tts_model(model):
+        if chosen in minimax_ids:
+            return chosen
+        if chosen in qwen_ids or is_edge_voice:
+            replacement = recommended_voice_for_tts_model(model, role_kind)
+            logger.warning(
+                "[tts] 当前模型 %s 不认识音色 %s（百炼/Edge 音色），已替换为 %s",
+                model,
+                chosen,
+                replacement,
+            )
+            return replacement
+        # 自定义克隆音色：不认识就原样透传，让服务端自己判断。
+        return chosen
+
+    if chosen in minimax_ids:
+        replacement = recommended_voice_for_tts_model(model, role_kind)
+        logger.warning(
+            "[tts] 当前模型 %s 不认识音色 %s（MiniMax 音色），已替换为 %s",
+            model,
+            chosen,
+            replacement,
+        )
+        return replacement
+    return chosen
+
+
+def create_tts_client(config: AppConfig, *, voice: str | None = None) -> Any:
+    """按 ``config.models.tts`` 路由到对应 TTS 客户端（Patch v3.4 Patch 16）。
+
+    - ``speech-*`` → :class:`providers.tts_minimax.MiniMaxTTS`；
+    - ``edge-tts`` → :class:`providers.tts_edge.EdgeTTS`；
+    - 其余（``qwen*``）→ :class:`providers.tts_qwen.QwenTTS`。
+
+    默认音色取 ``voice`` → ``config.tts.default_voice`` → provider 内置默认，
+    并统一过一遍 :func:`resolve_voice_for_tts_model`（跨模型切换不再报
+    ``2013 invalid voice_id``）。
+    """
+    model = (config.models.tts or "").strip()
+    requested = voice or config.tts.default_voice or ""
+    chosen = resolve_voice_for_tts_model(requested, tts_model=model, role_kind="narrator")
+
+    if is_minimax_tts_model(model):
+        from providers.tts_minimax import MiniMaxTTS
+
+        try:
+            api_key = resolve_minimax_api_key_with_env_file(config)
+        except ConfigError:
+            # 与百炼一致：不在构造期炸，延迟到真正合成时再报错。
+            api_key = None
+        return MiniMaxTTS(
+            api_key=api_key,
+            base_url=config.api.minimax_base_url,
+            group_id=resolve_minimax_group_id(config),
+            model=model,
+            voice=chosen,
+            timeout_s=config.api.timeout_s,
+            max_retries=config.api.max_retries,
+            retry_backoff_s=config.api.retry_backoff_s,
+            api_key_env=config.api.minimax_api_key_env,
+            group_id_env=config.api.minimax_group_id_env,
+        )
+
+    if model == "edge-tts":
+        from providers.tts_edge import EdgeTTS
+
+        return EdgeTTS(voice=chosen)
+
+    from providers.tts_qwen import QwenTTS
+
+    return QwenTTS(
+        base_url=config.api.base_url,
+        model=model,
+        voice=chosen,
+        timeout_s=config.api.timeout_s,
+        max_retries=config.api.max_retries,
+        retry_backoff_s=config.api.retry_backoff_s,
+    )
+

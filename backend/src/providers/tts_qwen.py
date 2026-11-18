@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import struct
 from typing import Any, Awaitable, Callable
 
@@ -29,8 +30,10 @@ __all__ = [
     "DEFAULT_MODEL",
     "DEFAULT_VOICE",
     "TTS_ENDPOINT_PATH",
-    "BAILIAN_VOICE_CATALOG",
-    "BAILIAN_VOICE_IDS",
+    "QWEN3_TTS_VOICES",
+    "QWEN3_VOICE_IDS",
+    "CORE_VOICE_IDS",
+    "voice_sample_filename",
 ]
 
 DEFAULT_MODEL = "qwen3-tts-flash"
@@ -41,112 +44,334 @@ DEFAULT_MODEL = "qwen3-tts-flash"
 #: :func:`stages.s5_tts.resolve_beat_voice` 按 ``beat.speaker_role`` 路由。
 DEFAULT_VOICE = "Elias"
 
-#: 百炼 ``qwen3-tts-flash`` 官方系统音色目录（Patch v3.2 Patch 13 A）。
+#: 百炼 ``qwen3-tts-flash`` 全量官方中文/方言/戏剧音色目录（Patch v3.3 Patch 15，34 个）。
 #:
-#: 前端作品配音设置页用这份目录渲染音色下拉；``init_voice_samples.py`` 用它
+#: 前端作品配音设置页用这份目录渲染分组音色下拉；``init_voice_samples.py`` 用它
 #: 决定要生成哪几个静态试听样例。字段：
 #:
-#: - ``id``：百炼音色 ID（合成接口的 ``voice`` 字段）；
-#: - ``name``：官方中文名；
+#: - ``voice_id``：百炼音色 ID（合成接口的 ``voice`` 字段，可能含空格，如 ``Eldric Sage``）；
+#: - ``display_name``：官方中文名；
 #: - ``gender``：``male`` / ``female``（用于默认男声/女声兜底）；
-#: - ``traits``：音色特点；
-#: - ``use_case``：适用场景。
-BAILIAN_VOICE_CATALOG: tuple[dict[str, str], ...] = (
+#: - ``age_group``：``child`` / ``youth`` / ``middle`` / ``elder``；
+#: - ``category``：``narrator``（旁白）/ ``character``（角色）/ ``dialect``（方言）/ ``drama``（戏剧）；
+#: - ``description``：音色特点与适用场景。
+#:
+#: 目录之外的其余百炼官方音色 ID（共 49 种）不做枚举限制，``VoiceSpec.voice``
+#: 可直接手填透传，只是没有静态试听样例。
+QWEN3_TTS_VOICES: tuple[dict[str, str], ...] = (
+    # -- 男声：普通话主旁白与青年/大叔/老者（11 个） ---------------------
     {
-        "id": "Elias",
-        "name": "墨讲师",
+        "voice_id": "Elias",
+        "display_name": "墨讲师",
         "gender": "male",
-        "traits": "磁性沉稳、有故事讲述感",
-        "use_case": "悬疑/剧情漫评主旁白（推荐默认）",
+        "age_group": "middle",
+        "category": "narrator",
+        "description": "磁性沉稳，适合悬疑/剧情漫评主旁白",
     },
     {
-        "id": "Ethan",
-        "name": "晨煦",
+        "voice_id": "Neil",
+        "display_name": "阿闻",
         "gender": "male",
-        "traits": "阳光温暖青年标准普通话",
-        "use_case": "现代男主 / 青春男旁白",
+        "age_group": "youth",
+        "category": "narrator",
+        "description": "标准主播腔，字正腔圆、语流利落",
     },
     {
-        "id": "Moon",
-        "name": "月白",
+        "voice_id": "Kai",
+        "display_name": "凯",
         "gender": "male",
-        "traits": "清冷率性帅气男声",
-        "use_case": "高冷/腹黑男主",
+        "age_group": "youth",
+        "category": "narrator",
+        "description": "温和磁性「耳朵SPA」，适合情感/治愈线旁白",
     },
     {
-        "id": "Kai",
-        "name": "凯",
+        "voice_id": "Ethan",
+        "display_name": "晨煦",
         "gender": "male",
-        "traits": "温柔低沉有质感男声",
-        "use_case": "深情男主 / 情感故事旁白",
+        "age_group": "youth",
+        "category": "character",
+        "description": "阳光标准普通话，适合年轻男主",
     },
     {
-        "id": "Ryan",
-        "name": "甜茶",
+        "voice_id": "Moon",
+        "display_name": "月白",
         "gender": "male",
-        "traits": "富有戏剧张力与情绪起伏男声",
-        "use_case": "冲突反派 / 激烈台词",
+        "age_group": "youth",
+        "category": "character",
+        "description": "清冷帅气，适合高冷/腹黑男主",
     },
     {
-        "id": "Marcus",
-        "name": "秦川",
+        "voice_id": "Vincent",
+        "display_name": "田叔",
         "gender": "male",
-        "traits": "沉稳硬汉男声（略带地方硬朗韵味）",
-        "use_case": "霸道长辈 / 硬派反派",
+        "age_group": "middle",
+        "category": "character",
+        "description": "沙哑烟嗓大叔，极适合父亲/boss/反派",
     },
     {
-        "id": "Cherry",
-        "name": "芊悦",
-        "gender": "female",
-        "traits": "明亮亲切年轻女声",
-        "use_case": "年轻女主",
+        "voice_id": "Eldric Sage",
+        "display_name": "沧明子",
+        "gender": "male",
+        "age_group": "elder",
+        "category": "character",
+        "description": "沉稳睿智老者、师尊/长辈",
     },
     {
-        "id": "Serena",
-        "name": "苏瑶",
-        "gender": "female",
-        "traits": "温柔细腻小姐姐声",
-        "use_case": "温柔女主 / 抒情女旁白",
+        "voice_id": "Arthur",
+        "display_name": "徐大爷",
+        "gender": "male",
+        "age_group": "elder",
+        "category": "narrator",
+        "description": "沧桑质朴说书老人",
     },
     {
-        "id": "Maia",
-        "name": "四月",
-        "gender": "female",
-        "traits": "知性优雅女声",
-        "use_case": "理性女配 / 叙事旁白",
+        "voice_id": "Nofish",
+        "display_name": "不吃鱼",
+        "gender": "male",
+        "age_group": "youth",
+        "category": "character",
+        "description": "幽默个性男配角",
     },
     {
-        "id": "Katerina",
-        "name": "卡捷琳娜",
-        "gender": "female",
-        "traits": "成熟富有韵味女声",
-        "use_case": "继母 / 御姐反派",
+        "voice_id": "Mochi",
+        "display_name": "沙小弥",
+        "gender": "male",
+        "age_group": "child",
+        "category": "character",
+        "description": "机灵聪明少年音",
     },
     {
-        "id": "Vivian",
-        "name": "十三",
+        "voice_id": "Pip",
+        "display_name": "调皮小新",
+        "gender": "male",
+        "age_group": "child",
+        "category": "character",
+        "description": "活泼调皮男童声",
+    },
+    # -- 女声：普通话女主/御姐/少女/老妇（15 个） -----------------------
+    {
+        "voice_id": "Cherry",
+        "display_name": "芊悦",
         "gender": "female",
-        "traits": "率性可爱略带小脾气",
-        "use_case": "傲娇女配 / 闺蜜",
+        "age_group": "youth",
+        "category": "character",
+        "description": "阳光明亮亲切女声，适合现代女主",
     },
     {
-        "id": "Chelsie",
-        "name": "千雪",
+        "voice_id": "Serena",
+        "display_name": "苏瑶",
         "gender": "female",
-        "traits": "甜美少女感",
-        "use_case": "软萌/少女角色",
+        "age_group": "youth",
+        "category": "narrator",
+        "description": "温柔小姐姐，适合言情女旁白",
     },
     {
-        "id": "Bella",
-        "name": "萌宝",
+        "voice_id": "Seren",
+        "display_name": "小婉",
         "gender": "female",
-        "traits": "萝莉/孩童声线",
-        "use_case": "幼年主角 / 儿童角色",
+        "age_group": "youth",
+        "category": "narrator",
+        "description": "舒缓柔声讲故事",
+    },
+    {
+        "voice_id": "Maia",
+        "display_name": "四月",
+        "gender": "female",
+        "age_group": "youth",
+        "category": "narrator",
+        "description": "知性优雅女声",
+    },
+    {
+        "voice_id": "Mia",
+        "display_name": "乖小妹",
+        "gender": "female",
+        "age_group": "youth",
+        "category": "character",
+        "description": "温顺乖巧甜美少女",
+    },
+    {
+        "voice_id": "Bellona",
+        "display_name": "燕铮莺",
+        "gender": "female",
+        "age_group": "youth",
+        "category": "character",
+        "description": "洪亮正统有气场，适合大女主/女反派",
+    },
+    {
+        "voice_id": "Katerina",
+        "display_name": "卡捷琳娜",
+        "gender": "female",
+        "age_group": "middle",
+        "category": "character",
+        "description": "成熟有韵味女声，适合继母/反派女",
+    },
+    {
+        "voice_id": "Vivian",
+        "display_name": "十三",
+        "gender": "female",
+        "age_group": "youth",
+        "category": "character",
+        "description": "自信可爱带小脾气",
+    },
+    {
+        "voice_id": "Momo",
+        "display_name": "茉兔",
+        "gender": "female",
+        "age_group": "youth",
+        "category": "character",
+        "description": "俏皮搞怪闺蜜",
+    },
+    {
+        "voice_id": "Chelsie",
+        "display_name": "千雪",
+        "gender": "female",
+        "age_group": "youth",
+        "category": "character",
+        "description": "二次元软萌少女",
+    },
+    {
+        "voice_id": "Bella",
+        "display_name": "萌宝",
+        "gender": "female",
+        "age_group": "youth",
+        "category": "character",
+        "description": "古灵精怪萌系少女",
+    },
+    {
+        "voice_id": "Bunny",
+        "display_name": "萌小姬",
+        "gender": "female",
+        "age_group": "child",
+        "category": "character",
+        "description": "可爱小萝莉",
+    },
+    {
+        "voice_id": "Nini",
+        "display_name": "邻家妹妹",
+        "gender": "female",
+        "age_group": "youth",
+        "category": "character",
+        "description": "自然邻家妹妹",
+    },
+    {
+        "voice_id": "Stella",
+        "display_name": "美少女阿月",
+        "gender": "female",
+        "age_group": "youth",
+        "category": "character",
+        "description": "甜美二次元美少女",
+    },
+    {
+        "voice_id": "Ebona",
+        "display_name": "诡婆婆",
+        "gender": "female",
+        "age_group": "elder",
+        "category": "character",
+        "description": "悬疑故事老年女声",
+    },
+    # -- 方言与剧场张力特色音色（8 个） ---------------------------------
+    {
+        "voice_id": "Dylan",
+        "display_name": "北京晓东",
+        "gender": "male",
+        "age_group": "youth",
+        "category": "dialect",
+        "description": "北京胡同青年",
+    },
+    {
+        "voice_id": "Jada",
+        "display_name": "上海阿珍",
+        "gender": "female",
+        "age_group": "middle",
+        "category": "dialect",
+        "description": "上海话特色女声",
+    },
+    {
+        "voice_id": "Sunny",
+        "display_name": "杭州阿晴",
+        "gender": "female",
+        "age_group": "youth",
+        "category": "dialect",
+        "description": "温柔江南口音",
+    },
+    {
+        "voice_id": "Eric",
+        "display_name": "四川程川",
+        "gender": "male",
+        "age_group": "youth",
+        "category": "dialect",
+        "description": "四川话特色男声",
+    },
+    {
+        "voice_id": "Marcus",
+        "display_name": "陕西秦川",
+        "gender": "male",
+        "age_group": "middle",
+        "category": "dialect",
+        "description": "陕西硬汉男声",
+    },
+    {
+        "voice_id": "Li",
+        "display_name": "南京老李",
+        "gender": "male",
+        "age_group": "middle",
+        "category": "dialect",
+        "description": "南京话大叔",
+    },
+    {
+        "voice_id": "Ryan",
+        "display_name": "甜茶",
+        "gender": "male",
+        "age_group": "youth",
+        "category": "drama",
+        "description": "强烈戏剧节奏与爆发张力男声",
+    },
+    {
+        "voice_id": "Jennifer",
+        "display_name": "詹妮弗",
+        "gender": "female",
+        "age_group": "youth",
+        "category": "drama",
+        "description": "电影叙事质感音色",
     },
 )
 
-#: 音色 ID 列表（顺序同 :data:`BAILIAN_VOICE_CATALOG`）。
-BAILIAN_VOICE_IDS: tuple[str, ...] = tuple(item["id"] for item in BAILIAN_VOICE_CATALOG)
+#: 音色 ID 列表（顺序同 :data:`QWEN3_TTS_VOICES`）。
+QWEN3_VOICE_IDS: tuple[str, ...] = tuple(item["voice_id"] for item in QWEN3_TTS_VOICES)
+
+#: 高频核心音色（``init_voice_samples.py --tier core`` 的 14 个，快速起步）。
+#: 即 Patch v3.2 已验证的 13 个 + 新增标准主播 ``Neil``。
+CORE_VOICE_IDS: tuple[str, ...] = (
+    "Elias",
+    "Neil",
+    "Ethan",
+    "Moon",
+    "Kai",
+    "Ryan",
+    "Marcus",
+    "Cherry",
+    "Serena",
+    "Maia",
+    "Katerina",
+    "Vivian",
+    "Chelsie",
+    "Bella",
+)
+
+#: 样例文件名里允许保留的字符（字母/数字/下划线/连字符/空格），其余一律剔除，
+#: 防止手填音色 ID 造成路径穿越；空格随后统一替换成下划线。
+_UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_\- ]+")
+
+
+def voice_sample_filename(voice_id: str) -> str:
+    """音色 ID → 试听样例文件名。
+
+    含空格的 ID 安全映射为下划线（``Eldric Sage`` → ``Eldric_Sage.wav``）；
+    由于下划线本身是保留字符，URL 里无论传 ``Eldric%20Sage`` 还是 ``Eldric_Sage``
+    都会解析到同一个文件。
+    """
+    cleaned = _UNSAFE_FILENAME_CHARS.sub("", voice_id.strip()).replace(" ", "_")
+    return f"{cleaned or 'unknown'}.wav"
 
 #: DashScope 原生（非 compatible-mode）多模态生成端点路径。
 TTS_ENDPOINT_PATH = "/api/v1/services/aigc/multimodal-generation/generation"

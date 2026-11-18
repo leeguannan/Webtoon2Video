@@ -427,19 +427,15 @@ async def run_understand(
 
 
 def _tts_factory(config: AppConfig, voice: str | None = None) -> Any:
-    """构造百炼 TTS 客户端工厂（Stage 5 用）。"""
+    """构造 TTS 客户端工厂（Stage 5 用）。
+
+    Patch v3.4 Patch 16：按 ``config.models.tts`` 路由到 MiniMax / 百炼 / Edge，
+    并统一过一遍跨模型音色兜底（避免把百炼音色发给 MiniMax 导致 2013）。
+    """
+    from core.config import create_tts_client
 
     def factory():
-        from providers.tts_qwen import DEFAULT_VOICE, QwenTTS
-
-        return QwenTTS(
-            base_url=config.api.base_url,
-            model=config.models.tts,
-            # Patch v3.1 Patch 11 A1/A2：默认音色来自 ``config.tts.default_voice``，
-            # 配置缺失时回退 provider 内置默认值。
-            voice=voice or config.tts.default_voice or DEFAULT_VOICE,
-            timeout_s=config.api.timeout_s,
-        )
+        return create_tts_client(config, voice=voice)
 
     return factory
 
@@ -550,6 +546,7 @@ async def _produce_media_from_scripts(
                     characters=characters,
                     concurrency=concurrency,
                     ffmpeg_bin=config.render.ffmpeg_bin,
+                    tts_model=config.models.tts,
                 )
 
         audio_manifests = await asyncio.gather(*(_speak(episode) for episode in episodes))

@@ -1,0 +1,260 @@
+{
+  "generated_at": "2026-11-18T01:12:29+00:00",
+  "provider": "minimax",
+  "text": "夜色落在窗台上，故事才刚刚开始。你听见了吗，风声里藏着的那句话。",
+  "instruction": "用自然、平稳、有代入感的语气朗读，不要夸张表演。",
+  "voices": {
+    "Chinese (Mandarin)_Radio_Host": {
+      "voice_id": "Chinese (Mandarin)_Radio_Host",
+      "display_name": "电台男主播",
+      "gender": "male",
+      "style": "沉稳叙事",
+      "recommended_for": "悬疑/剧情长漫主旁白",
+      "file": "Chinese__Mandarin__Radio_Host.wav",
+      "duration_ms": 7959
+    },
+    "Chinese (Mandarin)_Male_Announcer": {
+      "voice_id": "Chinese (Mandarin)_Male_Announcer",
+      "display_name": "播报男声",
+      "gender": "male",
+      "style": "磁性有力",
+      "recommended_for": "节奏紧凑的解说旁白",
+      "file": "Chinese__Mandarin__Male_Announcer.wav",
+      "duration_ms": 6964
+    },
+    "Chinese (Mandarin)_Reliable_Executive": {
+      "voice_id": "Chinese (Mandarin)_Reliable_Executive",
+      "display_name": "沉稳高管",
+      "gender": "male",
+      "style": "商务稳重",
+      "recommended_for": "都市/商战/悬疑旁白",
+      "file": "Chinese__Mandarin__Reliable_Executive.wav",
+      "duration_ms": 5997
+    },
+    "Chinese (Mandarin)_News_Anchor": {
+      "voice_id": "Chinese (Mandarin)_News_Anchor",
+      "display_name": "新闻女声",
+      "gender": "female",
+      "style": "清晰利落",
+      "recommended_for": "资讯速报型旁白",
+      "file": "Chinese__Mandarin__News_Anchor.wav",
+      "duration_ms": 7470
+    },
+    "Chinese (Mandarin)_Gentle_Senior": {
+      "voice_id": "Chinese (Mandarin)_Gentle_Senior",
+      "display_name": "温柔学姐",
+      "gender": "female",
+      "style": "温厚叙事",
+      "recommended_for": "抒情/回忆段落",
+      "file": "Chinese__Mandarin__Gentle_Senior.wav",
+      "duration_ms": 7211
+    },
+    "male-qn-qingse": {
+      "voice_id": "male-qn-qingse",
+      "display_name": "青涩青年",
+      "gender": "male",
+      "style": "少年感清亮",
+      "recommended_for": "校园/青涩少年角色",
+      "file": "male-qn-qingse.wav",
+      "duration_ms": 7595
+    },
+    "male-qn-qingse-jingpin": {
+      "voice_id": "male-qn-qingse-jingpin",
+      "display_name": "青涩青年-精品",
+      "gender": "male",
+      "style": "高品质少年感",
+      "recommended_for": "重要少年角色",
+      "file": "male-qn-qingse-jingpin.wav",
+      "duration_ms": 8203
+    },
+    "male-qn-jingying": {
+      "voice_id": "male-qn-jingying",
+      "display_name": "精英青年",
+      "gender": "male",
+      "style": "干练精英",
+      "recommended_for": "都市精英男主",
+      "file": "male-qn-jingying.wav",
+      "duration_ms": 6142
+    },
+    "male-qn-jingying-jingpin": {
+      "voice_id": "male-qn-jingying-jingpin",
+      "display_name": "精英青年-精品",
+      "gender": "male",
+      "style": "高品质精英",
+      "recommended_for": "重要精英角色",
+      "file": "male-qn-jingying-jingpin.wav",
+      "duration_ms": 6499
+    },
+    "male-qn-badao": {
+      "voice_id": "male-qn-badao",
+      "display_name": "霸道青年",
+      "gender": "male",
+      "style": "强势霸道",
+      "recommended_for": "霸总/反派角色",
+      "file": "male-qn-badao.wav",
+      "duration_ms": 6766
+    },
+    "male-qn-badao-jingpin": {
+      "voice_id": "male-qn-badao-jingpin",
+      "display_name": "霸道青年-精品",
+      "gender": "male",
+      "style": "高品质霸道",
+      "recommended_for": "重要反派角色",
+      "file": "male-qn-badao-jingpin.wav",
+      "duration_ms": 7736
+    },
+    "male-qn-daxuesheng": {
+      "voice_id": "male-qn-daxuesheng",
+      "display_name": "青年大学生",
+      "gender": "male",
+      "style": "阳光学生",
+      "recommended_for": "大学生角色",
+      "file": "male-qn-daxuesheng.wav",
+      "duration_ms": 7808
+    },
+    "Chinese (Mandarin)_Gentleman": {
+      "voice_id": "Chinese (Mandarin)_Gentleman",
+      "display_name": "温润男声",
+      "gender": "male",
+      "style": "温润知性",
+      "recommended_for": "成熟男主",
+      "file": "Chinese__Mandarin__Gentleman.wav",
+      "duration_ms": 6799
+    },
+    "Chinese (Mandarin)_Pure-hearted_Boy": {
+      "voice_id": "Chinese (Mandarin)_Pure-hearted_Boy",
+      "display_name": "清澈邻家弟弟",
+      "gender": "male",
+      "style": "清爽干净",
+      "recommended_for": "少年主角",
+      "file": "Chinese__Mandarin__Pure-hearted_Boy.wav",
+      "duration_ms": 7406
+    },
+    "Chinese (Mandarin)_Unrestrained_Young_Man": {
+      "voice_id": "Chinese (Mandarin)_Unrestrained_Young_Man",
+      "display_name": "不羁青年",
+      "gender": "male",
+      "style": "洒脱不羁",
+      "recommended_for": "自由不羁角色",
+      "file": "Chinese__Mandarin__Unrestrained_Young_Man.wav",
+      "duration_ms": 7049
+    },
+    "Chinese (Mandarin)_Humorous_Elder": {
+      "voice_id": "Chinese (Mandarin)_Humorous_Elder",
+      "display_name": "搞笑大爷",
+      "gender": "male",
+      "style": "幽默慈和",
+      "recommended_for": "长辈/大叔角色",
+      "file": "Chinese__Mandarin__Humorous_Elder.wav",
+      "duration_ms": 7688
+    },
+    "female-shaonv": {
+      "voice_id": "female-shaonv",
+      "display_name": "年轻少女",
+      "gender": "female",
+      "style": "清甜少女",
+      "recommended_for": "少女主角",
+      "file": "female-shaonv.wav",
+      "duration_ms": 7174
+    },
+    "female-shaonv-jingpin": {
+      "voice_id": "female-shaonv-jingpin",
+      "display_name": "少女-精品",
+      "gender": "female",
+      "style": "高品质少女",
+      "recommended_for": "重要少女角色",
+      "file": "female-shaonv-jingpin.wav",
+      "duration_ms": 6301
+    },
+    "female-yujie": {
+      "voice_id": "female-yujie",
+      "display_name": "成熟御姐",
+      "gender": "female",
+      "style": "御姐成熟",
+      "recommended_for": "成熟女角色",
+      "file": "female-yujie.wav",
+      "duration_ms": 10035
+    },
+    "female-yujie-jingpin": {
+      "voice_id": "female-yujie-jingpin",
+      "display_name": "御姐-精品",
+      "gender": "female",
+      "style": "精品御姐",
+      "recommended_for": "重要女角色",
+      "file": "female-yujie-jingpin.wav",
+      "duration_ms": 9249
+    },
+    "female-tianmei": {
+      "voice_id": "female-tianmei",
+      "display_name": "甜美女声",
+      "gender": "female",
+      "style": "甜美亲和",
+      "recommended_for": "甜美女友",
+      "file": "female-tianmei.wav",
+      "duration_ms": 7860
+    },
+    "female-tianmei-jingpin": {
+      "voice_id": "female-tianmei-jingpin",
+      "display_name": "甜美-精品",
+      "gender": "female",
+      "style": "精品甜美",
+      "recommended_for": "重要甜美女角色",
+      "file": "female-tianmei-jingpin.wav",
+      "duration_ms": 6728
+    },
+    "Chinese (Mandarin)_Warm_Girl": {
+      "voice_id": "Chinese (Mandarin)_Warm_Girl",
+      "display_name": "温暖少女",
+      "gender": "female",
+      "style": "温暖治愈",
+      "recommended_for": "治愈系女主",
+      "file": "Chinese__Mandarin__Warm_Girl.wav",
+      "duration_ms": 6867
+    },
+    "Chinese (Mandarin)_Warm_Bestie": {
+      "voice_id": "Chinese (Mandarin)_Warm_Bestie",
+      "display_name": "温暖闺蜜",
+      "gender": "female",
+      "style": "温柔亲切",
+      "recommended_for": "闺蜜角色",
+      "file": "Chinese__Mandarin__Warm_Bestie.wav",
+      "duration_ms": 6427
+    },
+    "Chinese (Mandarin)_Mature_Woman": {
+      "voice_id": "Chinese (Mandarin)_Mature_Woman",
+      "display_name": "傲娇御姐",
+      "gender": "female",
+      "style": "端庄成熟",
+      "recommended_for": "成熟女性角色",
+      "file": "Chinese__Mandarin__Mature_Woman.wav",
+      "duration_ms": 8188
+    },
+    "Chinese (Mandarin)_Sweet_Lady": {
+      "voice_id": "Chinese (Mandarin)_Sweet_Lady",
+      "display_name": "甜美女声",
+      "gender": "female",
+      "style": "甜美端庄",
+      "recommended_for": "淑女角色",
+      "file": "Chinese__Mandarin__Sweet_Lady.wav",
+      "duration_ms": 8335
+    },
+    "Chinese (Mandarin)_Wise_Women": {
+      "voice_id": "Chinese (Mandarin)_Wise_Women",
+      "display_name": "阅历姐姐",
+      "gender": "female",
+      "style": "知性理性",
+      "recommended_for": "学者/职场女性",
+      "file": "Chinese__Mandarin__Wise_Women.wav",
+      "duration_ms": 6670
+    },
+    "Chinese (Mandarin)_Kind-hearted_Elder": {
+      "voice_id": "Chinese (Mandarin)_Kind-hearted_Elder",
+      "display_name": "花甲奶奶",
+      "gender": "female",
+      "style": "慈祥温厚",
+      "recommended_for": "长辈女性角色",
+      "file": "Chinese__Mandarin__Kind-hearted_Elder.wav",
+      "duration_ms": 10464
+    }
+  }
+}

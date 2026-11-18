@@ -489,7 +489,10 @@ def test_get_config_returns_studio_shape(client: TestClient) -> None:
     payload = client.get("/api/config").json()
     assert payload["aspectRatio"] == "9:16"
     assert payload["visionModel"] == "qwen3-vl-plus"
-    assert payload["scriptModel"] == "qwen-plus"
+    assert payload["scriptModel"] == "qwen3.7-plus"
+    # Patch v3.3 Patch 15：4A 说书体模型与下拉候选一并回显。
+    assert payload["storyModel"] == "qwen4-max"
+    assert "qwen4-max" in payload["storyModelOptions"]
     assert payload["ttsModel"] == "qwen3-tts-flash"
     assert "apiKey" not in payload
 
@@ -513,13 +516,13 @@ def test_get_config_prefers_configured_default_voice(workspace: Path) -> None:
 
 
 def test_get_config_lists_voice_options(client: TestClient) -> None:
-    """可选音色清单包含百炼官方 13 个音色（Patch v3.2 Patch 13 起前端下拉用）。"""
-    from providers.tts_qwen import BAILIAN_VOICE_IDS
+    """可选音色清单包含百炼官方音色（Patch v3.3 Patch 15 扩到 34 个，前端下拉用）。"""
+    from providers.tts_qwen import QWEN3_VOICE_IDS
 
     payload = client.get("/api/config").json()
     options = payload["ttsVoiceOptions"]
-    assert [item["id"] for item in options] == list(BAILIAN_VOICE_IDS)
-    assert len(options) == 13
+    assert [item["id"] for item in options] == list(QWEN3_VOICE_IDS)
+    assert len(options) == len(QWEN3_VOICE_IDS)
     assert all(item["label"] for item in options)
 
 
@@ -742,7 +745,8 @@ async def test_job_runner_executes_stage1_to_stage4(
     assert (episode_dir / "03_vision" / "vision.json").is_file()
     assert (episode_dir / "04_script" / "script.json").is_file()
     assert any("qwen3-vl-plus" in model for model in stub.models)
-    assert any("qwen-plus" in model for model in stub.models)
+    # Patch v3.3 Patch 15：默认撰稿模型已升级为 qwen3.7-plus。
+    assert any("qwen3.7-plus" in model for model in stub.models)
 
 
 @pytest.mark.anyio
@@ -821,7 +825,7 @@ async def test_job_runner_passes_default_story_model_to_stage4(
     assert state is not None and state.status == "done", state.error
     assert captured["model"] == config.models.script
     assert captured["story_model"] == config.models.story_model
-    assert captured["story_model"] == "qwen3.8-max"
+    assert captured["story_model"] == "qwen4-max"
 
 
 @pytest.mark.anyio

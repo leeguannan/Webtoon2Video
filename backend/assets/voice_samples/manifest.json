@@ -1,124 +1,347 @@
 {
-  "generated_at": "2026-11-17T07:22:12+00:00",
+  "generated_at": "2026-11-17T08:46:53+00:00",
   "text": "夜色落在窗台上，故事才刚刚开始。你听见了吗，风声里藏着的那句话。",
   "instruction": "用自然、平稳、有代入感的语气朗读，不要夸张表演。",
   "voices": {
     "Elias": {
-      "id": "Elias",
-      "name": "墨讲师",
+      "voice_id": "Elias",
+      "display_name": "墨讲师",
       "gender": "male",
-      "traits": "磁性沉稳、有故事讲述感",
-      "use_case": "悬疑/剧情漫评主旁白（推荐默认）",
+      "age_group": "middle",
+      "category": "narrator",
+      "description": "磁性沉稳，适合悬疑/剧情漫评主旁白",
       "file": "Elias.wav",
       "duration_ms": 7191
     },
-    "Ethan": {
-      "id": "Ethan",
-      "name": "晨煦",
+    "Neil": {
+      "voice_id": "Neil",
+      "display_name": "阿闻",
       "gender": "male",
-      "traits": "阳光温暖青年标准普通话",
-      "use_case": "现代男主 / 青春男旁白",
+      "age_group": "youth",
+      "category": "narrator",
+      "description": "标准主播腔，字正腔圆、语流利落",
+      "file": "Neil.wav",
+      "duration_ms": 6389
+    },
+    "Kai": {
+      "voice_id": "Kai",
+      "display_name": "凯",
+      "gender": "male",
+      "age_group": "youth",
+      "category": "narrator",
+      "description": "温和磁性「耳朵SPA」，适合情感/治愈线旁白",
+      "file": "Kai.wav",
+      "duration_ms": 7344
+    },
+    "Ethan": {
+      "voice_id": "Ethan",
+      "display_name": "晨煦",
+      "gender": "male",
+      "age_group": "youth",
+      "category": "character",
+      "description": "阳光标准普通话，适合年轻男主",
       "file": "Ethan.wav",
       "duration_ms": 6476
     },
     "Moon": {
-      "id": "Moon",
-      "name": "月白",
+      "voice_id": "Moon",
+      "display_name": "月白",
       "gender": "male",
-      "traits": "清冷率性帅气男声",
-      "use_case": "高冷/腹黑男主",
+      "age_group": "youth",
+      "category": "character",
+      "description": "清冷帅气，适合高冷/腹黑男主",
       "file": "Moon.wav",
       "duration_ms": 11357
     },
-    "Kai": {
-      "id": "Kai",
-      "name": "凯",
+    "Vincent": {
+      "voice_id": "Vincent",
+      "display_name": "田叔",
       "gender": "male",
-      "traits": "温柔低沉有质感男声",
-      "use_case": "深情男主 / 情感故事旁白",
-      "file": "Kai.wav",
-      "duration_ms": 7344
+      "age_group": "middle",
+      "category": "character",
+      "description": "沙哑烟嗓大叔，极适合父亲/boss/反派",
+      "file": "Vincent.wav",
+      "duration_ms": 8700
     },
-    "Ryan": {
-      "id": "Ryan",
-      "name": "甜茶",
+    "Eldric Sage": {
+      "voice_id": "Eldric Sage",
+      "display_name": "沧明子",
       "gender": "male",
-      "traits": "富有戏剧张力与情绪起伏男声",
-      "use_case": "冲突反派 / 激烈台词",
-      "file": "Ryan.wav",
-      "duration_ms": 6717
+      "age_group": "elder",
+      "category": "character",
+      "description": "沉稳睿智老者、师尊/长辈",
+      "file": "Eldric_Sage.wav",
+      "duration_ms": 13507
     },
-    "Marcus": {
-      "id": "Marcus",
-      "name": "秦川",
+    "Arthur": {
+      "voice_id": "Arthur",
+      "display_name": "徐大爷",
       "gender": "male",
-      "traits": "沉稳硬汉男声（略带地方硬朗韵味）",
-      "use_case": "霸道长辈 / 硬派反派",
-      "file": "Marcus.wav",
-      "duration_ms": 6958
+      "age_group": "elder",
+      "category": "narrator",
+      "description": "沧桑质朴说书老人",
+      "file": "Arthur.wav",
+      "duration_ms": 12872
+    },
+    "Nofish": {
+      "voice_id": "Nofish",
+      "display_name": "不吃鱼",
+      "gender": "male",
+      "age_group": "youth",
+      "category": "character",
+      "description": "幽默个性男配角",
+      "file": "Nofish.wav",
+      "duration_ms": 5987
+    },
+    "Mochi": {
+      "voice_id": "Mochi",
+      "display_name": "沙小弥",
+      "gender": "male",
+      "age_group": "child",
+      "category": "character",
+      "description": "机灵聪明少年音",
+      "file": "Mochi.wav",
+      "duration_ms": 7357
+    },
+    "Pip": {
+      "voice_id": "Pip",
+      "display_name": "调皮小新",
+      "gender": "male",
+      "age_group": "child",
+      "category": "character",
+      "description": "活泼调皮男童声",
+      "file": "Pip.wav",
+      "duration_ms": 7989
     },
     "Cherry": {
-      "id": "Cherry",
-      "name": "芊悦",
+      "voice_id": "Cherry",
+      "display_name": "芊悦",
       "gender": "female",
-      "traits": "明亮亲切年轻女声",
-      "use_case": "年轻女主",
+      "age_group": "youth",
+      "category": "character",
+      "description": "阳光明亮亲切女声，适合现代女主",
       "file": "Cherry.wav",
       "duration_ms": 7432
     },
     "Serena": {
-      "id": "Serena",
-      "name": "苏瑶",
+      "voice_id": "Serena",
+      "display_name": "苏瑶",
       "gender": "female",
-      "traits": "温柔细腻小姐姐声",
-      "use_case": "温柔女主 / 抒情女旁白",
+      "age_group": "youth",
+      "category": "narrator",
+      "description": "温柔小姐姐，适合言情女旁白",
       "file": "Serena.wav",
       "duration_ms": 7589
     },
-    "Maia": {
-      "id": "Maia",
-      "name": "四月",
+    "Seren": {
+      "voice_id": "Seren",
+      "display_name": "小婉",
       "gender": "female",
-      "traits": "知性优雅女声",
-      "use_case": "理性女配 / 叙事旁白",
+      "age_group": "youth",
+      "category": "narrator",
+      "description": "舒缓柔声讲故事",
+      "file": "Seren.wav",
+      "duration_ms": 10537
+    },
+    "Maia": {
+      "voice_id": "Maia",
+      "display_name": "四月",
+      "gender": "female",
+      "age_group": "youth",
+      "category": "narrator",
+      "description": "知性优雅女声",
       "file": "Maia.wav",
       "duration_ms": 6872
     },
-    "Katerina": {
-      "id": "Katerina",
-      "name": "卡捷琳娜",
+    "Mia": {
+      "voice_id": "Mia",
+      "display_name": "乖小妹",
       "gender": "female",
-      "traits": "成熟富有韵味女声",
-      "use_case": "继母 / 御姐反派",
+      "age_group": "youth",
+      "category": "character",
+      "description": "温顺乖巧甜美少女",
+      "file": "Mia.wav",
+      "duration_ms": 7743
+    },
+    "Bellona": {
+      "voice_id": "Bellona",
+      "display_name": "燕铮莺",
+      "gender": "female",
+      "age_group": "youth",
+      "category": "character",
+      "description": "洪亮正统有气场，适合大女主/女反派",
+      "file": "Bellona.wav",
+      "duration_ms": 9414
+    },
+    "Katerina": {
+      "voice_id": "Katerina",
+      "display_name": "卡捷琳娜",
+      "gender": "female",
+      "age_group": "middle",
+      "category": "character",
+      "description": "成熟有韵味女声，适合继母/反派女",
       "file": "Katerina.wav",
       "duration_ms": 8141
     },
     "Vivian": {
-      "id": "Vivian",
-      "name": "十三",
+      "voice_id": "Vivian",
+      "display_name": "十三",
       "gender": "female",
-      "traits": "率性可爱略带小脾气",
-      "use_case": "傲娇女配 / 闺蜜",
+      "age_group": "youth",
+      "category": "character",
+      "description": "自信可爱带小脾气",
       "file": "Vivian.wav",
       "duration_ms": 6791
     },
-    "Chelsie": {
-      "id": "Chelsie",
-      "name": "千雪",
+    "Momo": {
+      "voice_id": "Momo",
+      "display_name": "茉兔",
       "gender": "female",
-      "traits": "甜美少女感",
-      "use_case": "软萌/少女角色",
+      "age_group": "youth",
+      "category": "character",
+      "description": "俏皮搞怪闺蜜",
+      "file": "Momo.wav",
+      "duration_ms": 6397
+    },
+    "Chelsie": {
+      "voice_id": "Chelsie",
+      "display_name": "千雪",
+      "gender": "female",
+      "age_group": "youth",
+      "category": "character",
+      "description": "二次元软萌少女",
       "file": "Chelsie.wav",
       "duration_ms": 7660
     },
     "Bella": {
-      "id": "Bella",
-      "name": "萌宝",
+      "voice_id": "Bella",
+      "display_name": "萌宝",
       "gender": "female",
-      "traits": "萝莉/孩童声线",
-      "use_case": "幼年主角 / 儿童角色",
+      "age_group": "youth",
+      "category": "character",
+      "description": "古灵精怪萌系少女",
       "file": "Bella.wav",
       "duration_ms": 9276
+    },
+    "Bunny": {
+      "voice_id": "Bunny",
+      "display_name": "萌小姬",
+      "gender": "female",
+      "age_group": "child",
+      "category": "character",
+      "description": "可爱小萝莉",
+      "file": "Bunny.wav",
+      "duration_ms": 8221
+    },
+    "Nini": {
+      "voice_id": "Nini",
+      "display_name": "邻家妹妹",
+      "gender": "female",
+      "age_group": "youth",
+      "category": "character",
+      "description": "自然邻家妹妹",
+      "file": "Nini.wav",
+      "duration_ms": 7407
+    },
+    "Stella": {
+      "voice_id": "Stella",
+      "display_name": "美少女阿月",
+      "gender": "female",
+      "age_group": "youth",
+      "category": "character",
+      "description": "甜美二次元美少女",
+      "file": "Stella.wav",
+      "duration_ms": 6927
+    },
+    "Ebona": {
+      "voice_id": "Ebona",
+      "display_name": "诡婆婆",
+      "gender": "female",
+      "age_group": "elder",
+      "category": "character",
+      "description": "悬疑故事老年女声",
+      "file": "Ebona.wav",
+      "duration_ms": 10859
+    },
+    "Dylan": {
+      "voice_id": "Dylan",
+      "display_name": "北京晓东",
+      "gender": "male",
+      "age_group": "youth",
+      "category": "dialect",
+      "description": "北京胡同青年",
+      "file": "Dylan.wav",
+      "duration_ms": 5832
+    },
+    "Jada": {
+      "voice_id": "Jada",
+      "display_name": "上海阿珍",
+      "gender": "female",
+      "age_group": "middle",
+      "category": "dialect",
+      "description": "上海话特色女声",
+      "file": "Jada.wav",
+      "duration_ms": 6314
+    },
+    "Sunny": {
+      "voice_id": "Sunny",
+      "display_name": "杭州阿晴",
+      "gender": "female",
+      "age_group": "youth",
+      "category": "dialect",
+      "description": "温柔江南口音",
+      "file": "Sunny.wav",
+      "duration_ms": 5670
+    },
+    "Eric": {
+      "voice_id": "Eric",
+      "display_name": "四川程川",
+      "gender": "male",
+      "age_group": "youth",
+      "category": "dialect",
+      "description": "四川话特色男声",
+      "file": "Eric.wav",
+      "duration_ms": 6394
+    },
+    "Marcus": {
+      "voice_id": "Marcus",
+      "display_name": "陕西秦川",
+      "gender": "male",
+      "age_group": "middle",
+      "category": "dialect",
+      "description": "陕西硬汉男声",
+      "file": "Marcus.wav",
+      "duration_ms": 6958
+    },
+    "Li": {
+      "voice_id": "Li",
+      "display_name": "南京老李",
+      "gender": "male",
+      "age_group": "middle",
+      "category": "dialect",
+      "description": "南京话大叔",
+      "file": "Li.wav",
+      "duration_ms": 5354
+    },
+    "Ryan": {
+      "voice_id": "Ryan",
+      "display_name": "甜茶",
+      "gender": "male",
+      "age_group": "youth",
+      "category": "drama",
+      "description": "强烈戏剧节奏与爆发张力男声",
+      "file": "Ryan.wav",
+      "duration_ms": 6717
+    },
+    "Jennifer": {
+      "voice_id": "Jennifer",
+      "display_name": "詹妮弗",
+      "gender": "female",
+      "age_group": "youth",
+      "category": "drama",
+      "description": "电影叙事质感音色",
+      "file": "Jennifer.wav",
+      "duration_ms": 6924
     }
   }
 }

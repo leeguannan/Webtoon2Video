@@ -8,8 +8,11 @@
 
 from __future__ import annotations
 
+import logging
 import re
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
+
+logger = logging.getLogger(__name__)
 
 # 与 ``core.schemas`` 保持一致的契约取值
 EMOTION_VALUES: tuple[str, ...] = (
@@ -314,6 +317,208 @@ def normalize_dialogue_quotes(text: str) -> str:
     return cleaned
 
 
+#: 相邻重复对白去重用的文本指纹：去掉标点 / 引号 / 空白。
+#:
+#: 模型写出的两句「这个地方是用来做什么的呀？」可能只差一个问号，
+#: 直接比字符串判不出重复，去掉标点后就能识别。
+_DEDUPE_STRIP_RE = re.compile(r"[^\w]+", re.UNICODE)
+
+#: 「后一条被前一条完全包含」时，后一条至少要有这么多字才算重复（Patch v3.4）。
+_DEDUPE_CONTAINED_MIN_CHARS = 6
+
+
+def _dedupe_text_key(text: Any) -> str:
+    """去重比较用的文本指纹（去掉标点 / 引号 / 空白）。"""
+    return _DEDUPE_STRIP_RE.sub("", coerce_str(text))
+
+
+def _beat_panel_ids(beat: dict[str, Any]) -> set[str]:
+    """beat 的分镜 ID 集合（去重时判断两条是否落在同一画面）。"""
+    return {item for item in coerce_str_list(beat.get("target_panel_ids")) if item}
+
+
+def deduplicate_adjacent_beats(beats: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """相邻重复对白确定性去重（Patch v3.4 Patch 17）。
+
+    相邻两条 Beat 命中以下任一条件时，丢弃**后一条**（保留信息量更完整 / 更早的那句）：
+
+    1. 去掉标点 / 引号 / 空白后的 ``tts_text``（缺省退回 ``narration_text``）完全相同；
+    2. 后一条的文本被前一条完全包含（后一条 ≥ 6 字），且两条共享同一组
+       ``target_panel_ids``（同一画面里的重复啰嗦）。
+
+    命中时打 INFO 日志，便于回溯到底是哪句被去掉。
+    """
+    kept: list[dict[str, Any]] = []
+    for beat in beats:
+        if not isinstance(beat, dict):
+            continue
+        if kept:
+            previous = kept[-1]
+            previous_key = _dedupe_text_key(
+                previous.get("tts_text") or previous.get("narration_text") or ""
+            )
+            current_key = _dedupe_text_key(
+                beat.get("tts_text") or beat.get("narration_text") or ""
+            )
+            if previous_key and current_key:
+                identical = previous_key == current_key
+                contained = (
+                    not identical
+                    and len(current_key) >= _DEDUPE_CONTAINED_MIN_CHARS
+                    and current_key in previous_key
+                    and bool(_beat_panel_ids(previous) & _beat_panel_ids(beat))
+                )
+                if identical or contained:
+                    logger.info(
+                        "[normalize] 相邻重复对白去重：丢弃 %s（与 %s 重复）",
+                        coerce_str(beat.get("beat_id")) or "?",
+                        coerce_str(previous.get("beat_id")) or "?",
+                    )
+                    continue
+        kept.append(beat)
+    return kept
+
+
+#: 心理活动关键词（Patch v3.4 Patch 17）。
+#:
+#: 引号前的引导文本命中这些词时，引号里的是「心里话」而不是角色开口，
+#: 保持旁白声线朗读，不切走角色声线。
+PSYCHOLOGICAL_LEAD_KEYWORDS: tuple[str, ...] = (
+    "心想",
+    "暗想",
+    "默念",
+    "心里",
+    "想到",
+    "意识到",
+    "回响",
+    "脑海",
+)
+
+_PSYCHOLOGICAL_LEAD_RE = re.compile("|".join(PSYCHOLOGICAL_LEAD_KEYWORDS))
+
+#: 引号内容少于该字数视为短促拟声 / 心理闪念（Patch v3.4 Patch 17）。
+#:
+#: 「嗯？」「……！」这类纯拟声没有真正的说话人，切成角色声线既突兀又多余。
+MIN_DIALOGUE_CHARS = 6
+
+#: 整段文本都是引号对白时的匹配规则。
+_QUOTED_LINE_RE = re.compile(r"^“([^”]+)”$")
+
+#: 分镜 ID 里的序号（``p_001`` → 1）。
+_PANEL_INDEX_RE = re.compile(r"(\d+)")
+
+#: 视为「旁白」的 ``speaker_role`` 取值（大小写无关）。
+NARRATOR_ROLE_NAMES: frozenset[str] = frozenset({"narrator", "旁白", "解说"})
+
+
+def quote_char_count(text: Any) -> int:
+    """引号内容的净字数（去掉标点 / 引号 / 空白）。"""
+    return len(_DEDUPE_STRIP_RE.sub("", coerce_str(text)))
+
+
+def extract_quoted_text(text: Any) -> str | None:
+    """整段文本是不是纯引号对白；是则返回引号内文本，否则返回 ``None``。"""
+    stripped = coerce_str(text).strip()
+    match = _QUOTED_LINE_RE.fullmatch(stripped)
+    return match.group(1) if match else None
+
+
+def first_panel_index(panel_ids: Any) -> int | None:
+    """取分镜 ID 列表里第一个可解析的序号（``p_003`` → 3）。"""
+    for panel_id in coerce_str_list(panel_ids):
+        match = _PANEL_INDEX_RE.search(panel_id)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:  # pragma: no cover - 正则已保证是数字
+                continue
+    return None
+
+
+def is_psychological_lead(text: Any) -> bool:
+    """引号前的引导文本是不是心理活动描写。"""
+    return bool(_PSYCHOLOGICAL_LEAD_RE.search(coerce_str(text)))
+
+
+def resolve_dialogue_speaker_inheritance(
+    beats: Sequence[Mapping[str, Any]],
+    *,
+    max_panel_gap: int = 1,
+) -> dict[str, tuple[str, str]]:
+    """连续对白说话人继承（Patch v3.4 Patch 17）。
+
+    消除「男角色说一半突然退回旁白女声」：一条**没有写明「XX说：」**的纯引号
+    对白（``speaker_role`` 仍是旁白，或性别未知），若与上一句已识别的对白同属
+    连续对话序列（分镜间隔不超过 ``max_panel_gap`` 格、中间没有旁白打断），
+    就继承上一句的说话人与性别。
+
+    返回 ``{beat_id: (speaker_role, speaker_gender)}``，只包含需要继承的 beat；
+    短促拟声 / 心理闪念（引号内不足 :data:`MIN_DIALOGUE_CHARS` 字）不继承——
+    它们本来就留在旁白声线。
+    """
+    inheritance: dict[str, tuple[str, str]] = {}
+    last_speaker = ""
+    last_gender = ""
+    last_panel_index: int | None = None
+
+    for beat in beats:
+        if not isinstance(beat, Mapping):
+            continue
+        quoted = extract_quoted_text(beat.get("narration_text"))
+        role = coerce_str(beat.get("speaker_role"))
+        gender = coerce_str(beat.get("speaker_gender")).lower()
+
+        if quoted is None:
+            # 纯旁白：打断连续对话序列。
+            last_speaker = ""
+            last_gender = ""
+            last_panel_index = None
+            continue
+
+        if role and role.lower() not in NARRATOR_ROLE_NAMES:
+            # 认出了具体说话人：记住他，供后面的纯引号对白继承。
+            last_speaker = role
+            last_gender = gender if gender in {"male", "female"} else ""
+            last_panel_index = first_panel_index(beat.get("target_panel_ids"))
+            continue
+
+        # 纯引号对白但没写明说话人 → 尝试继承上一句对白。
+        panel_index = first_panel_index(beat.get("target_panel_ids"))
+        if (
+            last_speaker
+            and last_panel_index is not None
+            and panel_index is not None
+            and 0 <= panel_index - last_panel_index <= max_panel_gap
+            and quote_char_count(quoted) >= MIN_DIALOGUE_CHARS
+        ):
+            beat_id = coerce_str(beat.get("beat_id"))
+            if beat_id:
+                inheritance[beat_id] = (last_speaker, last_gender or "unknown")
+    return inheritance
+
+
+def apply_dialogue_speaker_inheritance(
+    beats: Sequence[dict[str, Any]],
+    *,
+    max_panel_gap: int = 1,
+) -> list[dict[str, Any]]:
+    """把 :func:`resolve_dialogue_speaker_inheritance` 的结果写回 beat。"""
+    inheritance = resolve_dialogue_speaker_inheritance(
+        beats, max_panel_gap=max_panel_gap
+    )
+    result: list[dict[str, Any]] = []
+    for beat in beats:
+        if not isinstance(beat, dict):
+            continue
+        updated = dict(beat)
+        hit = inheritance.get(coerce_str(updated.get("beat_id")))
+        if hit:
+            updated["speaker_role"] = hit[0]
+            updated["speaker_gender"] = hit[1]
+        result.append(updated)
+    return result
+
+
 def normalize_script_payload(
     payload: dict[str, Any],
     *,
@@ -327,6 +532,7 @@ def normalize_script_payload(
     * ``narration_text`` 长度必须落在契约区间，过短的 beat 直接丢弃；
     * ``target_panel_ids`` 过滤空值，并可按真实存在的面板 ID 过滤；
     * ``motion`` / 伏笔状态等枚举越界时收敛；
+    * 相邻重复对白确定性去重（Patch v3.4 Patch 17）；
     * 话号与话次 ID 一律以流水线为准。
     """
     beats: list[dict[str, Any]] = []
@@ -442,7 +648,8 @@ def normalize_script_payload(
     return {
         "episode_id": episode_id,
         "hook_title": coerce_str(payload.get("hook_title")) or f"第 {episode_no} 话",
-        "beats": beats,
+        # Patch v3.4 Patch 17：相邻重复对白确定性去重（模型偶尔把同一句写两遍）。
+        "beats": deduplicate_adjacent_beats(beats),
         "episode_digest": digest,
         "character_updates": character_updates,
         "new_plot_threads": new_threads,

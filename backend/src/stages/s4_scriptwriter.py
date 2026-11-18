@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-import hashlib
+import logging
 import re
 import sys
 from collections.abc import Awaitable, Callable, Iterable, Sequence
@@ -20,10 +20,15 @@ from typing import Any
 
 from core.normalize import (
     MIN_NARRATION_CHARS,
+    MIN_DIALOGUE_CHARS,
+    apply_dialogue_speaker_inheritance,
     coerce_str,
     coerce_str_list,
+    deduplicate_adjacent_beats,
+    is_psychological_lead,
     normalize_dialogue_quotes,
     normalize_script_payload,
+    quote_char_count,
 )
 from core.memory import Stage4Context, StoryBibleManager
 from core.panel_ids import PanelIdResolver, panel_sort_key
@@ -33,7 +38,6 @@ from core.schemas import (
     EpisodeStoryDraft,
     NarrationScript,
     PanelVisionInfo,
-    ScriptBeat,
     StoryChapter,
     VisionWindowOutput,
     load_model,
@@ -42,9 +46,12 @@ from core.schemas import (
 from providers.llm_base import (
     ChatMessage,
     LLMClient,
+    LLMError,
     LLMTruncatedError,
     parse_json_response,
 )
+
+logger = logging.getLogger(__name__)
 
 SCRIPT_DIR_NAME = "04_script"
 OVERVIEW_PROMPT_FILENAME = "script_overview.md"
@@ -79,6 +86,79 @@ CHAPTER_MAX_PANELS = 120
 #: 接受 ``enable_thinking=False``（qwen3.8-max / qwen-plus 均实测兼容），关掉后
 #: 同一 4A 任务 34.2s 完成且产出过 schema 校验。所有 Stage 4 LLM 调用统一透传。
 _NO_THINKING_KWARGS: dict[str, object] = {"enable_thinking": False}
+
+#: Patch v3.3 Patch 15：Stage 4 新旗舰模型未开通/无权限时的有序降级链。
+#: 配置的主模型在链中时取其后的候选；不在链中（自定义模型）时整条链都作为候选。
+MODEL_FALLBACK_CHAIN: tuple[str, ...] = (
+    "qwen4-max",
+    "qwen3.8-max",
+    "qwen3.7-plus",
+    "qwen-plus",
+)
+
+#: 模型不可用类错误的识别标记（百炼 ModelNotFound / AccessDenied /
+#: InvalidParameter 与 HTTP 404/403，消息体均为英文错误码或中文「未开通」）。
+_MODEL_ACCESS_ERROR_MARKERS: tuple[str, ...] = (
+    "modelnotfound",
+    "accessdenied",
+    "invalidparameter",
+    "permission denied",
+    "not found",
+    "no access",
+    "404",
+    "403",
+    "未开通",
+    "无权限",
+    "没有权限",
+)
+
+
+def is_model_access_error(exc: BaseException) -> bool:
+    """判断异常是否为「模型未开通/无权限/不存在」类（可降级重试）。
+
+    只认 provider 层的 :class:`LLMError`，截断、JSON 结构等其他错误不触发降级。
+    """
+    if not isinstance(exc, LLMError):
+        return False
+    message = str(exc).lower()
+    return any(marker in message for marker in _MODEL_ACCESS_ERROR_MARKERS)
+
+
+def _fallback_candidates(primary_model: str) -> list[str]:
+    """主模型之后的降级候选（主模型不在链中时返回整条链）。"""
+    if primary_model in MODEL_FALLBACK_CHAIN:
+        index = MODEL_FALLBACK_CHAIN.index(primary_model)
+        return list(MODEL_FALLBACK_CHAIN[index + 1 :])
+    return list(MODEL_FALLBACK_CHAIN)
+
+
+async def run_with_model_fallback(
+    primary_model: str,
+    call_async: Callable[[str], Awaitable[Any]],
+    *,
+    label: str = "Stage 4 LLM 调用",
+) -> Any:
+    """按 :data:`MODEL_FALLBACK_CHAIN` 执行一次带降级的模型调用。
+
+    ``call_async(model)`` 接收实际使用的模型名、返回 awaitable；只有模型访问类
+    错误（见 :func:`is_model_access_error`）才换下一个候选，其余异常原样抛出，
+    候选耗尽后抛出最后一次异常。
+    """
+    candidates = _fallback_candidates(primary_model)
+    current = primary_model
+    while True:
+        try:
+            return await call_async(current)
+        except Exception as exc:  # noqa: BLE001 - 按错误类型决定是否降级
+            if not is_model_access_error(exc) or not candidates:
+                raise
+            next_model = candidates.pop(0)
+            print(
+                f"[s4_scriptwriter] 告警：{label} 模型 {current} 不可用"
+                f"（{type(exc).__name__}: {exc}），自动回退到 {next_model}",
+                file=sys.stderr,
+            )
+            current = next_model
 #: Patch v2.6-5：顺位校验失败后，把错误详情打回模型重写的最大次数。
 ALIGNMENT_MAX_RETRIES = 2
 #: ``ScriptBeat.focus_hint`` 的合法取值（与 schemas 保持一致）。
@@ -894,20 +974,41 @@ def split_mixed_quote_beats(
             else:
                 # 紧跟在另一段引号后面（「…！”“立刻带着…！”」）→ 同一人接着说。
                 role = prev_quote_role or speaker_role
-            prev_quote_role = role
+            # Patch v3.4 Patch 17：心理独白保留旁白。
+            #
+            # 引号前导文本命中心理活动关键词（「他心想：…」「他心里盘算…」）时，
+            # 引号里的是心里话而不是角色开口，保持旁白声线朗读，不切角色音色。
+            thought_lead = lead_before if lead_before.strip() else lead_in
+            if is_psychological_lead(thought_lead):
+                role = "narrator"
+            elif (
+                not lead_before.strip()
+                and quote_char_count(inner) < MIN_DIALOGUE_CHARS
+            ):
+                # 短促拟声（「嗯？」「……！」）没有说话人：没有引导词时留在旁白声线，
+                # 也不继承上一段引号的角色。有明确引导词的短句（「道振说：“别怕。”」）
+                # 仍归该角色——Patch v3.2 的旧契约不变。
+                role = "narrator"
+            if role != "narrator":
+                # 只有认出了具体角色才记住他（心理独白不参与「同一人接着说」推断）。
+                prev_quote_role = role
             child = dict(beat)
             child["narration_text"] = f"“{inner}”"
             child["tts_text"] = _derive_tts_text(inner, original_tts_text)
             child["speaker_role"] = role
-            child["speaker_gender"] = _resolve_speaker_gender(
-                role, gender_index, coerce_str(beat.get("speaker_gender"))
-            )
+            if role == "narrator":
+                child["speaker_gender"] = "unknown"
+            else:
+                child["speaker_gender"] = _resolve_speaker_gender(
+                    role, gender_index, coerce_str(beat.get("speaker_gender"))
+                )
             child["pause_after_ms"] = pause
             result.append(child)
 
     for index, beat in enumerate(result, start=1):
         beat["beat_id"] = f"b{index}"
     return result
+
 
 
 def _format_character(character: object) -> str:
@@ -1051,12 +1152,17 @@ async def _write_overview(
             "BASE_SOURCE": context.base_source,
         },
     )
-    response = await client.chat(
-        [ChatMessage(role="user", content=prompt)],
-        model=model,
-        temperature=temperature,
-        max_tokens=OVERVIEW_MAX_TOKENS,
-        **_NO_THINKING_KWARGS,
+    # Patch v3.3 Patch 15：新模型未开通时按 MODEL_FALLBACK_CHAIN 自动降级。
+    response = await run_with_model_fallback(
+        model,
+        lambda chosen: client.chat(
+            [ChatMessage(role="user", content=prompt)],
+            model=chosen,
+            temperature=temperature,
+            max_tokens=OVERVIEW_MAX_TOKENS,
+            **_NO_THINKING_KWARGS,
+        ),
+        label="Stage 4 整话概览",
     )
     data = parse_json_response(response.content, finish_reason=response.finish_reason)
     if not isinstance(data, dict):
@@ -1094,12 +1200,17 @@ async def _write_story_draft(
             "BASE_SOURCE": context.base_source,
         },
     )
-    response = await client.chat(
-        [ChatMessage(role="user", content=prompt)],
-        model=model,
-        temperature=temperature,
-        max_tokens=STORY_DRAFT_MAX_TOKENS,
-        **_NO_THINKING_KWARGS,
+    # Patch v3.3 Patch 15：qwen4-max 未开通时自动降级到 qwen3.8-max/qwen-plus。
+    response = await run_with_model_fallback(
+        model,
+        lambda chosen: client.chat(
+            [ChatMessage(role="user", content=prompt)],
+            model=chosen,
+            temperature=temperature,
+            max_tokens=STORY_DRAFT_MAX_TOKENS,
+            **_NO_THINKING_KWARGS,
+        ),
+        label="Stage 4A 故事反写",
     )
     data = parse_json_response(response.content, finish_reason=response.finish_reason)
     if not isinstance(data, dict):
@@ -1263,12 +1374,17 @@ async def _write_narration_chapter(
         },
     )
     try:
-        response = await client.chat(
-            [ChatMessage(role="user", content=prompt)],
-            model=model,
-            temperature=temperature,
-            max_tokens=NARRATE_MAX_TOKENS,
-            **_NO_THINKING_KWARGS,
+        # Patch v3.3 Patch 15：4B 拆拍同样享受新模型未开通降级保护。
+        response = await run_with_model_fallback(
+            model,
+            lambda chosen: client.chat(
+                [ChatMessage(role="user", content=prompt)],
+                model=chosen,
+                temperature=temperature,
+                max_tokens=NARRATE_MAX_TOKENS,
+                **_NO_THINKING_KWARGS,
+            ),
+            label="Stage 4B 章节拆拍",
         )
         data = parse_json_response(response.content, finish_reason=response.finish_reason)
     except LLMTruncatedError as exc:
@@ -1685,6 +1801,13 @@ async def write_episode_script(
             merged_beats, characters=context.characters
         )
 
+        # Patch v3.4 Patch 17：相邻重复对白去重（同一句连说两遍）+ 连续对白
+        # 说话人继承（没写「XX说：」的纯引号对白继承上一句的说话人）。
+        merged_beats = deduplicate_adjacent_beats(merged_beats)
+        merged_beats = apply_dialogue_speaker_inheritance(merged_beats)
+        for index, beat in enumerate(merged_beats, start=1):
+            beat["beat_id"] = f"b{index}"
+
         errors = chapter_errors
         errors += validate_beat_alignment(
             merged_beats,
@@ -1988,11 +2111,15 @@ def build_arc_compressor(
             "下面是某部漫画连续若干话的剧情详摘，请压缩成一段不超过 "
             f"{max_chars} 字的阶段性剧情摘要，保留关键转折与人物变化，不要评价、不要抒情。\n\n{raw}"
         )
-        response = await client.chat(
-            [ChatMessage(role="user", content=prompt)],
-            model=model,
-            temperature=0.3,
-            **_NO_THINKING_KWARGS,
+        response = await run_with_model_fallback(
+            model,
+            lambda chosen: client.chat(
+                [ChatMessage(role="user", content=prompt)],
+                model=chosen,
+                temperature=0.3,
+                **_NO_THINKING_KWARGS,
+            ),
+            label="篇章记忆压缩",
         )
         text = response.content.strip()
         if len(text) > max_chars:

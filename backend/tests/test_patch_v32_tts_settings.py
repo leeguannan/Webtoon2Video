@@ -302,17 +302,19 @@ async def test_trim_silence_actually_shortens_duration(tmp_path: Path) -> None:
 
 @pytest.mark.anyio
 async def test_generate_voice_samples_idempotent(tmp_path: Path) -> None:
+    from providers.tts_qwen import QWEN3_VOICE_IDS
     from scripts import init_voice_samples
 
     client = _FakeTTS()
     out = tmp_path / "voice_samples"
     results = await init_voice_samples.generate_voice_samples(out, client=client)
 
-    assert len(results) == 13
+    # Patch v3.3 Patch 15：音色表从 13 个扩到 34 个，默认全量生成。
+    assert len(results) == len(QWEN3_VOICE_IDS)
     assert all(path.is_file() for path in results.values())
-    assert len(client.calls) == 13  # 首次：13 个音色各合成一次
+    assert len(client.calls) == len(QWEN3_VOICE_IDS)  # 首次：每个音色各合成一次
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
-    assert len(manifest["voices"]) == 13
+    assert len(manifest["voices"]) == len(QWEN3_VOICE_IDS)
     assert manifest["voices"]["Elias"]["file"] == "Elias.wav"
 
     # 第二次运行：全部跳过，零新增合成。
@@ -374,10 +376,13 @@ def _register_series(workspace: Path) -> str:
 
 
 def test_list_tts_voices_endpoint(client: TestClient) -> None:
+    from providers.tts_qwen import QWEN3_VOICE_IDS
+
     response = client.get("/api/tts/voices")
     assert response.status_code == 200
     voices = response.json()["voices"]
-    assert len(voices) == 13
+    # Patch v3.3 Patch 15：音色表已扩充到 34 个。
+    assert len(voices) == len(QWEN3_VOICE_IDS)
     ids = {item["id"] for item in voices}
     assert {"Elias", "Ethan", "Moon", "Kai", "Ryan", "Marcus", "Cherry", "Serena", "Maia",
             "Katerina", "Vivian", "Chelsie", "Bella"} <= ids
@@ -415,6 +420,8 @@ def test_tts_sample_serves_file_when_present(client: TestClient, tmp_path: Path,
 
 
 def test_series_tts_config_roundtrip(client: TestClient, workspace: Path) -> None:
+    from providers.tts_qwen import QWEN3_VOICE_IDS
+
     series_id = _register_series(workspace)
 
     # GET：默认模板。
@@ -424,7 +431,7 @@ def test_series_tts_config_roundtrip(client: TestClient, workspace: Path) -> Non
     assert payload["narrator"] == {"voice": "Elias", "speed": 1.18}
     assert payload["default_male"]["voice"] == "Ethan"
     assert isinstance(payload["characters"], list)
-    assert len(payload["voices"]) == 13
+    assert len(payload["voices"]) == len(QWEN3_VOICE_IDS)
 
     # PUT：只改 narrator + 一个角色音色。
     put_body = {

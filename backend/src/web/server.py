@@ -24,11 +24,13 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import time
 import zipfile
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import quote
 
 import yaml
 from fastapi import FastAPI, HTTPException, Query
@@ -41,6 +43,7 @@ from sse_starlette.sse import EventSourceResponse
 from core.config import (
     AppConfig,
     ConfigError,
+    SeriesTTSConfig,
     WorkspaceConfig,
     assets_root,
     find_config_path,
@@ -48,6 +51,8 @@ from core.config import (
     load_env_file,
     load_series_config,
     merge_series_tts,
+    recommended_voice_for_tts_model,
+    resolve_voice_for_tts_model,
 )
 from core.manifest import ManifestManager, infer_stage_artifacts, infer_stage_status
 from core.schemas import (
@@ -63,8 +68,19 @@ from core.schemas import (
     load_model,
     save_model,
 )
-from providers.tts_qwen import BAILIAN_VOICE_CATALOG, BAILIAN_VOICE_IDS, DEFAULT_VOICE
-from stages import s0_catalog, s6_timeline, s7_renderer
+from providers.tts_minimax import (
+    MINIMAX_FEMALE_VOICE_IDS,
+    MINIMAX_MALE_VOICE_IDS,
+    MINIMAX_NARRATOR_VOICE_IDS,
+    MINIMAX_VOICES,
+    voice_sample_filename as minimax_voice_sample_filename,
+)
+from providers.tts_qwen import (
+    DEFAULT_VOICE,
+    QWEN3_TTS_VOICES,
+    voice_sample_filename,
+)
+from stages import s0_catalog, s5_tts, s6_timeline, s7_renderer
 from web.job_runner import STAGE_DEFS, EpisodeState, JobError, JobRunner
 
 #: 面板图片后缀。
@@ -75,19 +91,45 @@ PANEL_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp"})
 DEFAULT_TTS_VOICE = DEFAULT_VOICE
 DEFAULT_MAX_IMAGE_LONG_EDGE = 1280
 
-#: 可选音色清单（前端下拉展示用）：音色 ID → 中文说明。
-#: Patch v3.1 Patch 11 A1：与 ``core.config.TTSConfig.voice_cast`` 的五个主音色一致。
-#: Patch v3.2 Patch 13 C2：升级为百炼官方 13 个音色（说明取自音色表）。
+#: 可选音色清单（前端下拉展示用）：全量 34 个官方音色的精简条目。
+#: Patch v3.2 Patch 13 C2：百炼官方 13 个音色；Patch v3.3 Patch 15：扩充至 34 个
+#: （含方言/戏剧音色），目录外官方 ID 仍可手填透传，只是没有静态试听样例。
 TTS_VOICE_OPTIONS: tuple[dict[str, str], ...] = tuple(
     {
-        "id": str(item["id"]),
-        "label": f"{item['name']}（{item['traits']}）",
+        "id": str(item["voice_id"]),
+        "label": f"{item['display_name']}（{item['description']}）",
     }
-    for item in BAILIAN_VOICE_CATALOG
+    for item in QWEN3_TTS_VOICES
 )
 
 #: 试听样例目录名（相对 ``backend/assets/``）。
 VOICE_SAMPLES_DIR_NAME = "voice_samples"
+
+#: Patch v3.4 Patch 16：试听样例按供应商分目录（``voice_samples/{provider}/``），
+#: 避免百炼与 MiniMax 的同名文件互相覆盖。
+VOICE_SAMPLE_PROVIDERS: tuple[str, ...] = ("qwen", "minimax")
+
+#: Patch v3.4 Patch 16：TTS 模型下拉（百炼 / MiniMax / Edge 三套 provider）。
+TTS_MODEL_OPTIONS: tuple[str, ...] = (
+    "qwen3-tts-flash",
+    "qwen-audio-3.1-tts-plus",
+    "speech-2.8-hd",
+    "speech-2.8-turbo",
+    "edge-tts",
+)
+
+#: Stage 4 模型下拉推荐项（Patch v3.3 Patch 15：新增 qwen4-max / qwen3.7-plus）。
+STORY_MODEL_OPTIONS: tuple[str, ...] = (
+    "qwen4-max",
+    "qwen3.8-max",
+    "qwen3.7-plus",
+    "qwen-plus",
+)
+SCRIPT_MODEL_OPTIONS: tuple[str, ...] = (
+    "qwen3.7-plus",
+    "qwen-plus",
+    "qwen3.8-max",
+)
 
 
 def voice_sample_dir() -> Path:
@@ -95,29 +137,144 @@ def voice_sample_dir() -> Path:
     return assets_root() / VOICE_SAMPLES_DIR_NAME
 
 
+def _safe_provider_dir(provider: str) -> str:
+    """供应商目录名安全化（只允许字母/数字/下划线/连字符）。"""
+    return re.sub(r"[^A-Za-z0-9_\-]+", "", (provider or "").strip())
+
+
+def provider_voice_sample_dir(provider: str) -> Path:
+    """某供应商的样例目录：``backend/assets/voice_samples/{provider}/``。"""
+    return voice_sample_dir() / _safe_provider_dir(provider)
+
+
 def voice_sample_path(voice_id: str) -> Path | None:
-    """某个音色的试听样例路径；音色 ID 非法时返回 ``None``。"""
-    if voice_id not in set(BAILIAN_VOICE_IDS):
+    """某个音色的试听样例路径。
+
+    Patch v3.3 Patch 15：目录外的百炼官方音色 ID 也允许手填使用，因此不再以
+    音色表枚举拒收；统一经 :func:`voice_sample_filename` 安全化，含空格的
+    ``Eldric Sage`` 与下划线写法 ``Eldric_Sage`` 解析到同一文件。
+    """
+    cleaned = voice_id.strip()
+    if not cleaned:
         return None
-    return voice_sample_dir() / f"{voice_id}.wav"
+    return voice_sample_dir() / voice_sample_filename(cleaned)
+
+
+def minimax_voice_sample_path(voice_id: str) -> Path | None:
+    """MiniMax 音色的试听样例路径（``voice_samples/minimax/``）。"""
+    cleaned = voice_id.strip()
+    if not cleaned:
+        return None
+    return provider_voice_sample_dir("minimax") / minimax_voice_sample_filename(cleaned)
+
+
+def provider_voice_sample_candidates(provider: str, voice_id: str) -> list[Path]:
+    """某供应商音色的样例候选路径：供应商目录优先，回退旧的扁平目录。"""
+    cleaned = voice_id.strip()
+    name = _safe_provider_dir(provider)
+    if not cleaned or not name:
+        return []
+    filename = (
+        minimax_voice_sample_filename(cleaned)
+        if name == "minimax"
+        else voice_sample_filename(cleaned)
+    )
+    return [provider_voice_sample_dir(name) / filename, voice_sample_dir() / filename]
+
+
+def provider_voice_sample_path(provider: str, voice_id: str) -> Path | None:
+    """按供应商解析样例路径（供应商目录优先）。"""
+    candidates = provider_voice_sample_candidates(provider, voice_id)
+    return candidates[0] if candidates else None
+
+
+def _sample_ready(*candidates: Path | None) -> bool:
+    """任一候选样例文件存在即视为就绪。"""
+    for candidate in candidates:
+        if candidate is not None and candidate.is_file():
+            return True
+    return False
 
 
 def voice_options_payload() -> list[dict[str, Any]]:
-    """音色清单（前端下拉 + 试听按钮用）。"""
+    """音色清单（前端分组下拉 + 试听按钮用）。"""
     payload: list[dict[str, Any]] = []
-    for item in BAILIAN_VOICE_CATALOG:
+    for item in QWEN3_TTS_VOICES:
+        voice_id = str(item["voice_id"])
+        payload.append(
+            {
+                # 规范字段（Patch v3.3 结构）
+                "voice_id": voice_id,
+                "display_name": str(item["display_name"]),
+                "gender": str(item["gender"]),
+                "age_group": str(item["age_group"]),
+                "category": str(item["category"]),
+                "description": str(item["description"]),
+                # Patch v3.4 Patch 16：供应商标记，前端据此分组，避免把两套
+                # provider 的音色混进同一个 optgroup。
+                "provider": "qwen",
+                # 兼容别名（前端既有字段名，避免重复口径）
+                "id": voice_id,
+                "name": str(item["display_name"]),
+                "label": f"{item['display_name']}（{item['description']}）",
+                # Patch v3.3 Patch 15：带空格的音色 ID 做 URL 编码（Eldric Sage →
+                # /api/tts/samples/Eldric%20Sage），路由侧再安全化回 Eldric_Sage.wav。
+                "sample_url": f"/api/tts/samples/{quote(voice_id, safe='')}",
+                # Patch v3.4 Patch 16：供应商目录优先，旧扁平目录仍兼容。
+                "sample_ready": _sample_ready(
+                    provider_voice_sample_path("qwen", voice_id),
+                    voice_sample_path(voice_id),
+                ),
+            }
+        )
+    return payload
+
+
+def _minimax_voice_category(voice_id: str) -> str:
+    """MiniMax 音色归类（前端按类分组展示）。
+
+    narrator=推荐说书旁白、male=男角色、female=女角色。
+    """
+    if voice_id in MINIMAX_NARRATOR_VOICE_IDS:
+        return "narrator"
+    if voice_id in MINIMAX_MALE_VOICE_IDS:
+        return "male"
+    if voice_id in MINIMAX_FEMALE_VOICE_IDS:
+        return "female"
+    return "other"
+
+
+def minimax_voice_options_payload() -> list[dict[str, Any]]:
+    """MiniMax 音色清单（Patch v3.4 Patch 16，28 条）。
+
+    与百炼清单分开暴露，避免前端把两套 provider 的音色混在一起
+    （百炼音色发给 MiniMax 会直接 2013 invalid voice_id）。
+    """
+    payload: list[dict[str, Any]] = []
+    for item in MINIMAX_VOICES:
         voice_id = str(item["id"])
         payload.append(
             {
-                "id": voice_id,
-                "label": f"{item['name']}（{item['traits']}）",
-                "name": str(item["name"]),
+                "voice_id": voice_id,
+                "display_name": str(item["name"]),
                 "gender": str(item["gender"]),
-                "traits": str(item["traits"]),
-                "use_case": str(item["use_case"]),
-                "sample_url": f"/api/tts/samples/{voice_id}",
-                "sample_ready": voice_sample_path(voice_id) is not None
-                and voice_sample_path(voice_id).is_file(),
+                "style": str(item["style"]),
+                "recommended_for": str(item["recommended_for"]),
+                # Patch v3.4 Patch 16：与百炼条目同构的分类/描述字段，
+                # 前端一套渲染逻辑即可同时渲染两套清单。
+                "category": _minimax_voice_category(voice_id),
+                "age_group": "adult",
+                "description": f"{item['style']}，{item['recommended_for']}",
+                "provider": "minimax",
+                # 兼容别名（与百炼条目同构，前端可复用一套渲染逻辑）
+                "id": voice_id,
+                "name": str(item["name"]),
+                "label": f"{item['name']}（{item['style']}）",
+                "sample_url": f"/api/tts/samples/minimax/{quote(voice_id, safe='')}",
+                "sample_ready": _sample_ready(
+                    provider_voice_sample_path("minimax", voice_id),
+                    minimax_voice_sample_path(voice_id),
+                ),
             }
         )
     return payload
@@ -235,6 +392,8 @@ class ConfigUpdateRequest(BaseModel):
     bailianBaseUrl: str | None = None
     visionModel: str | None = None
     scriptModel: str | None = None
+    #: Patch v3.3 Patch 15：Stage 4A 说书体模型（qwen4-max / qwen3.8-max …）。
+    storyModel: str | None = None
     ttsModel: str | None = None
     ttsVoice: str | None = None
     maxImageLongEdge: int | None = None
@@ -523,24 +682,70 @@ class WorkspaceView:
         except Exception:  # noqa: BLE001 - 剧本损坏时按无解说处理
             return []
         durations = self._audio_durations(episode_dir)
+        assignment_ctx = self._voice_assignment_context(series_id)
         result: list[dict[str, Any]] = []
         for beat in script.beats:
-            result.append(
-                {
-                    "beat_id": beat.beat_id,
-                    "narration_text": beat.narration_text,
-                    "tts_text": beat.tts_text or "",
-                    "emotion_instruction": beat.emotion_instruction,
-                    "target_panel_ids": list(beat.target_panel_ids),
-                    "motion": getattr(beat.motion, "value", beat.motion),
-                    "pause_after_ms": beat.pause_after_ms,
-                    "audio_duration_ms": durations.get(beat.beat_id, 0),
-                    "speaker_role": beat.speaker_role,
-                    "sfx_cue": beat.sfx_cue,
-                    "focus_hint": beat.focus_hint,
-                }
-            )
+            item: dict[str, Any] = {
+                "beat_id": beat.beat_id,
+                "narration_text": beat.narration_text,
+                "tts_text": beat.tts_text or "",
+                "emotion_instruction": beat.emotion_instruction,
+                "target_panel_ids": list(beat.target_panel_ids),
+                "motion": getattr(beat.motion, "value", beat.motion),
+                "pause_after_ms": beat.pause_after_ms,
+                "audio_duration_ms": durations.get(beat.beat_id, 0),
+                "speaker_role": beat.speaker_role,
+                "speaker_gender": str(getattr(beat, "speaker_gender", "") or ""),
+                "sfx_cue": beat.sfx_cue,
+                "focus_hint": beat.focus_hint,
+            }
+            if assignment_ctx is not None:
+                item["resolved_voice"] = self._resolved_voice(beat, assignment_ctx)
+            result.append(item)
         return result
+
+    def _voice_assignment_context(
+        self, series_id: str
+    ) -> tuple[SeriesTTSConfig, list[CharacterProfile], dict[str, str]] | None:
+        """解析「这条 beat 用哪个音色」所需的上下文。
+
+        与 Stage 5 保持同一份输入：作品级配音模板（合并全局）+ StoryBible 角色表
+        + 旧槽位音色表。这样审核台显示的「本句配音」就是 Stage 5 真正会用的音色。
+        """
+        try:
+            series_dir = self.registry.series_dir(series_id)
+        except Exception:  # noqa: BLE001 - 作品目录缺失时按「无法解析」处理
+            return None
+        try:
+            series_config = load_series_config(series_dir)
+        except Exception:  # noqa: BLE001 - 作品级配置损坏时退回全局模板
+            series_config = None
+        merged = merge_series_tts(self.config.tts, series_config.tts)
+        characters = s5_tts.load_bible_characters(series_dir)
+        return merged, characters, dict(self.config.tts.voice_cast)
+
+    def _resolved_voice(
+        self,
+        beat: ScriptBeat,
+        assignment_ctx: tuple[SeriesTTSConfig, list[CharacterProfile], dict[str, str]],
+    ) -> dict[str, Any]:
+        """算出这条 beat 的「音色 + 语速 + 来源」，供审核台显示与核对。"""
+        series_tts, characters, voice_cast = assignment_ctx
+        assignment = s5_tts.resolve_beat_voice_assignment(
+            beat,
+            series_tts=series_tts,
+            characters=characters,
+            default_voice=self.config.tts.default_voice,
+            voice_cast=voice_cast,
+        )
+        return {
+            "voice": assignment.spec.voice,
+            "speed": assignment.spec.speed,
+            "source": assignment.source,
+            "label": assignment.label,
+            "role": assignment.role,
+            "gender": assignment.gender,
+        }
 
     @staticmethod
     def _audio_durations(episode_dir: Path) -> dict[str, int]:
@@ -632,7 +837,12 @@ def create_app(
     app.state.runner = job_runner
     app.state.view = view
     # 配置文件位置：优先既有配置，否则落在工作区根（便于多工作区与测试隔离）。
-    app.state.config_path = find_config_path() or (workspace_root / "config.yaml")
+    # Patch v3.4 Patch 16：显式传入配置（测试 / 嵌入式场景）时写工作区自己的
+    # config.yaml，避免覆盖仓库里的真实部署配置。
+    if config is None:
+        app.state.config_path = find_config_path() or (workspace_root / "config.yaml")
+    else:
+        app.state.config_path = workspace_root / "config.yaml"
 
     def _reload_config() -> AppConfig:
         """重新读取磁盘配置并刷新内存态（工作区根目录保持不变）。"""
@@ -693,21 +903,51 @@ def create_app(
     # ------------------------------------------------------------------
     @app.get("/api/tts/voices")
     async def list_tts_voices() -> dict[str, Any]:
-        """百炼 13 个官方音色 + 试听样例是否就绪。"""
-        return {"voices": voice_options_payload()}
+        """百炼官方音色 + 试听样例是否就绪 + MiniMax 音色清单（Patch v3.4 Patch 16）。"""
+        return {
+            "voices": voice_options_payload(),
+            "minimax_voices": minimax_voice_options_payload(),
+        }
 
     @app.get("/api/tts/samples/{voice_id}")
     async def get_tts_sample(voice_id: str) -> FileResponse:
-        """试听样例音频（静态文件，浏览器用 ``playbackRate`` 变速播放）。"""
-        path = voice_sample_path(voice_id)
-        if path is None:
+        """试听样例音频（静态文件，浏览器用 ``playbackRate`` 变速播放）。
+
+        Patch v3.4 Patch 16：按百炼供应商解析（``voice_samples/qwen/`` 优先，
+        旧的扁平目录回退），因此旧链接在分供应商布局下依然可用。
+        """
+        candidates = provider_voice_sample_candidates("qwen", voice_id)
+        if not candidates:
             raise HTTPException(status_code=404, detail=f"未知音色：{voice_id}")
-        if not path.is_file():
-            raise HTTPException(
-                status_code=404,
-                detail=f"音色 {voice_id} 还没有试听样例，请先运行 backend/scripts/init_voice_samples.py",
-            )
-        return FileResponse(path, media_type="audio/wav", filename=f"{voice_id}.wav")
+        for candidate in candidates:
+            if candidate.is_file():
+                # Patch v3.3 Patch 15：含空格的 ID（Eldric Sage）下载名也走安全文件名。
+                return FileResponse(candidate, media_type="audio/wav", filename=candidate.name)
+        raise HTTPException(
+            status_code=404,
+            detail=f"音色 {voice_id} 还没有试听样例，请先运行 backend/scripts/init_voice_samples.py",
+        )
+
+    @app.get("/api/tts/samples/{provider}/{voice_id}")
+    async def get_tts_provider_sample(provider: str, voice_id: str) -> FileResponse:
+        """按供应商试听（Patch v3.4 Patch 16）。
+
+        路径形如 ``/api/tts/samples/minimax/Chinese%20(Mandarin)_Radio_Host``；
+        样例按供应商隔离在 ``voice_samples/{provider}/``，旧的扁平目录仍可回退。
+        """
+        name = _safe_provider_dir(provider)
+        if name not in VOICE_SAMPLE_PROVIDERS:
+            raise HTTPException(status_code=404, detail=f"未知供应商：{provider}")
+        candidates = provider_voice_sample_candidates(name, voice_id)
+        if not candidates:
+            raise HTTPException(status_code=404, detail=f"未知音色：{voice_id}")
+        for candidate in candidates:
+            if candidate.is_file():
+                return FileResponse(candidate, media_type="audio/wav", filename=candidate.name)
+        raise HTTPException(
+            status_code=404,
+            detail=f"音色 {voice_id} 还没有试听样例，请先运行 backend/scripts/init_voice_samples.py --provider {name}",
+        )
 
     @app.get("/api/series/{series_id}/tts-config")
     async def get_series_tts_config(series_id: str) -> dict[str, Any]:
@@ -968,8 +1208,24 @@ def create_app(
             models["vision"] = payload.visionModel
         if payload.scriptModel:
             models["script"] = payload.scriptModel
+        if payload.storyModel:
+            # Patch v3.3 Patch 15：4A 故事模型可在 Web 端切换（留空则回退 script）。
+            models["story_model"] = payload.storyModel
         if payload.ttsModel:
             models["tts"] = payload.ttsModel
+            # Patch v3.4 Patch 16：切换 TTS provider 时原音色可能属于另一家
+            # （百炼音色发给 MiniMax 会直接 2013 invalid voice_id），不兼容时
+            # 自动换成新模型的推荐旁白音色。
+            if not payload.ttsVoice:
+                current_voice = str(tts.get("default_voice") or DEFAULT_TTS_VOICE).strip()
+                if (
+                    current_voice
+                    and resolve_voice_for_tts_model(
+                        current_voice, tts_model=payload.ttsModel
+                    )
+                    != current_voice
+                ):
+                    tts["default_voice"] = recommended_voice_for_tts_model(payload.ttsModel)
         if payload.bgmDuckingDb is not None:
             render["bgm_gain_db"] = float(payload.bgmDuckingDb)
         if payload.ttsVoice:
@@ -1067,12 +1323,27 @@ def _config_payload(config: AppConfig) -> dict[str, Any]:
         "bailianBaseUrl": config.api.base_url,
         "visionModel": config.models.vision,
         "scriptModel": config.models.script,
+        # Patch v3.3 Patch 15：4A 故事模型与 Stage 4 模型下拉推荐项。
+        "storyModel": config.models.story_model,
+        "storyModelOptions": list(STORY_MODEL_OPTIONS),
+        "scriptModelOptions": list(SCRIPT_MODEL_OPTIONS),
         "ttsModel": config.models.tts,
+        # Patch v3.4 Patch 16：TTS 模型下拉（百炼 / MiniMax / Edge）。
+        "ttsModelOptions": list(TTS_MODEL_OPTIONS),
         # Patch v3.1 Patch 11 A1/A2：默认音色来自 ``config.tts.default_voice``，
         # 没有配置时退回 provider 的系统默认音色（``Elias``）。
-        "ttsVoice": config.tts.default_voice or DEFAULT_TTS_VOICE,
+        # Patch v3.4 Patch 16：回显按当前 TTS 模型做跨模型兜底（百炼音色发给
+        # MiniMax 会直接 2013 invalid voice_id，这里提前换成 MiniMax 音色）。
+        "ttsVoice": resolve_voice_for_tts_model(
+            config.tts.default_voice or DEFAULT_TTS_VOICE,
+            tts_model=config.models.tts,
+        ),
         # Patch v3.1 Patch 11 A1：可选音色清单，供前端下拉展示。
-        "ttsVoiceOptions": [dict(item) for item in TTS_VOICE_OPTIONS],
+        # Patch v3.4 Patch 16：改为完整条目（带 sample_url/sample_ready），
+        # 前端才能在全局配置页直接试听百炼音色。
+        "ttsVoiceOptions": voice_options_payload(),
+        # Patch v3.4 Patch 16：MiniMax 音色清单单独下发，避免两套 provider 混用。
+        "minimaxVoiceOptions": minimax_voice_options_payload(),
         "maxImageLongEdge": DEFAULT_MAX_IMAGE_LONG_EDGE,
         "aspectRatio": config.video.aspect_ratio,
         "bgmDuckingDb": config.render.bgm_gain_db,
@@ -1121,6 +1392,9 @@ def _series_tts_payload(
         },
         "characters": characters,
         "voices": voice_options_payload(),
+        # Patch v3.4 Patch 16：MiniMax 28 音色一并下发，前端作品配音面板
+        # 才能选到 MiniMax 音色并直接试听（百炼音色发给 MiniMax 会 2013）。
+        "minimax_voices": minimax_voice_options_payload(),
     }
 
 
