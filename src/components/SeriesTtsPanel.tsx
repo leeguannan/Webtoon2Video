@@ -1,17 +1,25 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronDown, Loader2, Play, Save, Square, Volume2 } from 'lucide-react';
+import React, { useEffect, useMemo, useState } from 'react';
+import { ChevronDown, Loader2, Save, Volume2 } from 'lucide-react';
 import type {
   SeriesTtsConfig,
   SeriesTtsConfigResponse,
   VoiceOption,
   VoiceSpec,
 } from '../types/studio';
+import {
+  VoicePreviewButton,
+  VoiceSelect,
+  findVoiceOption,
+  useVoicePreview,
+} from './VoicePicker';
 
 /**
- * 作品级配音设置面板（Patch v3.2 Patch 13）。
+ * 作品级配音设置面板（Patch v3.2 Patch 13；Patch v3.3 Patch 15 升级 34 音色；
+ * Patch v3.4 Patch 16 接入 MiniMax 28 音色）。
  *
  * 四块设置：讲解者 / 通用男声 / 通用女声 / 已识别角色专属音色。
- * 每块 = 音色下拉（13 个百炼官方音色）+ 语速滑块 + 试听样例按钮。
+ * 每块 = 音色选择（百炼 34 + MiniMax 28，可手填目录外音色 ID）
+ * + 语速滑块 + 试听样例按钮。
  *
  * 试听**只播放后端预生成的静态样例**，用 ``audio.playbackRate`` 实时变速，
  * 点击试听或拖动滑块都不会调用 TTS 合成接口。
@@ -51,7 +59,7 @@ const VoiceCard: React.FC<VoiceCardProps> = ({
   onPreview,
   onStop,
 }) => {
-  const option = voices.find((item) => item.id === spec.voice);
+  const option = findVoiceOption(voices, spec.voice);
   const sampleReady = option?.sample_ready ?? false;
   return (
     <div className="rounded-lg border border-slate-200 bg-white p-4 space-y-3">
@@ -68,17 +76,17 @@ const VoiceCard: React.FC<VoiceCardProps> = ({
       <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_220px] gap-3">
         <label className="block">
           <span className="block text-xs text-slate-500 mb-1">音色</span>
-          <select
+          <VoiceSelect
             value={spec.voice}
-            onChange={(e) => onChange({ ...spec, voice: e.target.value })}
-            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none cursor-pointer"
-          >
-            {voices.map((item) => (
-              <option key={item.id} value={item.id}>
-                {item.label}
-              </option>
-            ))}
-          </select>
+            voices={voices}
+            ariaLabel={`${title}音色`}
+            onChange={(voice) => onChange({ ...spec, voice })}
+          />
+          <span className="block text-[11px] text-slate-400 mt-1 truncate">
+            {option
+              ? `${option.description}`
+              : `目录外音色 ID：${spec.voice}（无静态样例，无法试听）`}
+          </span>
         </label>
 
         <label className="block">
@@ -99,35 +107,12 @@ const VoiceCard: React.FC<VoiceCardProps> = ({
         </label>
       </div>
 
-      <div className="flex items-center gap-2">
-        {playing ? (
-          <button
-            type="button"
-            onClick={onStop}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-red-700 bg-red-50 border border-red-200 rounded-lg hover:bg-red-100 transition-colors cursor-pointer"
-          >
-            <Square className="w-3.5 h-3.5" />
-            停止试听
-          </button>
-        ) : (
-          <button
-            type="button"
-            disabled={!sampleReady}
-            title={sampleReady ? '播放静态试听样例（按当前语速变速，不调用 TTS）' : '样例未生成，请先运行 init_voice_samples.py'}
-            onClick={() => onPreview(spec)}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-blue-700 bg-blue-50 border border-blue-200 rounded-lg hover:bg-blue-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
-          >
-            <Play className="w-3.5 h-3.5" />
-            试听样例
-          </button>
-        )}
-        {!sampleReady && (
-          <span className="text-[11px] text-amber-600 inline-flex items-center gap-1">
-            <Volume2 className="w-3 h-3" />
-            样例未生成
-          </span>
-        )}
-      </div>
+      <VoicePreviewButton
+        playing={playing}
+        sampleReady={sampleReady}
+        onPreview={() => onPreview(spec)}
+        onStop={onStop}
+      />
     </div>
   );
 };
@@ -140,8 +125,19 @@ export const SeriesTtsPanel: React.FC<SeriesTtsPanelProps> = ({ seriesId }) => {
   const [error, setError] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
   const [savedAt, setSavedAt] = useState<string | null>(null);
-  const [playingKey, setPlayingKey] = useState<string | null>(null);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const { playingKey, preview: previewSample, stop: stopPreview } = useVoicePreview(setError);
+
+  /** Patch v3.4 Patch 16：百炼 34 + MiniMax 28 合并成一份候选清单。 */
+  const voiceOptions: VoiceOption[] = useMemo(
+    () => [...(data?.voices ?? []), ...(data?.minimax_voices ?? [])],
+    [data],
+  );
+
+  /** 试听静态样例：只设置 playbackRate，绝不调用 TTS 合成接口。 */
+  const preview = (key: string, spec: VoiceSpec) => {
+    if (!data) return;
+    previewSample(key, spec, voiceOptions);
+  };
 
   const load = async () => {
     setLoading(true);
@@ -166,35 +162,6 @@ export const SeriesTtsPanel: React.FC<SeriesTtsPanelProps> = ({ seriesId }) => {
     return () => stopPreview();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
-
-  const stopPreview = () => {
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current = null;
-    }
-    setPlayingKey(null);
-  };
-
-  /** 试听静态样例：只设置 playbackRate，绝不调用 TTS 合成接口。 */
-  const preview = (key: string, spec: VoiceSpec) => {
-    if (!data) return;
-    const option = data.voices.find((item) => item.id === spec.voice);
-    if (!option?.sample_ready) return;
-    stopPreview();
-    const audio = new Audio(option.sample_url);
-    audio.playbackRate = spec.speed;
-    audio.onended = () => setPlayingKey(null);
-    audio.onerror = () => {
-      setPlayingKey(null);
-      setError('试听样例播放失败');
-    };
-    audioRef.current = audio;
-    setPlayingKey(key);
-    void audio.play().catch((err) => {
-      setPlayingKey(null);
-      setError(err instanceof Error ? err.message : String(err));
-    });
-  };
 
   const patchSlot = (key: SlotKey, next: VoiceSpec) => {
     if (!data) return;
@@ -255,8 +222,6 @@ export const SeriesTtsPanel: React.FC<SeriesTtsPanelProps> = ({ seriesId }) => {
       setSaving(false);
     }
   };
-
-  const voiceOptions: VoiceOption[] = useMemo(() => data?.voices ?? [], [data]);
 
   return (
     <section className="rounded-xl border border-slate-200 bg-white overflow-hidden">

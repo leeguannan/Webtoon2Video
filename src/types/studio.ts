@@ -50,6 +50,22 @@ export interface PanelItem {
   focus_region: [number, number, number, number];
 }
 
+/** 一条 beat 的配音落点（后端 Stage 5 解析结果，Patch v3.4）。 */
+export interface BeatVoiceAssignment {
+  /** 实际使用的音色 ID。 */
+  voice: string;
+  /** 语速倍率。 */
+  speed: number;
+  /** 来源代号：narrator / character / default_male / default_female / legacy_*。 */
+  source: string;
+  /** 人类可读来源说明，例如「讲解者（旁白）」「角色专属 · 恩彗」。 */
+  label: string;
+  /** 命中的角色名。 */
+  role: string;
+  /** 解析出的说话人性别。 */
+  gender: string;
+}
+
 export interface ScriptBeat {
   beat_id: string;
   narration_text: string;
@@ -67,6 +83,8 @@ export interface ScriptBeat {
   sfx_cue?: string | null;
   /** 取景提示（full / top / bottom / center）。 */
   focus_hint?: string;
+  /** Patch v3.4：后端解析出的「本句配音」（音色 + 来源），审核台直接展示。 */
+  resolved_voice?: BeatVoiceAssignment;
 }
 
 /** 百炼官方音色的一条配音规格（Patch v3.2 Patch 13）。 */
@@ -83,14 +101,21 @@ export interface SeriesTtsConfig {
   character_voices: Record<string, VoiceSpec>;
 }
 
-/** GET /api/tts/voices 返回的单个音色元数据。 */
+/** GET /api/tts/voices 返回的单个音色元数据（Patch v3.3：34 音色结构）。 */
 export interface VoiceOption {
-  id: string;
-  label: string;
-  name: string;
+  // 规范字段
+  voice_id: string;
+  display_name: string;
   gender: string;
-  traits: string;
-  use_case: string;
+  age_group: 'child' | 'youth' | 'middle' | 'elder' | string;
+  category: 'narrator' | 'character' | 'dialect' | 'drama' | string;
+  description: string;
+  /** Patch v3.4 Patch 16：供应商标记（qwen / minimax），前端据此分组下拉。 */
+  provider?: 'qwen' | 'minimax' | string;
+  // 后端同时返回的兼容别名
+  id: string;
+  name: string;
+  label: string;
   sample_url: string;
   sample_ready: boolean;
 }
@@ -105,6 +130,8 @@ export interface SeriesTtsConfigResponse extends SeriesTtsConfig {
     traits: string;
   }>;
   voices: VoiceOption[];
+  /** Patch v3.4 Patch 16：MiniMax 28 音色（与百炼清单分开，避免混用）。 */
+  minimax_voices?: VoiceOption[];
 }
 
 export interface EpisodeItem {
@@ -181,8 +208,17 @@ export interface StudioConfig {
   bailianBaseUrl: string;
   visionModel: string;
   scriptModel: string;
+  /** Patch v3.3 Patch 15：Stage 4A 说书体模型（qwen4-max / qwen3.8-max …）。 */
+  storyModel?: string;
+  storyModelOptions?: string[];
+  scriptModelOptions?: string[];
   ttsModel: string;
   ttsVoice: string;
+  /** Patch v3.4 Patch 16：TTS 模型下拉（百炼 / MiniMax / Edge）。 */
+  ttsModelOptions?: string[];
+  /** Patch v3.4 Patch 16：可选音色清单（百炼 34 / MiniMax 28），供下拉 + 试听。 */
+  ttsVoiceOptions?: VoiceOption[];
+  minimaxVoiceOptions?: VoiceOption[];
   maxImageLongEdge: number;
   aspectRatio: '9:16';
   bgmDuckingDb: number;

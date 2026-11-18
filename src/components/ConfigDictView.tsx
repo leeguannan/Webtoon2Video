@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Plus, Trash2, Save, Check } from 'lucide-react';
-import type { PronunciationRule, StudioConfig } from '../types/studio';
+import type { PronunciationRule, StudioConfig, VoiceOption } from '../types/studio';
+import { VoicePreviewButton, VoiceSelect, findVoiceOption, useVoicePreview } from './VoicePicker';
 
 interface ConfigDictViewProps {
   config: StudioConfig;
@@ -9,6 +10,45 @@ interface ConfigDictViewProps {
   onAddRule: (rule: Omit<PronunciationRule, 'id'>) => void;
   onDeleteRule: (id: string) => void;
 }
+
+/** Patch v3.3 Patch 15：Stage 4 撰稿模型候选（后端未给选项时的兜底）。 */
+const FALLBACK_SCRIPT_MODEL_OPTIONS = ['qwen3.7-plus', 'qwen3-max', 'qwen-plus', 'deepseek-v3'];
+
+/** Patch v3.3 Patch 15：Stage 4A 说书体模型候选（后端未给选项时的兜底）。 */
+const FALLBACK_STORY_MODEL_OPTIONS = ['qwen4-max', 'qwen3.8-max', 'qwen3.7-plus', 'qwen-plus'];
+
+/** Patch v3.4 Patch 16：Stage 5 TTS 模型候选（后端未给选项时的兜底）。 */
+const FALLBACK_TTS_MODEL_OPTIONS = [
+  'qwen3-tts-flash',
+  'qwen-audio-3.1-tts-plus',
+  'speech-2.8-hd',
+  'speech-2.8-turbo',
+  'edge-tts',
+];
+
+const SCRIPT_MODEL_LABELS: Record<string, string> = {
+  'qwen3.7-plus': 'qwen3.7-plus (新版主力)',
+  'qwen3.8-max': 'qwen3.8-max (长篇精修)',
+  'qwen3-max': 'qwen3-max (长篇精修)',
+  'qwen-plus': 'qwen-plus (高性价比)',
+  'deepseek-v3': 'deepseek-v3 (百炼内置)',
+};
+
+const STORY_MODEL_LABELS: Record<string, string> = {
+  'qwen4-max': 'qwen4-max (最新说书体)',
+  'qwen3.8-max': 'qwen3.8-max (备选)',
+  'qwen3.7-plus': 'qwen3.7-plus (备选)',
+  'qwen-plus': 'qwen-plus (兜底)',
+};
+
+/** Patch v3.4 Patch 16：TTS 模型下拉标签（百炼 / MiniMax / Edge 三套 provider）。 */
+const TTS_MODEL_LABELS: Record<string, string> = {
+  'qwen3-tts-flash': 'qwen3-tts-flash (百炼 · 指令情绪)',
+  'qwen-audio-3.1-tts-plus': 'qwen-audio-3.1-tts-plus (百炼 · 支持 SSML)',
+  'speech-2.8-hd': 'speech-2.8-hd (MiniMax · 高清)',
+  'speech-2.8-turbo': 'speech-2.8-turbo (MiniMax · 快速)',
+  'edge-tts': 'edge-tts (微软 Edge · 免费)',
+};
 
 export const ConfigDictView: React.FC<ConfigDictViewProps> = ({
   config,
@@ -19,6 +59,10 @@ export const ConfigDictView: React.FC<ConfigDictViewProps> = ({
 }) => {
   const [draft, setDraft] = useState<StudioConfig>(config);
   const [savedNotice, setSavedNotice] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+
+  /** Patch v3.4 Patch 16：试听静态样例（不调用 TTS 合成）。 */
+  const { playingKey, preview, stop } = useVoicePreview((message) => setPreviewError(message));
 
   const [newSource, setNewSource] = useState('');
   const [newReplacement, setNewReplacement] = useState('');
@@ -43,6 +87,42 @@ export const ConfigDictView: React.FC<ConfigDictViewProps> = ({
     setNewReplacement('');
     setNewNote('');
   };
+
+  // Patch v3.3 Patch 15：模型下拉以服务端候选为准，并把当前值兜底进列表避免回退丢值。
+  const scriptModelOptions = React.useMemo(() => {
+    const base =
+      draft.scriptModelOptions && draft.scriptModelOptions.length > 0
+        ? draft.scriptModelOptions
+        : FALLBACK_SCRIPT_MODEL_OPTIONS;
+    return base.includes(draft.scriptModel) ? base : [draft.scriptModel, ...base];
+  }, [draft.scriptModelOptions, draft.scriptModel]);
+
+  const storyModelOptions = React.useMemo(() => {
+    const base =
+      draft.storyModelOptions && draft.storyModelOptions.length > 0
+        ? draft.storyModelOptions
+        : FALLBACK_STORY_MODEL_OPTIONS;
+    const current = draft.storyModel ?? '';
+    return current && !base.includes(current) ? [current, ...base] : base;
+  }, [draft.storyModelOptions, draft.storyModel]);
+
+  /** Patch v3.4 Patch 16：TTS 模型候选（后端为准，当前值兜底进列表避免回退丢值）。 */
+  const ttsModelOptions = React.useMemo(() => {
+    const base =
+      draft.ttsModelOptions && draft.ttsModelOptions.length > 0
+        ? draft.ttsModelOptions
+        : FALLBACK_TTS_MODEL_OPTIONS;
+    return base.includes(draft.ttsModel) ? base : [draft.ttsModel, ...base];
+  }, [draft.ttsModelOptions, draft.ttsModel]);
+
+  /** Patch v3.4 Patch 16：两套供应商的音色合并（百炼 34 + MiniMax 28）。 */
+  const voiceOptions: VoiceOption[] = React.useMemo(
+    () => [...(draft.ttsVoiceOptions ?? []), ...(draft.minimaxVoiceOptions ?? [])],
+    [draft.ttsVoiceOptions, draft.minimaxVoiceOptions],
+  );
+  const currentVoice = findVoiceOption(voiceOptions, draft.ttsVoice);
+  const minimaxModel = draft.ttsModel.startsWith('speech-');
+  const voiceProviderMismatch = minimaxModel && currentVoice?.provider === 'qwen';
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
@@ -106,11 +186,33 @@ export const ConfigDictView: React.FC<ConfigDictViewProps> = ({
                 onChange={(e) => setDraft({ ...draft, scriptModel: e.target.value })}
                 className="w-full px-3 py-2 text-xs font-mono-tabular bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
               >
-                <option value="qwen-plus">qwen-plus (高性价比)</option>
-                <option value="qwen3-max">qwen3-max (长篇精修)</option>
-                <option value="deepseek-v3">deepseek-v3 (百炼内置)</option>
+                {scriptModelOptions.map((model) => (
+                  <option key={model} value={model}>
+                    {SCRIPT_MODEL_LABELS[model] ?? model}
+                  </option>
+                ))}
               </select>
             </div>
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-slate-700 mb-1">
+              说书体模型 (Stage 4A · 故事反写)
+            </label>
+            <select
+              value={draft.storyModel ?? ''}
+              onChange={(e) => setDraft({ ...draft, storyModel: e.target.value })}
+              className="w-full px-3 py-2 text-xs font-mono-tabular bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
+            >
+              {storyModelOptions.map((model) => (
+                <option key={model} value={model}>
+                  {STORY_MODEL_LABELS[model] ?? model}
+                </option>
+              ))}
+            </select>
+            <p className="text-[11px] text-slate-400 mt-1">
+              账号未开通该模型时自动降级：qwen4-max → qwen3.8-max → qwen3.7-plus → qwen-plus
+            </p>
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -123,21 +225,52 @@ export const ConfigDictView: React.FC<ConfigDictViewProps> = ({
                 onChange={(e) => setDraft({ ...draft, ttsModel: e.target.value })}
                 className="w-full px-3 py-2 text-xs font-mono-tabular bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
               >
-                <option value="qwen3-tts-flash">qwen3-tts-flash (指令情绪)</option>
-                <option value="qwen-audio-3.1-tts-plus">qwen-audio-3.1-tts-plus (支持SSML)</option>
+                {ttsModelOptions.map((model) => (
+                  <option key={model} value={model}>
+                    {TTS_MODEL_LABELS[model] ?? model}
+                  </option>
+                ))}
               </select>
+              <p className="text-[11px] text-slate-400 mt-1">
+                MiniMax 走 speech-2.8 系列（需 .env 里配置 MINIMAX_API_KEY）
+              </p>
             </div>
 
             <div>
               <label className="block text-xs font-medium text-slate-700 mb-1">
                 音色 ID (Voice)
               </label>
-              <input
-                type="text"
-                value={draft.ttsVoice}
-                onChange={(e) => setDraft({ ...draft, ttsVoice: e.target.value })}
-                className="w-full px-3 py-2 text-xs font-mono-tabular bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
-              />
+              <div className="flex items-start gap-2">
+                <div className="flex-1 min-w-0">
+                  <VoiceSelect
+                    value={draft.ttsVoice}
+                    voices={voiceOptions}
+                    ariaLabel="默认音色"
+                    placeholder="输入音色 ID，例如 Chinese (Mandarin)_Radio_Host"
+                    className="w-full px-3 py-2 text-xs font-mono-tabular bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
+                    onChange={(voice) => setDraft({ ...draft, ttsVoice: voice })}
+                  />
+                  <p className="text-[11px] text-slate-400 mt-1">
+                    {currentVoice
+                      ? `${currentVoice.provider === 'minimax' ? 'MiniMax' : '百炼'} · ${currentVoice.description}`
+                      : `目录外音色 ID：${draft.ttsVoice}（无静态样例，无法试听）`}
+                  </p>
+                </div>
+                <VoicePreviewButton
+                  playing={playingKey === 'ttsVoice'}
+                  sampleReady={currentVoice?.sample_ready ?? false}
+                  onPreview={() => preview('ttsVoice', { voice: draft.ttsVoice, speed: 1 }, voiceOptions)}
+                  onStop={stop}
+                />
+              </div>
+              {voiceProviderMismatch && (
+                <p className="text-[11px] text-amber-600 mt-1">
+                  当前音色属于百炼，MiniMax 模型会自动替换为 MiniMax 旁白音色（保存后回显）。
+                </p>
+              )}
+              {previewError && (
+                <p className="text-[11px] text-red-600 mt-1">试听失败：{previewError}</p>
+              )}
             </div>
           </div>
 

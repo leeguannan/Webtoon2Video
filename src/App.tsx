@@ -24,6 +24,7 @@ import type {
   StageId,
   StageStatus,
   StudioConfig,
+  VoiceOption,
 } from './types/studio';
 import { CatalogView } from './components/CatalogView';
 import { EpisodeStudioView } from './components/EpisodeStudioView';
@@ -60,6 +61,7 @@ const FALLBACK_CONFIG: StudioConfig = {
   bailianBaseUrl: '',
   visionModel: '',
   scriptModel: '',
+  storyModel: '',
   ttsModel: '',
   ttsVoice: 'Cherry',
   maxImageLongEdge: 1280,
@@ -111,8 +113,16 @@ type RawConfig = {
   bailianBaseUrl: string;
   visionModel: string;
   scriptModel: string;
+  /** Patch v3.3 Patch 15：Stage 4A 说书体模型与候选清单。 */
+  storyModel?: string;
+  storyModelOptions?: string[];
+  scriptModelOptions?: string[];
   ttsModel: string;
   ttsVoice: string;
+  /** Patch v3.4 Patch 16：TTS 模型候选 + 两套供应商的音色清单（供下拉与试听）。 */
+  ttsModelOptions?: string[];
+  ttsVoiceOptions?: VoiceOption[];
+  minimaxVoiceOptions?: VoiceOption[];
   maxImageLongEdge: number;
   aspectRatio: string;
   bgmDuckingDb: number;
@@ -279,8 +289,14 @@ function toStudioConfig(raw: RawConfig): StudioConfig {
     bailianBaseUrl: raw.bailianBaseUrl,
     visionModel: raw.visionModel,
     scriptModel: raw.scriptModel,
+    storyModel: raw.storyModel ?? '',
+    storyModelOptions: raw.storyModelOptions,
+    scriptModelOptions: raw.scriptModelOptions,
     ttsModel: raw.ttsModel,
     ttsVoice: raw.ttsVoice,
+    ttsModelOptions: raw.ttsModelOptions,
+    ttsVoiceOptions: raw.ttsVoiceOptions,
+    minimaxVoiceOptions: raw.minimaxVoiceOptions,
     maxImageLongEdge: raw.maxImageLongEdge,
     aspectRatio: '9:16',
     bgmDuckingDb: raw.bgmDuckingDb,
@@ -848,6 +864,7 @@ export default function App() {
           bailianBaseUrl: next.bailianBaseUrl,
           visionModel: next.visionModel,
           scriptModel: next.scriptModel,
+          storyModel: next.storyModel,
           ttsModel: next.ttsModel,
           ttsVoice: next.ttsVoice,
           maxImageLongEdge: next.maxImageLongEdge,

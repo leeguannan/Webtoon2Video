@@ -22,6 +22,7 @@ import type {
   EpisodeItem,
   PronunciationRule,
   ScriptBeat,
+  SeriesTtsConfigResponse,
   StageId,
   StudioConfig,
 } from '../types/studio';
@@ -70,6 +71,8 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   const [showFocusOverlay, setShowFocusOverlay] = useState(true);
   const [draftBeats, setDraftBeats] = useState<ScriptBeat[]>(episode.beats);
   const [playingBeatId, setPlayingBeatId] = useState<string | null>(null);
+  /** 作品级配音设置（角色清单 + 各角色音色），用于「本句配音」的角色下拉。 */
+  const [seriesTts, setSeriesTts] = useState<SeriesTtsConfigResponse | null>(null);
 
   // 分镜大图弹窗 + 字幕原文保存（切换分镜 / 关闭弹窗时落盘，编辑过程中不写库）
   const [zoomBeatId, setZoomBeatId] = useState<string | null>(null);
@@ -98,6 +101,142 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     setVideoTimeMs(0);
     setIsPlayingVideo(false);
   }, [episode.episode_id, episode.beats, episode.panels]);
+
+  // Patch v3.4：拉作品级配音设置——审核台要显示「本句配音用哪个角色 / 哪个音色」，
+  // 并允许就地改角色（改完保存并重跑 Stage 5 生效）。
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const res = await fetch(`/api/series/${encodeURIComponent(seriesId)}/tts-config`);
+        if (!res.ok) return;
+        const data = (await res.json()) as SeriesTtsConfigResponse;
+        if (!cancelled) setSeriesTts(data);
+      } catch {
+        // 拉不到就退回「只显示后端已解析结果」的降级模式，不影响审核台其他功能。
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, [seriesId]);
+
+  /** 可选角色名（作品角色表 + 已单独配置音色的角色）。 */
+  const roleNames = useMemo(() => {
+    const names = new Set<string>();
+    seriesTts?.characters?.forEach((c) => names.add(c.name));
+    Object.keys(seriesTts?.character_voices ?? {}).forEach((n) => names.add(n));
+    return Array.from(names);
+  }, [seriesTts]);
+
+  /**
+   * 角色 → 性别。
+   *
+   * 改角色时必须同步 speaker_gender：Stage 4 留下的性别属于**原来那个角色**
+   * （男角色改成女角色后仍是 male），不跟着改就会用错音色的兜底槽位。
+   */
+  const genderForRole = (role: string): 'male' | 'female' | 'unknown' => {
+    const lowered = role.trim().toLowerCase();
+    if (!lowered) return 'unknown';
+    if (lowered === 'male' || lowered.startsWith('male_')) return 'male';
+    if (lowered === 'female' || lowered.startsWith('female_')) return 'female';
+    const character = (seriesTts?.characters ?? []).find((c) =>
+      [c.name, ...(c.aliases ?? [])].some(
+        (key) => key.trim().toLowerCase() === lowered
+      )
+    );
+    const gender = (character?.gender ?? '').toLowerCase();
+    return gender === 'male' || gender === 'female' ? gender : 'unknown';
+  };
+
+  /**
+   * 一条 beat 的「本句配音」说明。
+   *
+   * 后端已给出权威结果（``resolved_voice``，与 Stage 5 同一套解析）；这里再按当前
+   * 下拉选择做一次**本地预览**，改角色后能立刻看到会换成谁，保存重跑后以服务端为准。
+   */
+  const beatVoiceInfo = (
+    beat: ScriptBeat
+  ): { label: string; voice: string; pending: boolean; hint: string } => {
+    const resolved = beat.resolved_voice;
+    const role = (beat.speaker_role ?? '').trim();
+    const base = {
+      label: resolved?.label ?? '待解析',
+      voice: resolved?.voice ?? '—',
+      pending: false,
+      hint: '',
+    };
+    if (!seriesTts) return base;
+    if (!role) {
+      return {
+        label: '不指定 · 按性别兜底',
+        voice: base.voice,
+        pending: !!resolved,
+        hint: '按角色性别选通用男声 / 通用女声',
+      };
+    }
+    if (role === 'narrator' || role === '旁白' || role === '解说') {
+      return {
+        label: '讲解者（旁白）',
+        voice: seriesTts.narrator.voice,
+        pending: false,
+        hint: '',
+      };
+    }
+    const cast = seriesTts.character_voices[role];
+    if (cast) {
+      return {
+        label: `角色专属 · ${role}`,
+        voice: cast.voice,
+        pending: false,
+        hint: '',
+      };
+    }
+    if (role === 'male') {
+      return {
+        label: '通用男声',
+        voice: seriesTts.default_male.voice,
+        pending: false,
+        hint: '',
+      };
+    }
+    if (role === 'female') {
+      return {
+        label: '通用女声',
+        voice: seriesTts.default_female.voice,
+        pending: false,
+        hint: '',
+      };
+    }
+    if (roleNames.includes(role)) {
+      // 作品角色表里有这个角色，但没单独配音色 → Stage 5 按性别兜底。
+      return {
+        label: `角色 ${role} · 按性别兜底`,
+        voice: base.voice,
+        pending: false,
+        hint: '该角色未单独配置音色，可改选通用男声 / 通用女声',
+      };
+    }
+    // 旧槽位角色（male_antagonist 之类）：按后端给出的性别落到作品级通用槽位。
+    if (resolved?.gender === 'male') {
+      return {
+        label: '通用男声',
+        voice: seriesTts.default_male.voice,
+        pending: false,
+        hint: '旧槽位角色，改选角色名可切到专属音色',
+      };
+    }
+    if (resolved?.gender === 'female') {
+      return {
+        label: '通用女声',
+        voice: seriesTts.default_female.voice,
+        pending: false,
+        hint: '旧槽位角色，改选角色名可切到专属音色',
+      };
+    }
+    return { ...base, hint: '旧槽位角色，改选角色名可切到专属音色' };
+  };
 
   const activePanel = useMemo(
     () => episode.panels.find((p) => p.panel_id === selectedPanelId) ?? episode.panels[0],
@@ -255,20 +394,65 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     [episode.episode_id]
   );
 
+  /** 生成一个当前列表里没被占用的 beat_id（避免与既有 id 撞车）。 */
+  const uniqueBeatId = (beats: ScriptBeat[]): string => {
+    const used = new Set(beats.map((b) => b.beat_id));
+    let n = beats.length + 1;
+    let candidate = `b_new_${String(n).padStart(3, '0')}`;
+    while (used.has(candidate)) {
+      n += 1;
+      candidate = `b_new_${String(n).padStart(3, '0')}`;
+    }
+    return candidate;
+  };
+
   const handleAddBeat = () => {
-    const idx = draftBeats.length + 1;
-    const firstPanel = episode.panels[0]?.panel_id ?? 'p_001';
-    const newBeat: ScriptBeat = {
-      beat_id: `b_${String(idx).padStart(3, '0')}`,
-      narration_text: '请在此输入新的短句解说文案。',
-      tts_text: '',
-      emotion_instruction: '用自然平稳的漫评解说语气说出',
-      target_panel_ids: [firstPanel],
-      motion: 'zoom_in',
-      pause_after_ms: 250,
-      audio_duration_ms: 2800,
-    };
-    setDraftBeats((prev) => [...prev, newBeat]);
+    setDraftBeats((prev) => {
+      const firstPanel = episode.panels[0]?.panel_id ?? 'p_001';
+      const newBeat: ScriptBeat = {
+        beat_id: uniqueBeatId(prev),
+        narration_text: '请在此输入新的短句解说文案。',
+        tts_text: '',
+        emotion_instruction: '用自然平稳的漫评解说语气说出',
+        target_panel_ids: [firstPanel],
+        motion: 'zoom_in',
+        pause_after_ms: 250,
+        audio_duration_ms: 0,
+      };
+      return [...prev, newBeat];
+    });
+  };
+
+  /**
+   * 在指定 beat 之后插入一条新解说句（Patch v3.4）。
+   *
+   * 画面默认继承**下一句**的分镜（插入的镜头承接后面的画面；没有下一句时继承当前句），
+   * 情绪指令 / 运镜 / 停顿 / 说话角色沿用当前句，避免插进去就变味。
+   * 新句尚未合成，时长记 0；落盘需要点「保存并从 Stage 5 重跑配音」。
+   */
+  const handleInsertBeat = (afterBeatId: string) => {
+    setDraftBeats((prev) => {
+      const index = prev.findIndex((b) => b.beat_id === afterBeatId);
+      if (index < 0) return prev;
+      const current = prev[index];
+      const next = prev[index + 1];
+      const newBeat: ScriptBeat = {
+        beat_id: uniqueBeatId(prev),
+        narration_text: '请在此输入新的短句解说文案。',
+        tts_text: '',
+        emotion_instruction: current.emotion_instruction,
+        target_panel_ids: next
+          ? [...next.target_panel_ids]
+          : [...current.target_panel_ids],
+        motion: current.motion,
+        pause_after_ms: current.pause_after_ms,
+        audio_duration_ms: 0,
+        speaker_role: current.speaker_role,
+      };
+      const nextBeats = [...prev];
+      nextBeats.splice(index + 1, 0, newBeat);
+      return nextBeats;
+    });
   };
 
   const handleDeleteBeat = (beatId: string) => {
@@ -614,7 +798,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                         Qwen TTS 情绪指令 (instruction)
                       </th>
                       <th className="py-3 px-3 w-36">运镜与停顿</th>
-                      <th className="py-3 pl-3 pr-5 w-28 text-right">试听 / 删</th>
+                      <th className="py-3 pl-3 pr-5 w-32 text-right">试听 / 插入 / 删</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100 text-xs align-top">
@@ -623,6 +807,16 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                         (p) => p.panel_id === beat.target_panel_ids[0]
                       );
                       const { spokenText, matchedRules } = resolveSpokenText(beat, rules);
+                      const voiceInfo = beatVoiceInfo(beat);
+                      const currentRole = (beat.speaker_role ?? '').trim();
+                      // 当前角色可能是旧槽位代号（如 male_antagonist），不在候选里时补一条，
+                      // 免得下拉显示空白、用户看不出这一句到底是谁在念。
+                      const currentRoleOption =
+                        currentRole &&
+                        !['narrator', 'male', 'female'].includes(currentRole) &&
+                        !roleNames.includes(currentRole)
+                          ? { value: currentRole, label: `当前角色 ${currentRole}（旧槽位）` }
+                          : null;
                       const charLen = beat.narration_text.trim().length;
                       const isLengthWarn = charLen < 8 || charLen > 30;
                       return (
@@ -721,7 +915,54 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                               className="w-full p-2 text-xs text-slate-800 bg-white border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600 resize-none"
                             />
                             <div className="mt-1 text-[11px] font-mono-tabular text-slate-400">
-                              {config.ttsModel} · {config.ttsVoice}
+                              {config.ttsModel}
+                            </div>
+                            {/* Patch v3.4：显示「本句配音」（角色 + 音色），并可就地改角色。 */}
+                            <div className="mt-1.5 space-y-1">
+                              <div className="text-[11px] leading-snug text-slate-600">
+                                本句配音：{voiceInfo.label} · {voiceInfo.voice}
+                                {voiceInfo.pending && (
+                                  <span className="text-amber-600">（保存重跑后生效）</span>
+                                )}
+                              </div>
+                              <select
+                                value={beat.speaker_role ?? ''}
+                                onChange={(e) => {
+                                  const nextRole = e.target.value;
+                                  updateBeatField(beat.beat_id, 'speaker_role', nextRole);
+                                  if (nextRole) {
+                                    // 角色换了，性别也得跟着换（否则会沿用旧角色的性别）。
+                                    updateBeatField(
+                                      beat.beat_id,
+                                      'speaker_gender',
+                                      genderForRole(nextRole)
+                                    );
+                                  }
+                                }}
+                                aria-label={`${beat.beat_id} 配音角色`}
+                                className="w-full px-2 py-1 text-[11px] bg-white border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
+                              >
+                                {currentRoleOption && (
+                                  <option value={currentRoleOption.value}>
+                                    {currentRoleOption.label}
+                                  </option>
+                                )}
+                                <option value="">不指定（按性别兜底）</option>
+                                <option value="narrator">讲解者（旁白）</option>
+                                <option value="male">通用男声</option>
+                                <option value="female">通用女声</option>
+                                {roleNames.map((name) => (
+                                  <option key={name} value={name}>
+                                    {name}
+                                    {seriesTts?.character_voices[name] ? '' : '（未单独配置音色）'}
+                                  </option>
+                                ))}
+                              </select>
+                              {voiceInfo.hint && (
+                                <div className="text-[10px] leading-snug text-slate-400">
+                                  {voiceInfo.hint}
+                                </div>
+                              )}
                             </div>
                           </td>
 
@@ -779,6 +1020,15 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                               >
                                 <Volume2 className="w-3.5 h-3.5" />
                                 {playingBeatId === beat.beat_id ? '试听中' : '试听'}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleInsertBeat(beat.beat_id)}
+                                title="在本格之后插入一条解说句"
+                                aria-label={`在 ${beat.beat_id} 之后插入解说句`}
+                                className="p-1.5 text-slate-400 hover:text-blue-600 cursor-pointer"
+                              >
+                                <Plus className="w-3.5 h-3.5" />
                               </button>
                               <button
                                 type="button"
