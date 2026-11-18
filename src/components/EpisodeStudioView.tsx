@@ -130,6 +130,13 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   const pendingRef = useRef<{ episodeId: string; beats: ScriptBeat[] } | null>(null);
   /** 表格未保存标记的 ref 副本：后台回填 effect 里读它，避免把 dirty 塞进依赖导致回填反复触发。 */
   const tableDirtyRef = useRef(false);
+  /**
+   * 未保存草稿所属的话次。
+   *
+   * 双保险：即便组件没有因 key 变化而重挂载，切到另一话时也能识别出
+   * 「这份 dirty 属于上一话」，拒绝把上一话的草稿套到新话数据上。
+   */
+  const tableDirtyEpisodeRef = useRef<string>('');
 
   // Video simulator state (9:16 standard)
   const [isPlayingVideo, setIsPlayingVideo] = useState(false);
@@ -143,9 +150,19 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     // （表格内编辑或弹窗改字），就保留本地草稿，别让用户正在改的内容被服务端数据冲掉。
     const pending = pendingRef.current;
     const dirty = tableDirtyRef.current;
-    if ((!pending || pending.episodeId !== episode.episode_id) && !dirty) {
+    // dirty 只在「属于当前话」时才保护草稿；切话次后旧 dirty 必须作废。
+    const dirtyBelongsHere = dirty && tableDirtyEpisodeRef.current === episode.episode_id;
+    if ((!pending || pending.episodeId !== episode.episode_id) && !dirtyBelongsHere) {
       setDraftBeats(episode.beats);
       draftBeatsRef.current = episode.beats;
+    }
+    if (dirty && !dirtyBelongsHere) {
+      // 话次切换：清掉上一话遗留的未保存标记与确认横幅，避免草稿串话。
+      tableDirtyRef.current = false;
+      setTableDirty(false);
+      setSaveHint('');
+      setResetTarget(null);
+      tableDirtyEpisodeRef.current = '';
     }
     setSelectedPanelId(episode.panels[0]?.panel_id ?? '');
     setVideoTimeMs(0);
@@ -224,6 +241,23 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   };
 
   /**
+   * 改说话人角色时要同步落的字段（表格行内 select 与分镜弹窗共用同一套规则）：
+   * a) speaker_gender 始终跟着角色走，选回「不指定」（空串）时重置为 unknown；
+   * b) 清掉历史逐句音色 voice_override，恢复按角色解析，避免界面角色与实际音色不一致。
+   */
+  const speakerRolePatch = (
+    beat: ScriptBeat,
+    nextRole: string
+  ): Partial<ScriptBeat> => {
+    const patch: Partial<ScriptBeat> = {
+      speaker_role: nextRole,
+      speaker_gender: nextRole ? genderForRole(nextRole) : 'unknown',
+    };
+    if ((beat.voice_override ?? '').trim()) patch.voice_override = '';
+    return patch;
+  };
+
+  /**
    * 说话人候选（审核台表格与分镜弹窗共用同一份）。
    *
    * 只让用户选**角色**，音色由角色自动带出（讲解者 / 通用男声 / 通用女声 / 角色专属），
@@ -267,6 +301,16 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   const beatVoiceInfo = (
     beat: ScriptBeat
   ): { label: string; voice: string; pending: boolean; hint: string } => {
+    // Patch v4.2：逐句指定音色（voice_override）优先级最高，与后端 s5_tts 解析保持一致。
+    const override = (beat.voice_override ?? '').trim();
+    if (override) {
+      return {
+        label: '指定音色',
+        voice: override,
+        pending: false,
+        hint: '已逐句指定音色，改选角色可恢复按角色解析',
+      };
+    }
     const resolved = beat.resolved_voice;
     const role = (beat.speaker_role ?? '').trim();
     const base = {
@@ -422,8 +466,9 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   /** 标记表格里有未落盘的改动。 */
   const markTableDirty = useCallback(() => {
     tableDirtyRef.current = true;
+    tableDirtyEpisodeRef.current = episode.episode_id;
     setTableDirty(true);
-  }, []);
+  }, [episode.episode_id]);
 
   /**
    * 表格里改一个字段。
@@ -467,6 +512,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
       }
       pendingRef.current = null;
       tableDirtyRef.current = false;
+      tableDirtyEpisodeRef.current = '';
       setTableDirty(false);
       setSaveStatus('saved');
       setSaveMessage(new Date().toLocaleTimeString('zh-CN', { hour12: false }));
@@ -504,18 +550,16 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
    * Patch v4.2：弹窗内改说话人角色。
    *
    * 角色决定音色（讲解者 / 通用男声 / 通用女声 / 角色专属），所以只改角色就够；
-   * 同步写 speaker_gender，避免沿用上一个角色的性别；顺手清掉历史遗留的
-   * 强制指定音色（voice_override），否则界面显示的角色与实际合成音色会不一致。
+   * 与表格行内 select 走同一套 speakerRolePatch：同步 speaker_gender、
+   * 清空 voice_override，避免界面显示的角色与实际合成音色不一致。
    */
   const handleZoomRoleChange = (beatId: string, role: string) => {
-    updateZoomBeat(beatId, 'speaker_role', role);
-    updateZoomBeat(
-      beatId,
-      'speaker_gender',
-      role ? genderForRole(role) : 'unknown'
-    );
     const beat = draftBeatsRef.current.find((b) => b.beat_id === beatId);
-    if (beat?.voice_override) updateZoomBeat(beatId, 'voice_override', '');
+    if (!beat) return;
+    const patch = speakerRolePatch(beat, role);
+    (Object.keys(patch) as Array<keyof ScriptBeat>).forEach((key) => {
+      updateZoomBeat(beatId, key, patch[key] as ScriptBeat[typeof key]);
+    });
   };
 
   /** Patch v4.2：弹窗内改情绪指令（送音语气）。 */
@@ -652,6 +696,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         return;
       }
       tableDirtyRef.current = false;
+      tableDirtyEpisodeRef.current = '';
       setTableDirty(false);
       pendingRef.current = null;
     } finally {
@@ -1298,15 +1343,18 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                                 value={beat.speaker_role ?? ''}
                                 onChange={(e) => {
                                   const nextRole = e.target.value;
-                                  updateBeatField(beat.beat_id, 'speaker_role', nextRole);
-                                  if (nextRole) {
-                                    // 角色换了，性别也得跟着换（否则会沿用旧角色的性别）。
-                                    updateBeatField(
-                                      beat.beat_id,
-                                      'speaker_gender',
-                                      genderForRole(nextRole)
-                                    );
-                                  }
+                                  // 与弹窗走同一套规则：同步 speaker_gender（空值重置 unknown）、
+                                  // 清空 voice_override。
+                                  const patch = speakerRolePatch(beat, nextRole);
+                                  (Object.keys(patch) as Array<keyof ScriptBeat>).forEach(
+                                    (key) => {
+                                      updateBeatField(
+                                        beat.beat_id,
+                                        key,
+                                        patch[key] as ScriptBeat[typeof key]
+                                      );
+                                    }
+                                  );
                                 }}
                                 aria-label={`${beat.beat_id} 配音角色`}
                                 className="w-full px-2 py-1 text-[11px] bg-white border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"

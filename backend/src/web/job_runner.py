@@ -410,13 +410,16 @@ class JobRunner:
         try:
             # Patch v4.1 Patch 21：真正开跑前先清空 from_stage 及下游的旧产物，
             # 免得「昨天的旧成片 + 旧绿色完成标记」和本次重跑混在一起。
+            # ManifestManager 只认 S1 ~ S7；从 S0 点「从此步重跑」时先收敛到 s1_crawler，
+            # 否则 reset_from_stage 抛 ValueError 被下面的 except 吞掉，下游旧产物不会被清。
+            reset_stage = "s1_crawler" if from_stage == "s0_catalog" else from_stage
             try:
                 ManifestManager(series_dir, series_id=series_id).reset_from_stage(
                     episode.episode_no,
-                    from_stage,
+                    reset_stage,
                     include_human_storyboard=False,
                 )
-                self._log(state, f"[清理重置] 已清空 {from_stage} 及下游的旧产物")
+                self._log(state, f"[清理重置] 已清空 {reset_stage} 及下游的旧产物")
             except Exception as exc:  # noqa: BLE001 - 清理失败不应阻断重跑
                 self._log(state, f"[清理重置] 跳过（{exc}）")
             llm_client = (self.client_factory or (lambda: _default_llm(self.config)))()

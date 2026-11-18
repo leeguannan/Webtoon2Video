@@ -1257,6 +1257,7 @@ export default function App() {
 
           {booted && activeSeries && navView === 'studio' && activeEpisode && (
             <EpisodeStudioView
+              key={activeEpisode.episode_id}
               episode={activeEpisode}
               seriesId={activeSeries.series_id}
               config={config ?? FALLBACK_CONFIG}

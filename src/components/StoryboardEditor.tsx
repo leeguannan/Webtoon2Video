@@ -290,11 +290,7 @@ export const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
         setData(payload.storyboard);
         setScenes(payload.storyboard.scenes);
         onScenesLoaded?.(payload.storyboard.scenes.length);
-        setNotice(
-          mode === 'phase1_only'
-            ? `后台任务已提交（job_id=${payload.job.job_id}），正在按镜头组重生成 Stage 4 剧本。`
-            : `后台任务已提交（job_id=${payload.job.job_id}），正在从 Stage 4 一路制片到 Stage 7。`
-        );
+        // 只保留一条任务通知（jobNotice 横幅），避免同时渲染两条绿色提示。
         setJobNotice(
           mode === 'phase1_only'
             ? `镜头组剧本重生成任务已提交（job_id=${payload.job.job_id}）。`
