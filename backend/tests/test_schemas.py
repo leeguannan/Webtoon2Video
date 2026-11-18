@@ -148,6 +148,8 @@ FIELD_LOCKS: list[tuple[type, tuple[str, ...]]] = [
             "speaker_gender",
             # Patch v4.2：逐句指定音色（默认空串 = 跟随角色解析）
             "voice_override",
+            # Patch v4.4：单句语速微调（默认 None = 跟随角色默认语速）
+            "speed_override",
         ),
     ),
     (

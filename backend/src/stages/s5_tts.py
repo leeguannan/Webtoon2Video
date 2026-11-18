@@ -541,6 +541,10 @@ def resolve_beat_voice_assignment(
     ``beat.voice_override``：非空时强制使用该音色（语速沿用解析结果），
     来源标记为 ``voice_override``，界面显示「指定音色」。
 
+    Patch v4.4：最后叠加 ``beat.speed_override``——非 ``None`` 时只替换语速
+    （经 :func:`normalize_speed` 收敛），``source`` / ``label`` / ``role`` /
+    ``gender`` 全部保留，音色来源不因为语速微调而改变。
+
     跨供应商兜底不在这里做：MiniMax 模型收到百炼音色时，统一在合成阶段
     （:func:`resolve_voice_for_tts_model`）换成同定位的 MiniMax 音色。
     """
@@ -552,15 +556,28 @@ def resolve_beat_voice_assignment(
         voice_cast=voice_cast,
     )
     override = str(getattr(beat, "voice_override", "") or "").strip()
-    if not override:
-        return assignment
-    return BeatVoiceAssignment(
-        spec=VoiceSpec(voice=override, speed=assignment.spec.speed),
-        source="voice_override",
-        label="指定音色",
-        role=assignment.role,
-        gender=assignment.gender,
-    )
+    if override:
+        assignment = BeatVoiceAssignment(
+            spec=VoiceSpec(voice=override, speed=assignment.spec.speed),
+            source="voice_override",
+            label="指定音色",
+            role=assignment.role,
+            gender=assignment.gender,
+        )
+    speed_override = getattr(beat, "speed_override", None)
+    if speed_override is not None:
+        # 单句语速微调与音色解析正交：只换 spec.speed，来源标记保持角色 / 指定音色原样。
+        assignment = BeatVoiceAssignment(
+            spec=VoiceSpec(
+                voice=assignment.spec.voice,
+                speed=normalize_speed(speed_override),
+            ),
+            source=assignment.source,
+            label=assignment.label,
+            role=assignment.role,
+            gender=assignment.gender,
+        )
+    return assignment
 
 
 def resolve_beat_voice_assignment_without_override(
@@ -821,6 +838,13 @@ async def _synthesize_beat(
         )
         beat_voice = spec.voice
         speed = normalize_speed(spec.speed)
+    # Patch v4.4：单句语速微调对三条分支一视同仁——显式 ``--voice`` 与
+    # ``series_tts is None`` 的旧契约分支原本语速恒为 1.0，这里同样覆盖；
+    # 四级解析分支里 ``resolve_beat_voice_spec`` 已应用过一次，再赋同值
+    # （``normalize_speed`` 对区间内值幂等），保证三条路径行为一致。
+    beat_speed_override = getattr(beat, "speed_override", None)
+    if beat_speed_override is not None:
+        speed = normalize_speed(beat_speed_override)
     if beat_voice:
         # Patch v3.4 Patch 16：跨模型音色兜底。把百炼/Edge 音色（如 Cherry）
         # 发给 MiniMax 会直接返回 2013 invalid voice_id 并让整话失败，

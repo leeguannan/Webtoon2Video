@@ -463,10 +463,12 @@ PRESERVED_BEAT_FIELDS: tuple[str, ...] = (
     "speaker_gender",
     # Patch v4.2：逐句指定音色（前端未回传时继承旧值；回传空串 = 改回「跟随角色」）
     "voice_override",
+    # Patch v4.4：单句语速微调（前端未回传时继承旧值；显式传 null = 清空，恢复角色默认语速）
+    "speed_override",
 )
 
 #: 上面这些字段里允许显式置 ``None``（清空）的，其余字段 ``None`` 非法，按「未提供」处理。
-NULLABLE_BEAT_FIELDS: frozenset[str] = frozenset({"sfx_cue"})
+NULLABLE_BEAT_FIELDS: frozenset[str] = frozenset({"sfx_cue", "speed_override"})
 
 _MISSING = object()
 
@@ -830,6 +832,8 @@ class WorkspaceView:
                 "speaker_gender": str(getattr(beat, "speaker_gender", "") or ""),
                 # Patch v4.2：逐句指定音色（空串 = 跟随角色解析）。
                 "voice_override": str(getattr(beat, "voice_override", "") or ""),
+                # Patch v4.4：单句语速微调（None = 跟随角色默认语速）。
+                "speed_override": getattr(beat, "speed_override", None),
                 "sfx_cue": beat.sfx_cue,
                 "focus_hint": beat.focus_hint,
             }
@@ -872,9 +876,19 @@ class WorkspaceView:
             default_voice=self.config.tts.default_voice,
             voice_cast=voice_cast,
         )
+        # Patch v4.4：角色默认语速始终一并下发（未微调时与 speed 相等；微调后
+        # speed 是本句生效语速，role_speed 仍是按角色解析出的默认语速）。
+        base = s5_tts.resolve_beat_voice_assignment_without_override(
+            beat,
+            series_tts=series_tts,
+            characters=characters,
+            default_voice=self.config.tts.default_voice,
+            voice_cast=voice_cast,
+        )
         payload: dict[str, Any] = {
             "voice": assignment.spec.voice,
             "speed": assignment.spec.speed,
+            "role_speed": base.spec.speed,
             "source": assignment.source,
             "label": assignment.label,
             "role": assignment.role,
@@ -882,13 +896,6 @@ class WorkspaceView:
         }
         if assignment.source == "voice_override":
             # 逐句指定音色时，同时给出「清空指定后按角色会用哪个音色」。
-            base = s5_tts.resolve_beat_voice_assignment_without_override(
-                beat,
-                series_tts=series_tts,
-                characters=characters,
-                default_voice=self.config.tts.default_voice,
-                voice_cast=voice_cast,
-            )
             payload["role_voice"] = {
                 "voice": base.spec.voice,
                 "speed": base.spec.speed,

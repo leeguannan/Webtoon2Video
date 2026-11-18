@@ -216,6 +216,9 @@ class ScriptBeat(BaseModel):
     #: Patch v4.2：逐句指定音色（审核台分镜大图弹窗里设置）。空串 = 按角色解析
     #: （旁白 / 角色专属 / 通用男女声），非空则强制使用该音色 ID。
     voice_override: str = ""
+    #: Patch v4.4：单句语速微调。``None`` = 跟随当前角色的默认语速；非 ``None``
+    #: 时本句 TTS 合成强制使用该倍率（合成前仍经 ``normalize_speed`` 收敛到合法区间）。
+    speed_override: float | None = Field(default=None, ge=0.5, le=2.0)
 
 
 class NarrationScript(BaseModel):

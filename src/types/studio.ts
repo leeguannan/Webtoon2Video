@@ -66,6 +66,8 @@ export interface BeatVoiceAssignment {
   gender: string;
   /** 逐句指定音色（voice_override）时，附上「清空指定后按角色会用哪个音色」。 */
   role_voice?: BeatVoiceAssignment;
+  /** Patch v4.4：按角色解析的默认语速（未微调时等于 speed；微调后 speed 是本句生效语速）。 */
+  role_speed?: number;
 }
 
 export interface ScriptBeat {
@@ -89,6 +91,8 @@ export interface ScriptBeat {
   resolved_voice?: BeatVoiceAssignment;
   /** Patch v4.2：逐句指定音色（空串 / 缺省 = 跟随角色解析）。 */
   voice_override?: string;
+  /** Patch v4.4：单句语速微调（null / 缺省 = 跟随角色默认语速）。 */
+  speed_override?: number | null;
 }
 
 /** 百炼官方音色的一条配音规格（Patch v3.2 Patch 13）。 */

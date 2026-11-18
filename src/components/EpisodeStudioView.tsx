@@ -243,7 +243,8 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   /**
    * 改说话人角色时要同步落的字段（表格行内 select 与分镜弹窗共用同一套规则）：
    * a) speaker_gender 始终跟着角色走，选回「不指定」（空串）时重置为 unknown；
-   * b) 清掉历史逐句音色 voice_override，恢复按角色解析，避免界面角色与实际音色不一致。
+   * b) 清掉历史逐句音色 voice_override，恢复按角色解析，避免界面角色与实际音色不一致；
+   * c) Patch v4.4：一并清空单句语速微调 speed_override，让新角色自带的默认语速自动生效。
    */
   const speakerRolePatch = (
     beat: ScriptBeat,
@@ -252,6 +253,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     const patch: Partial<ScriptBeat> = {
       speaker_role: nextRole,
       speaker_gender: nextRole ? genderForRole(nextRole) : 'unknown',
+      speed_override: null,
     };
     if ((beat.voice_override ?? '').trim()) patch.voice_override = '';
     return patch;
@@ -293,14 +295,53 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   };
 
   /**
+   * Patch v4.4：按当前 ``speaker_role`` 从作品级 TTS 配置算出角色默认语速。
+   *
+   * 讲解者 / 角色专属 / 通用男女声各取对应槽位的 ``speed``；本地配置找不到时，
+   * 依次回落后端下发的 ``role_speed``、当前生效 ``speed``，最后兜底 1.15。
+   */
+  const roleSpeedForBeat = (beat: ScriptBeat): number => {
+    const fallback =
+      beat.resolved_voice?.role_speed ?? beat.resolved_voice?.speed ?? 1.15;
+    if (!seriesTts) return fallback;
+    const role = (beat.speaker_role ?? '').trim();
+    if (!role) return fallback;
+    if (role === 'narrator' || role === '旁白' || role === '解说') {
+      return seriesTts.narrator.speed;
+    }
+    const cast = seriesTts.character_voices[role];
+    if (cast) return cast.speed;
+    if (role === 'male') return seriesTts.default_male.speed;
+    if (role === 'female') return seriesTts.default_female.speed;
+    return fallback;
+  };
+
+  /**
    * 一条 beat 的「本句配音」说明。
    *
    * 后端已给出权威结果（``resolved_voice``，与 Stage 5 同一套解析）；这里再按当前
    * 下拉选择做一次**本地预览**，改角色后能立刻看到会换成谁，保存重跑后以服务端为准。
+   *
+   * Patch v4.4：返回值同时携带语速三件套——``roleSpeed``（角色默认语速）、
+   * ``speed``（当前生效语速，微调后等于 ``speed_override``）、``speedOverridden``。
    */
   const beatVoiceInfo = (
     beat: ScriptBeat
-  ): { label: string; voice: string; pending: boolean; hint: string } => {
+  ): {
+    label: string;
+    voice: string;
+    pending: boolean;
+    hint: string;
+    speed: number;
+    roleSpeed: number;
+    speedOverridden: boolean;
+  } => {
+    const roleSpeed = roleSpeedForBeat(beat);
+    const speedOverridden = beat.speed_override != null;
+    const speed = speedOverridden
+      ? (beat.speed_override as number)
+      : roleSpeed;
+    const speedFields = { speed, roleSpeed, speedOverridden };
     // Patch v4.2：逐句指定音色（voice_override）优先级最高，与后端 s5_tts 解析保持一致。
     const override = (beat.voice_override ?? '').trim();
     if (override) {
@@ -309,6 +350,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         voice: override,
         pending: false,
         hint: '已逐句指定音色，改选角色可恢复按角色解析',
+        ...speedFields,
       };
     }
     const resolved = beat.resolved_voice;
@@ -318,6 +360,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
       voice: resolved?.voice ?? '—',
       pending: false,
       hint: '',
+      ...speedFields,
     };
     if (!seriesTts) return base;
     if (!role) {
@@ -326,6 +369,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         voice: base.voice,
         pending: !!resolved,
         hint: '按角色性别选通用男声 / 通用女声',
+        ...speedFields,
       };
     }
     if (role === 'narrator' || role === '旁白' || role === '解说') {
@@ -334,6 +378,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         voice: seriesTts.narrator.voice,
         pending: false,
         hint: '',
+        ...speedFields,
       };
     }
     const cast = seriesTts.character_voices[role];
@@ -343,6 +388,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         voice: cast.voice,
         pending: false,
         hint: '',
+        ...speedFields,
       };
     }
     if (role === 'male') {
@@ -351,6 +397,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         voice: seriesTts.default_male.voice,
         pending: false,
         hint: '',
+        ...speedFields,
       };
     }
     if (role === 'female') {
@@ -359,6 +406,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         voice: seriesTts.default_female.voice,
         pending: false,
         hint: '',
+        ...speedFields,
       };
     }
     if (roleNames.includes(role)) {
@@ -368,6 +416,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         voice: base.voice,
         pending: false,
         hint: '该角色未单独配置音色，可改选通用男声 / 通用女声',
+        ...speedFields,
       };
     }
     // 旧槽位角色（male_antagonist 之类）：按后端给出的性别落到作品级通用槽位。
@@ -377,6 +426,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         voice: seriesTts.default_male.voice,
         pending: false,
         hint: '旧槽位角色，改选角色名可切到专属音色',
+        ...speedFields,
       };
     }
     if (resolved?.gender === 'female') {
@@ -385,6 +435,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         voice: seriesTts.default_female.voice,
         pending: false,
         hint: '旧槽位角色，改选角色名可切到专属音色',
+        ...speedFields,
       };
     }
     return { ...base, hint: '旧槽位角色，改选角色名可切到专属音色' };
@@ -565,6 +616,16 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   /** Patch v4.2：弹窗内改情绪指令（送音语气）。 */
   const handleZoomEmotionChange = (beatId: string, text: string) => {
     updateZoomBeat(beatId, 'emotion_instruction', text);
+  };
+
+  /**
+   * Patch v4.4：弹窗内调单句语速。
+   *
+   * 只改本地草稿，落盘与其他弹窗字段一样交给切格 / 关闭时的统一保存；
+   * 传 ``null`` 表示清空微调、恢复该角色的默认语速。
+   */
+  const handleZoomSpeedChange = (beatId: string, speed: number | null) => {
+    updateZoomBeat(beatId, 'speed_override', speed);
   };
 
   /** 上一格 / 下一格：先把当前格的改动存下来，再翻页 */
@@ -1334,9 +1395,15 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                             {/* Patch v3.4：显示「本句配音」（角色 + 音色），并可就地改角色。 */}
                             <div className="mt-1.5 space-y-1">
                               <div className="text-[11px] leading-snug text-slate-600">
-                                本句配音：{voiceInfo.label} · {voiceInfo.voice}
+                                本句配音：{voiceInfo.label} · {voiceInfo.voice} ·{' '}
+                                {voiceInfo.speed.toFixed(2)}x
                                 {voiceInfo.pending && (
                                   <span className="text-amber-600">（保存重跑后生效）</span>
+                                )}
+                                {voiceInfo.speedOverridden && (
+                                  <span className="text-slate-400">
+                                    （已微调，默认 {voiceInfo.roleSpeed.toFixed(2)}x）
+                                  </span>
                                 )}
                               </div>
                               <select
@@ -1805,7 +1872,14 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         voiceInfo={
           zoomBeat
             ? beatVoiceInfo(zoomBeat)
-            : { label: '待解析', voice: '—', hint: '' }
+            : {
+                label: '待解析',
+                voice: '—',
+                hint: '',
+                speed: 1.15,
+                roleSpeed: 1.15,
+                speedOverridden: false,
+              }
         }
         voiceOptions={voiceOptions}
         onClose={handleZoomClose}
@@ -1813,6 +1887,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         onChangeNarration={handleZoomNarrationChange}
         onChangeRole={handleZoomRoleChange}
         onChangeEmotion={handleZoomEmotionChange}
+        onChangeSpeed={handleZoomSpeedChange}
       />
     </div>
   );

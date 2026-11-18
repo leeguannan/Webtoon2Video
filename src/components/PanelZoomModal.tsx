@@ -22,8 +22,18 @@ interface PanelZoomModalProps {
   saveMessage?: string;
   /** 可选说话人（与审核台表格同一份候选：不指定 / 讲解者 / 通用男声 / 通用女声 / 各角色名）。 */
   roleOptions: { value: string; label: string }[];
-  /** 本句配音预览（角色 → 音色），由审核台统一计算。 */
-  voiceInfo: { label: string; voice: string; hint: string };
+  /** 本句配音预览（角色 → 音色 → 语速），由审核台统一计算。 */
+  voiceInfo: {
+    label: string;
+    voice: string;
+    hint: string;
+    /** Patch v4.4：当前生效语速（微调后等于 speed_override，否则等于角色默认）。 */
+    speed: number;
+    /** Patch v4.4：按角色解析的默认语速。 */
+    roleSpeed: number;
+    /** Patch v4.4：本句是否做了语速微调。 */
+    speedOverridden: boolean;
+  };
   /** 全部可选音色（仅用于试听当前生效音色的样例）。 */
   voiceOptions: VoiceOption[];
   onClose: () => void;
@@ -33,6 +43,8 @@ interface PanelZoomModalProps {
   onChangeRole: (beatId: string, role: string) => void;
   /** 情绪指令（送音时的语气提示）。 */
   onChangeEmotion: (beatId: string, text: string) => void;
+  /** Patch v4.4：改本句语速（传 null = 清空微调，恢复角色默认语速）。 */
+  onChangeSpeed: (beatId: string, speed: number | null) => void;
 }
 
 const SAVE_STATUS_TEXT: Record<SaveStatus, string> = {
@@ -71,6 +83,7 @@ export const PanelZoomModal: React.FC<PanelZoomModalProps> = ({
   onChangeNarration,
   onChangeRole,
   onChangeEmotion,
+  onChangeSpeed,
 }) => {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const { playingKey, preview, stop } = useVoicePreview();
@@ -243,27 +256,75 @@ export const PanelZoomModal: React.FC<PanelZoomModalProps> = ({
                       </span>
                     )}
                   </p>
-                  <VoicePreviewButton
-                    playing={playingKey === 'zoomVoice'}
-                    sampleReady={!!previewOption?.sample_ready}
-                    onPreview={() =>
-                      preview(
-                        'zoomVoice',
-                        {
-                          voice: voiceInfo.voice,
-                          speed: beat.resolved_voice?.speed ?? 1,
-                        },
-                        voiceOptions
-                      )
-                    }
-                    onStop={stop}
-                  />
+                  <div className="shrink-0">
+                    <VoicePreviewButton
+                      playing={playingKey === 'zoomVoice'}
+                      sampleReady={!!previewOption?.sample_ready}
+                      onPreview={() =>
+                        preview(
+                          'zoomVoice',
+                          {
+                            voice: voiceInfo.voice,
+                            speed: beat.resolved_voice?.speed ?? 1,
+                          },
+                          voiceOptions
+                        )
+                      }
+                      onStop={stop}
+                    />
+                  </div>
                 </div>
                 {voiceInfo.hint && (
                   <p className="mt-1 text-[11px] text-slate-400 leading-relaxed">
                     {voiceInfo.hint}
                   </p>
                 )}
+              </div>
+
+              {/* Patch v4.4：单句语速微调（只作用于本句 TTS 合成，不碰角色默认配置） */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <label
+                    htmlFor="zoom-speed-range"
+                    className="text-xs font-medium text-slate-700"
+                  >
+                    本句语速（speed_override · 本句TTS合成）
+                  </label>
+                  <span className="text-xs font-mono-tabular text-slate-600">
+                    {voiceInfo.speed.toFixed(2)}x
+                  </span>
+                </div>
+                <div className="flex items-center justify-between gap-2 text-[11px]">
+                  {voiceInfo.speedOverridden ? (
+                    <>
+                      <span className="text-slate-500">
+                        角色默认 {voiceInfo.roleSpeed.toFixed(2)}x
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => onChangeSpeed(beat.beat_id, null)}
+                        className="shrink-0 text-blue-600 hover:text-blue-700 hover:underline cursor-pointer"
+                      >
+                        恢复默认
+                      </button>
+                    </>
+                  ) : (
+                    <span className="text-slate-400">角色默认</span>
+                  )}
+                </div>
+                <input
+                  id="zoom-speed-range"
+                  type="range"
+                  min={0.75}
+                  max={1.5}
+                  step={0.01}
+                  value={voiceInfo.speed}
+                  aria-label="本句语速"
+                  onChange={(event) =>
+                    onChangeSpeed(beat.beat_id, Number(event.target.value))
+                  }
+                  className="w-full accent-blue-600 cursor-pointer"
+                />
               </div>
 
               <div>
@@ -351,7 +412,7 @@ export const PanelZoomModal: React.FC<PanelZoomModalProps> = ({
             <p className="text-[11px] text-slate-400 leading-relaxed">
               快捷键：Esc 关闭 · ←/→ 翻格（焦点在输入框内时为移动光标）
               <br />
-              修改字幕原文、配音角色、情绪指令后，在切换分镜或关闭弹窗时自动保存，不会触发重新配音；如需重出配音请回审核台点「保存并从 Stage 5 重跑配音」。
+              修改字幕原文、配音角色、情绪指令、语速后，在切换分镜或关闭弹窗时自动保存，不会触发重新配音；如需重出配音请回审核台点「保存并从 Stage 5 重跑配音」。
             </p>
           </div>
         </div>
