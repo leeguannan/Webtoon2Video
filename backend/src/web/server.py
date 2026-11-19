@@ -27,11 +27,15 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
+import os
 import re
 import tempfile
 import time
 import zipfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Iterator, Literal
 from urllib.parse import quote
@@ -391,7 +395,10 @@ def _load_episode_vision(episode_dir: Path) -> VisionWindowOutput | None:
 
 
 def _validate_storyboard_scenes(
-    raw_scenes: list[dict[str, Any]], valid_panel_ids: set[str]
+    raw_scenes: list[dict[str, Any]],
+    valid_panel_ids: set[str],
+    *,
+    existing_scenes: Sequence[StoryboardScene] | None = None,
 ) -> list[StoryboardScene]:
     """校验前端提交的镜头组并构造 ``StoryboardScene`` 列表。
 
@@ -403,15 +410,53 @@ def _validate_storyboard_scenes(
     * 幕内分镜按 :func:`panel_sort_key` 单调不减排列；
     * 跨幕顺序：后一幕的起始分镜必须排在上一幕末尾分镜之后
       （Patch v4.0 Patch 20.1），否则按剧情时间倒序了。
+
+    Patch v4.7：请求体缺 ``bgm*`` 键时按 ``scene_id`` 从 ``existing_scenes``
+    继承配乐四字段，防止其它面板保存时冲掉已配置的幕级 BGM。
     """
     if not raw_scenes:
         raise HTTPException(status_code=400, detail="至少保留一个镜头组")
+    existing_by_id = {scene.scene_id: scene for scene in (existing_scenes or [])}
     seen: set[str] = set()
     scenes: list[StoryboardScene] = []
     previous_last_key: tuple[str, int, str] | None = None
     for index, raw in enumerate(raw_scenes):
         if not isinstance(raw, dict):
             raise HTTPException(status_code=400, detail=f"第 {index + 1} 幕格式不正确")
+        scene_id = str(raw.get("scene_id") or f"sc_{index + 1:03d}")
+        existing = existing_by_id.get(scene_id)
+        bgm_mood = (
+            str(raw["bgm_mood"])
+            if raw.get("bgm_mood") is not None
+            else (existing.bgm_mood if existing else "")
+        )
+        bgm_suggestion = (
+            str(raw["bgm_suggestion"])
+            if raw.get("bgm_suggestion") is not None
+            else (existing.bgm_suggestion if existing else "")
+        )
+        # bgm / bgm_gain_db 的 None 是合法值（自动选择 / 默认增益），
+        # 只能用「键是否存在」区分显式提交与缺键继承。
+        bgm_value: str | None
+        if "bgm" in raw:
+            bgm_value = None if raw["bgm"] is None else str(raw["bgm"])
+        else:
+            bgm_value = existing.bgm if existing else None
+        if "bgm_gain_db" in raw and raw["bgm_gain_db"] is not None:
+            try:
+                bgm_gain_db = float(raw["bgm_gain_db"])
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"第 {index + 1} 幕的 bgm_gain_db 必须是数字",
+                ) from exc
+            if not -30.0 <= bgm_gain_db <= 6.0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"第 {index + 1} 幕的 bgm_gain_db 必须在 -30~6 dB 之间",
+                )
+        else:
+            bgm_gain_db = existing.bgm_gain_db if existing else None
         panel_ids = [str(pid).strip() for pid in (raw.get("panel_ids") or [])]
         panel_ids = [pid for pid in panel_ids if pid]
         if not panel_ids:
@@ -448,7 +493,7 @@ def _validate_storyboard_scenes(
         scenes.append(
             StoryboardScene(
                 # 与 s3b_scenes 约定对齐：scene_index 1-based、scene_id 前缀 sc_。
-                scene_id=str(raw.get("scene_id") or f"sc_{index + 1:03d}"),
+                scene_id=scene_id,
                 scene_index=index + 1,
                 title=str(raw.get("title") or ""),
                 location=str(raw.get("location") or ""),
@@ -460,6 +505,10 @@ def _validate_storyboard_scenes(
                     str(item) for item in (raw.get("locked_quotes") or []) if str(item)
                 ],
                 visual_recap=str(raw.get("visual_recap") or ""),
+                bgm_mood=bgm_mood,
+                bgm_suggestion=bgm_suggestion,
+                bgm=bgm_value,
+                bgm_gain_db=bgm_gain_db,
             )
         )
     return scenes
@@ -584,6 +633,35 @@ class CoverPreviewRequest(BaseModel):
     episode_no: int | None = None
     cover_text: dict[str, Any] | None = None
     cover_text_override: str | None = None
+
+
+class BgmUploadRequest(BaseModel):
+    """``POST /api/series/{sid}/bgm-library/upload`` 请求体（JSON+Base64）。"""
+
+    filename: str
+    content_base64: str
+    mood_slot: str | None = None
+
+
+#: Patch v4.7 曲库上传限制：30MB、仅四种音频后缀（与 s7 ASSET_SUFFIX_PRIORITY 对齐）。
+BGM_UPLOAD_MAX_BYTES = 30 * 1024 * 1024
+BGM_ALLOWED_SUFFIXES = (".mp3", ".m4a", ".wav", ".ogg")
+
+
+def _decode_base64_audio(content_base64: str) -> bytes:
+    """兼容带/不带 ``data:audio/...;base64,`` 前缀的 Base64 音频解码。"""
+    payload = content_base64.strip()
+    if "," in payload and payload.lower().startswith("data:"):
+        payload = payload.split(",", 1)[1]
+    try:
+        raw = base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"音频 Base64 解码失败：{exc}") from exc
+    if not raw:
+        raise HTTPException(status_code=400, detail="音频内容为空")
+    if len(raw) > BGM_UPLOAD_MAX_BYTES:
+        raise HTTPException(status_code=400, detail="音频体积超过 30MB 上限")
+    return raw
 
 
 # ---------------------------------------------------------------------------
@@ -1059,6 +1137,77 @@ def _resolve_episode_dir(view: "WorkspaceView", episode_id: str) -> tuple[str, P
     return series_id, episode_dir, episode_no
 
 
+#: audio_manifest.json 中可能承载音频条目的容器键（与 s6_timeline 解析口径一致）。
+_MANIFEST_CONTAINER_KEYS = ("audios", "audio_clips", "clips", "items", "audio_manifest")
+
+
+def _sync_pause_to_audio_manifest(
+    episode_dir: Path, beats: Sequence[ScriptBeat] | Sequence[dict[str, Any]]
+) -> int:
+    """把剧本侧的 ``pause_after_ms`` 同步进 ``05_audio/audio_manifest.json``。
+
+    Stage 6 的时间轴以 audio_manifest 的停顿为唯一来源，因此人工改稿或自动
+    节奏留白后必须把新停顿回写到清单，用户才能只重跑 S6→S7 而无需重跑 S5。
+    兼容清单为裸列表或 ``{"audios": [...]}`` 等容器结构；只更新匹配到的
+    beat 的停顿字段，不动其它任何字段；原子写回。返回实际同步的条目数。
+    """
+    manifest_path = episode_dir / "05_audio" / "audio_manifest.json"
+    if not manifest_path.is_file():
+        return 0
+
+    pause_map: dict[str, int] = {}
+    for beat in beats:
+        if isinstance(beat, dict):
+            beat_id = str(beat.get("beat_id") or "")
+            pause = int(beat.get("pause_after_ms") or 0)
+        else:
+            beat_id = str(getattr(beat, "beat_id", "") or "")
+            pause = int(getattr(beat, "pause_after_ms", 0) or 0)
+        if beat_id:
+            pause_map[beat_id] = max(0, min(2000, pause))
+    if not pause_map:
+        return 0
+
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - 清单损坏时不阻断剧本保存
+        return 0
+
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        items = next(
+            (
+                candidate
+                for key in _MANIFEST_CONTAINER_KEYS
+                if isinstance((candidate := data.get(key)), list)
+            ),
+            None,
+        )
+        if items is None:
+            return 0
+    else:
+        return 0
+
+    synced = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        beat_id = str(item.get("beat_id") or "")
+        if beat_id in pause_map:
+            item["pause_after_ms"] = pause_map[beat_id]
+            synced += 1
+    if synced == 0:
+        return 0
+
+    tmp_path = manifest_path.with_name(f"{manifest_path.name}.tmp")
+    tmp_path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    os.replace(tmp_path, manifest_path)
+    return synced
+
+
 class _VisionPayload(BaseModel):
     """Stage 3 面板结果的最小读取模型。"""
 
@@ -1506,6 +1655,8 @@ def create_app(
         beats = _merge_script_beats(script.beats, payload.beats)
         script = script.model_copy(update={"beats": beats})
         save_model(script, script_path)
+        # Patch v4.6：人工调整停顿后同步进 audio_manifest，只重跑 S6→S7 即生效。
+        _sync_pause_to_audio_manifest(view.episode_dir(series_id, episode_no), script.beats)
         readable = view.episode_dir(series_id, episode_no) / "04_script" / "script_readable.md"
         if readable.is_file():
             from stages.s4_scriptwriter import render_readable_script
@@ -1521,6 +1672,75 @@ def create_app(
             )
             result["job"] = job
         return result
+
+    @app.post("/api/episodes/{episode_id}/script/auto-pacing")
+    async def auto_pace_episode_script(episode_id: str) -> dict[str, Any]:
+        """Patch v4.6：对已保存剧本执行叙事节奏自动留白，并同步 audio_manifest。"""
+        located = view.find_episode(episode_id)
+        if located is None:
+            raise HTTPException(status_code=404, detail=f"找不到话次：{episode_id}")
+        series_id, episode_no = located
+        episode_dir = view.episode_dir(series_id, episode_no)
+        script_dir = episode_dir / "04_script"
+        script_path = script_dir / "script.json"
+        if not script_path.is_file():
+            raise HTTPException(status_code=404, detail="该话还没有 Stage 4 剧本")
+        script = load_model(NarrationScript, script_path)
+
+        # 启用幕：优先读已落盘 storyboard；缺失但有 vision 时内存自动编排，
+        # 结果只用于本次节奏判定，绝不落盘覆盖用户的镜头编排。
+        storyboard = s3b_scenes.load_storyboard(
+            s3b_scenes.storyboard_path_for(episode_dir)
+        )
+        if storyboard is None:
+            vision = _load_episode_vision(episode_dir)
+            if vision is not None:
+                try:
+                    storyboard = s3b_scenes.auto_build_storyboard(episode_id, vision)
+                except Exception:  # noqa: BLE001 - 自动编排失败退化为无幕模式，规则 B/C 仍可用
+                    storyboard = None
+        active_scenes = (
+            [scene for scene in storyboard.scenes if scene.enabled]
+            if storyboard is not None
+            else []
+        )
+
+        from stages.s4_scriptwriter import (
+            apply_narrative_pacing,
+            render_readable_script,
+        )
+
+        beat_dicts = [beat.model_dump() for beat in script.beats]
+        paced_beats, report = apply_narrative_pacing(
+            beat_dicts,
+            scenes=active_scenes or None,
+            audio_durations_ms=view._audio_durations(episode_dir),
+        )
+        try:
+            updated_script = NarrationScript.model_validate(
+                {**script.model_dump(), "beats": paced_beats}
+            )
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"自动节奏留白产出非法剧本：{exc}"
+            ) from exc
+        save_model(updated_script, script_path)
+        readable_path = script_dir / "script_readable.md"
+        readable_path.write_text(
+            render_readable_script(updated_script), encoding="utf-8"
+        )
+        synced = _sync_pause_to_audio_manifest(episode_dir, updated_script.beats)
+        return {
+            "beats": view.beats(series_id, episode_no),
+            "summary": {
+                "updated_count": report.updated_count,
+                "scene_end_count": report.scene_end_count,
+                "turn_count": report.turn_count,
+                "breath_count": report.breath_count,
+                "changed_beat_ids": report.changed_beat_ids,
+                "audio_manifest_synced": synced,
+            },
+        }
 
     # ------------------------------------------------------------------
     # 镜头编排（Storyboard，Patch v4.0 Patch 20）
@@ -1582,12 +1802,17 @@ def create_app(
         if vision is None:
             raise HTTPException(status_code=404, detail="该话还没有 Stage 3 视觉结果")
         valid_panel_ids = {panel.panel_id for panel in vision.panels}
-        scenes = _validate_storyboard_scenes(payload.scenes, valid_panel_ids)
+        storyboard_path = s3b_scenes.storyboard_path_for(episode_dir)
+        existing_storyboard = s3b_scenes.load_storyboard(storyboard_path)
+        scenes = _validate_storyboard_scenes(
+            payload.scenes,
+            valid_panel_ids,
+            existing_scenes=existing_storyboard.scenes if existing_storyboard else None,
+        )
         # 人工保存一律标记 source="human"，此后自动流程与 reset 之外绝不覆写。
         storyboard = EpisodeStoryboard(
             episode_id=episode_id, source="human", scenes=scenes
         )
-        storyboard_path = s3b_scenes.storyboard_path_for(episode_dir)
         s3b_scenes.save_storyboard(storyboard, storyboard_path)
         return _storyboard_payload(storyboard, episode_id, series_id, episode_no)
 
@@ -1626,7 +1851,12 @@ def create_app(
         if payload.scenes:
             # 带 scenes：先按人工编排保存（source="human"），再入队重跑。
             valid_panel_ids = {panel.panel_id for panel in vision.panels}
-            scenes = _validate_storyboard_scenes(payload.scenes, valid_panel_ids)
+            existing_storyboard = s3b_scenes.load_storyboard(storyboard_path)
+            scenes = _validate_storyboard_scenes(
+                payload.scenes,
+                valid_panel_ids,
+                existing_scenes=existing_storyboard.scenes if existing_storyboard else None,
+            )
             storyboard = EpisodeStoryboard(
                 episode_id=episode_id, source="human", scenes=scenes
             )
@@ -1651,6 +1881,151 @@ def create_app(
                 storyboard, episode_id, series_id, episode_no
             ),
         }
+
+    # ------------------------------------------------------------------
+    # Patch v4.7：作品曲库管理 + 按幕 AI 配乐建议
+    # ------------------------------------------------------------------
+    BGM_MEDIA_TYPES = {
+        ".mp3": "audio/mpeg",
+        ".m4a": "audio/mp4",
+        ".wav": "audio/wav",
+        ".ogg": "audio/ogg",
+    }
+
+    def _bgm_library_payload(series_id: str) -> dict[str, Any]:
+        """组装曲库响应：五档情绪预设 + 作品/全局曲目（带试听 URL）。"""
+        series_dir = view.registry.series_dir(series_id)
+        tracks = []
+        for item in s7_renderer.list_bgm_library(series_dir):
+            tracks.append(
+                {
+                    "filename": item["filename"],
+                    "scope": item["scope"],
+                    "size_bytes": item["size_bytes"],
+                    "url": (
+                        f"/api/series/{series_id}/bgm-file/"
+                        f"{item['scope']}/{quote(item['filename'])}"
+                    ),
+                }
+            )
+        moods = [
+            {"mood": mood, **preset}
+            for mood, preset in s3b_scenes.BGM_MOOD_PRESETS.items()
+        ]
+        return {"series_id": series_id, "moods": moods, "tracks": tracks}
+
+    @app.get("/api/series/{series_id}/bgm-library")
+    def get_bgm_library(series_id: str) -> dict[str, Any]:
+        if series_id not in view.series_ids():
+            raise HTTPException(status_code=404, detail=f"作品不存在：{series_id}")
+        return _bgm_library_payload(series_id)
+
+    @app.get("/api/series/{series_id}/bgm-file/{scope}/{filename}")
+    def get_bgm_file(series_id: str, scope: str, filename: str) -> FileResponse:
+        """流式回源一首曲库音频（试听用），scope 仅允许 series/global。"""
+        if series_id not in view.series_ids():
+            raise HTTPException(status_code=404, detail=f"作品不存在：{series_id}")
+        if scope not in ("series", "global"):
+            raise HTTPException(status_code=400, detail="scope 只支持 series / global")
+        safe_name = Path(filename).name  # 防路径穿越
+        if Path(safe_name).suffix.lower() not in BGM_ALLOWED_SUFFIXES:
+            raise HTTPException(status_code=400, detail="不支持的音频格式")
+        if scope == "series":
+            path = (
+                view.registry.series_dir(series_id)
+                / s7_renderer.ASSETS_DIR_NAME
+                / s7_renderer.BGM_DIR_NAME
+                / safe_name
+            )
+        else:
+            path = s7_renderer.assets_root() / s7_renderer.BGM_DIR_NAME / safe_name
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail=f"找不到曲目：{safe_name}")
+        return FileResponse(
+            path,
+            media_type=BGM_MEDIA_TYPES.get(
+                Path(safe_name).suffix.lower(), "application/octet-stream"
+            ),
+            filename=safe_name,
+            content_disposition_type="inline",
+        )
+
+    @app.post("/api/series/{series_id}/bgm-library/upload")
+    def upload_bgm_track(series_id: str, payload: BgmUploadRequest) -> dict[str, Any]:
+        if series_id not in view.series_ids():
+            raise HTTPException(status_code=404, detail=f"作品不存在：{series_id}")
+        raw_name = Path(payload.filename or "").name
+        if not raw_name:
+            raise HTTPException(status_code=400, detail="filename 不能为空")
+        suffix = Path(raw_name).suffix.lower()
+        if suffix not in BGM_ALLOWED_SUFFIXES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"只支持 {', '.join(BGM_ALLOWED_SUFFIXES)} 音频",
+            )
+        if payload.mood_slot is not None:
+            if payload.mood_slot not in s3b_scenes.BGM_MOOD_PRESETS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "mood_slot 必须是五档情绪之一："
+                        f"{', '.join(s3b_scenes.BGM_MOOD_PRESETS)}"
+                    ),
+                )
+            target_name = f"{payload.mood_slot}{suffix}"
+        else:
+            target_name = raw_name
+        raw_bytes = _decode_base64_audio(payload.content_base64)
+        bgm_dir = (
+            view.registry.series_dir(series_id)
+            / s7_renderer.ASSETS_DIR_NAME
+            / s7_renderer.BGM_DIR_NAME
+        )
+        bgm_dir.mkdir(parents=True, exist_ok=True)
+        (bgm_dir / target_name).write_bytes(raw_bytes)
+        return _bgm_library_payload(series_id)
+
+    @app.delete("/api/series/{series_id}/bgm-library/{filename}")
+    def delete_bgm_track(series_id: str, filename: str) -> dict[str, Any]:
+        """只允许删除作品专属曲目，全局曲库受保护。"""
+        if series_id not in view.series_ids():
+            raise HTTPException(status_code=404, detail=f"作品不存在：{series_id}")
+        safe_name = Path(filename).name
+        path = (
+            view.registry.series_dir(series_id)
+            / s7_renderer.ASSETS_DIR_NAME
+            / s7_renderer.BGM_DIR_NAME
+            / safe_name
+        )
+        if not path.is_file():
+            raise HTTPException(
+                status_code=404, detail=f"作品曲库中找不到曲目：{safe_name}"
+            )
+        path.unlink()
+        return _bgm_library_payload(series_id)
+
+    @app.post("/api/episodes/{episode_id}/storyboard/suggest-bgm")
+    def suggest_episode_bgm(episode_id: str) -> dict[str, Any]:
+        """对存量话次一键补全各幕 AI 配乐建议（只写 mood/suggestion，不动人工 bgm）。"""
+        located = view.find_episode(episode_id)
+        if located is None:
+            raise HTTPException(status_code=404, detail=f"找不到话次：{episode_id}")
+        series_id, episode_no = located
+        episode_dir = view.episode_dir(series_id, episode_no)
+        storyboard_path = s3b_scenes.storyboard_path_for(episode_dir)
+        storyboard = s3b_scenes.load_storyboard(storyboard_path)
+        if storyboard is None:
+            vision = _load_episode_vision(episode_dir)
+            if vision is None:
+                raise HTTPException(
+                    status_code=404, detail="该话还没有分镜，无法生成配乐建议"
+                )
+            storyboard = s3b_scenes.auto_build_storyboard(episode_id, vision)
+        else:
+            vision = _load_episode_vision(episode_dir)
+        storyboard = s3b_scenes.suggest_storyboard_bgm(storyboard, vision)
+        s3b_scenes.save_storyboard(storyboard, storyboard_path)
+        return _storyboard_payload(storyboard, episode_id, series_id, episode_no)
 
     @app.get("/api/episodes/{episode_id}/panels/{filename}")
     async def get_episode_panel_file(episode_id: str, filename: str) -> FileResponse:

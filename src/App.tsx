@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import type {
   ArcSummary,
+  AutoPacingResponse,
   CharacterProfile,
   EpisodeDigest,
   EpisodeItem,
@@ -801,6 +802,32 @@ export default function App() {
     }));
   };
 
+  /**
+   * Patch v4.6：一键叙事节奏留白。后端按确定性规则改写 pause_after_ms，
+   * 同步 script.json 与 audio_manifest.json，返回最新 beats 与调整明细；
+   * 成功后本地不可变更新该话 beats，调用方据此刷新草稿并提示只重跑 S6→S7。
+   * 失败时上报错误并返回 null，由组件展示内联错误，不使用浏览器弹窗。
+   */
+  const handleAutoPacing = useCallback(
+    async (episodeId: string): Promise<AutoPacingResponse | null> => {
+      try {
+        const result = await apiFetch<AutoPacingResponse>(
+          `/episodes/${encodeURIComponent(episodeId)}/script/auto-pacing`,
+          { method: 'POST' }
+        );
+        patchEpisode(episodeId, (ep) => ({
+          ...ep,
+          beats: result.beats as ScriptBeat[],
+        }));
+        return result;
+      } catch (err) {
+        reportError('自动节奏留白失败', err);
+        return null;
+      }
+    },
+    [patchEpisode]
+  );
+
   const handleExportEpisode = async (
     episodeId: string,
     format: 'mp4' | 'ass' | 'script'
@@ -1287,6 +1314,7 @@ export default function App() {
               onTogglePanelBlank={handleTogglePanelBlank}
               onUpdateBeats={handleUpdateBeats}
               onAutoSaveBeats={handleAutoSaveBeats}
+              onAutoPacing={handleAutoPacing}
               onUpdateEpisodeRenderOptions={handleUpdateEpisodeRenderOptions}
               onExportEpisode={handleExportEpisode}
             />

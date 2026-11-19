@@ -320,6 +320,15 @@ export interface StoryboardScene {
   locked_quotes: string[];
   /** Stage 3b 整幕视觉联看摘要（AI 生成，只读参考）。 */
   visual_recap?: string;
+  // ---- Patch v4.7：按幕 BGM ----
+  /** AI 配乐情绪档位（五档之一），空串表示尚未生成。 */
+  bgm_mood?: string;
+  /** AI 配乐建议（乐器/BPM/氛围 + 英文搜歌关键词）。 */
+  bgm_suggestion?: string;
+  /** 本幕曲目文件名；null/undefined=自动，'none'=显式静音。 */
+  bgm?: string | null;
+  /** 本幕独立增益（dB），null=跟随作品默认。 */
+  bgm_gain_db?: number | null;
 }
 
 /** panels_index 中单格的精简信息（后端 Storyboard 接口下发）。 */
@@ -359,4 +368,52 @@ export interface EpisodeResetResponse {
   preserved_human_storyboard: boolean;
   stages: StageProgress[];
   logs?: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Patch v4.6：叙事节奏自动留白（auto-pacing）
+// ---------------------------------------------------------------------------
+/** 自动节奏留白的执行明细（与后端 PacingReport + manifest 同步数对齐）。 */
+export interface AutoPacingSummary {
+  updated_count: number;
+  scene_end_count: number;
+  turn_count: number;
+  breath_count: number;
+  changed_beat_ids: string[];
+  /** 同步进 05_audio/audio_manifest.json 的条目数。 */
+  audio_manifest_synced: number;
+}
+
+/** POST /api/episodes/{id}/script/auto-pacing 的完整响应。 */
+export interface AutoPacingResponse {
+  beats: ScriptBeat[];
+  summary: AutoPacingSummary;
+}
+
+// ---------------------------------------------------------------------------
+// Patch v4.7：按幕 AI 配乐与曲库管理
+// ---------------------------------------------------------------------------
+/** 五档配乐情绪预设（与后端 s3b_scenes.BGM_MOOD_PRESETS 对齐）。 */
+export interface BgmMoodPreset {
+  mood: string;
+  label: string;
+  description: string;
+  search_keywords: string[];
+  default_suggestion: string;
+}
+
+/** 曲库中的一首曲目（作品级 scope='series' / 全局 scope='global'）。 */
+export interface BgmTrackItem {
+  filename: string;
+  scope: 'series' | 'global';
+  size_bytes: number;
+  /** 经后端的流式试听地址。 */
+  url: string;
+}
+
+/** GET /api/series/{id}/bgm-library 的完整响应。 */
+export interface BgmLibraryResponse {
+  series_id: string;
+  moods: BgmMoodPreset[];
+  tracks: BgmTrackItem[];
 }

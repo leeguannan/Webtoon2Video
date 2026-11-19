@@ -130,6 +130,11 @@ class StoryboardScene(BaseModel):
     user_note: str = ""
     locked_quotes: list[str] = Field(default_factory=list)
     visual_recap: str = ""
+    # Patch v4.7：按幕 BGM 配乐。旧 storyboard.json 缺这些键时全部走默认值。
+    bgm_mood: str = ""
+    bgm_suggestion: str = ""
+    bgm: str | None = None
+    bgm_gain_db: float | None = Field(default=None, ge=-30.0, le=6.0)
 
 
 class EpisodeStoryboard(BaseModel):

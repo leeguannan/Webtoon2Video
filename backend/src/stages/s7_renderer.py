@@ -35,6 +35,7 @@ import re
 import shutil
 import subprocess
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -44,8 +45,17 @@ from core.branding_render import (
     render_outro_image,
     resolve_effective_branding,
 )
-from core.config import AppConfig, assets_root, load_series_config
-from core.schemas import RenderTimeline, SfxEvent, SubtitleLine, TimelineScene, load_model
+from core.config import AppConfig, SeriesConfig, assets_root, load_series_config
+from core.schemas import (
+    EpisodeStoryboard,
+    RenderTimeline,
+    SfxEvent,
+    StoryboardScene,
+    SubtitleLine,
+    TimelineScene,
+    load_model,
+)
+from stages.s3b_scenes import load_storyboard, storyboard_path_for
 
 #: Stage 7 输出目录名（对应 ``core.manifest.STAGE_DIR_NAMES["s7_renderer"]``）。
 OUT_DIR_NAME = "07_out"
@@ -630,6 +640,375 @@ def resolve_sfx_asset(
     return resolve_audio_asset(root / SFX_DIR_NAME, sfx_key)
 
 
+# --------------------------------------------------------------------------
+# Patch v4.7：按幕 BGM（曲库扫描 / 单幕解析 / 时间轴分幕 / 多轨平滑混音）
+# --------------------------------------------------------------------------
+#: 多幕 BGM 交叉淡化的默认重叠时长与静音侧的自身淡变上限（毫秒）。
+DEFAULT_BGM_CROSSFADE_MS = 1400
+_BGM_SILENT_FADE_MS = 700
+
+
+def list_bgm_library(
+    series_dir: str | Path | None,
+    assets_dir: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """扫描作品级与全局两个 BGM 曲库，返回曲目元数据列表。
+
+    作品级目录 ``<series_dir>/assets/bgm`` 标记 ``scope="series"``，
+    全局目录 ``<assets_dir>/bgm``（缺省取 :func:`assets_root`）标记
+    ``scope="global"``；作品级排在前面，同名时前端可据此优先展示。
+    只收 :data:`ASSET_SUFFIX_PRIORITY` 里的音频后缀。
+    """
+    tracks: list[dict[str, Any]] = []
+
+    def _scan(root: Path, scope: str) -> None:
+        if not root.is_dir():
+            return
+        for path in sorted(root.iterdir()):
+            if not path.is_file() or path.suffix.lower() not in ASSET_SUFFIX_PRIORITY:
+                continue
+            tracks.append(
+                {
+                    "filename": path.name,
+                    "scope": scope,
+                    "path": path,
+                    "size_bytes": path.stat().st_size,
+                }
+            )
+
+    if series_dir is not None:
+        _scan(Path(series_dir) / ASSETS_DIR_NAME / BGM_DIR_NAME, "series")
+    global_root = Path(assets_dir).expanduser() if assets_dir else assets_root()
+    _scan(global_root / BGM_DIR_NAME, "global")
+    return tracks
+
+
+def resolve_scene_bgm_path(
+    scene: StoryboardScene,
+    *,
+    series_dir: Path,
+    series_config: SeriesConfig,
+    settings: AppConfig,
+    assets_dir: str | Path | None = None,
+) -> tuple[Path | None, float]:
+    """解析单幕 BGM 的实际文件与增益，返回 ``(path | None, gain_db)``。
+
+    决策顺序：
+
+    1. ``scene.bgm`` 为 ``none``/``silent`` → 本幕显式静音 ``(None, gain)``；
+    2. ``scene.bgm`` 是具体文件名 → 作品曲库优先、全局曲库兜底，再按裸路径；
+    3. ``scene.bgm`` 为空（自动）→ 先按 ``bgm_mood`` 同名命中（如
+       ``sad_piano.mp3``），否则回退作品级配置与全局默认 BGM。
+
+    增益优先取幕级 ``bgm_gain_db``，缺省用渲染配置 ``render.bgm_gain_db``。
+    """
+    gain = (
+        float(scene.bgm_gain_db)
+        if scene.bgm_gain_db is not None
+        else float(settings.render.bgm_gain_db)
+    )
+    series_bgm_dir = series_dir / ASSETS_DIR_NAME / BGM_DIR_NAME
+    global_root = Path(assets_dir).expanduser() if assets_dir else assets_root()
+    global_bgm_dir = global_root / BGM_DIR_NAME
+    choice = (scene.bgm or "").strip()
+
+    if choice.lower() in {"none", "silent"}:
+        return None, gain
+
+    if choice:
+        hit = resolve_audio_asset(series_bgm_dir, choice)
+        if hit is None:
+            hit = resolve_audio_asset(global_bgm_dir, choice)
+        if hit is None:
+            candidate = Path(choice)
+            hit = candidate if candidate.is_absolute() else series_dir / candidate
+            if not hit.is_file():
+                print(f"[s7] 警告：幕 {scene.scene_id} 指定的 BGM {choice!r} 不存在，回退自动配乐")
+                hit = None
+        if hit is not None:
+            return hit, gain
+
+    # 自动模式：先按情绪档同名命中（作品级优先，再全局）。
+    mood = (scene.bgm_mood or "").strip()
+    if mood:
+        hit = resolve_audio_asset(series_bgm_dir, mood)
+        if hit is None:
+            hit = resolve_audio_asset(global_bgm_dir, mood)
+        if hit is not None:
+            return hit, gain
+
+    configured = (series_config.bgm or "").strip() if series_config else ""
+    if configured:
+        candidate = Path(configured)
+        hit = candidate if candidate.is_absolute() else series_dir / candidate
+        if hit.is_file():
+            return hit, gain
+    default_hit = resolve_default_bgm(settings, assets_dir=assets_dir)
+    return default_hit, gain
+
+
+@dataclass(frozen=True, slots=True)
+class BgmSpan:
+    """正文时间轴上的一段 BGM（毫秒，相对正文 0 点；允许负起点覆盖封页）。"""
+
+    start_ms: int
+    end_ms: int
+    bgm_path: Path | None
+    gain_db: float
+
+
+def build_scene_bgm_spans(
+    storyboard: EpisodeStoryboard,
+    timeline: RenderTimeline,
+    *,
+    series_dir: Path,
+    series_config: SeriesConfig,
+    settings: AppConfig,
+    assets_dir: str | Path | None = None,
+    cover_duration_ms: int = 0,
+    outro_duration_ms: int = 0,
+) -> list[BgmSpan]:
+    """按启用幕把正文 ``[0, total_duration_ms]`` 连续切成若干 :class:`BgmSpan`。
+
+    * ``timeline.scenes`` 的 ``panel_id`` 映射到幕（``panel_ids`` 命中），
+      对不上幕的时间格归入相邻前幕（开头悬空归第一幕），保证区间无空洞；
+    * 相邻幕若解析出同一文件且增益（保留 1 位小数）相同，自动合并；
+    * 首段向前含封页时长（负起点）、末段向后含结尾时长，由混音环节夹取。
+    """
+    active_scenes = [
+        scene
+        for scene in storyboard.scenes
+        if scene.enabled and scene.panel_ids
+    ]
+    if not active_scenes:
+        return []
+
+    panel_owner: dict[str, StoryboardScene] = {}
+    for scene in active_scenes:
+        for panel_id in scene.panel_ids:
+            panel_owner.setdefault(panel_id, scene)
+
+    resolved: dict[str, tuple[Path | None, float]] = {
+        scene.scene_id: resolve_scene_bgm_path(
+            scene,
+            series_dir=series_dir,
+            series_config=series_config,
+            settings=settings,
+            assets_dir=assets_dir,
+        )
+        for scene in active_scenes
+    }
+
+    total_ms = max(0, int(timeline.total_duration_ms or 0))
+    if total_ms <= 0:
+        return []
+
+    # 1) 时间格按出现顺序归组到 owner（None = 没对上任何启用幕）。
+    raw: list[tuple[int, int, StoryboardScene | None]] = []
+    for tl_scene in sorted(timeline.scenes or [], key=lambda item: int(item.start_ms)):
+        owner = panel_owner.get(tl_scene.panel_id)
+        start = max(0, int(tl_scene.start_ms))
+        end = min(total_ms, int(tl_scene.end_ms))
+        if end <= start:
+            continue
+        if raw and raw[-1][2] is owner:
+            prev_start, _prev_end, prev_owner = raw[-1]
+            raw[-1] = (prev_start, end, prev_owner)
+        else:
+            raw.append((start, end, owner))
+    if not raw:
+        return []
+
+    # 2) 悬空段归并：开头的 None 归第一幕，其余 None 归前一幕。
+    first_owner = next((owner for _, _, owner in raw if owner is not None), None)
+    if first_owner is None:
+        return []
+    last_owner: StoryboardScene | None = None
+    filled: list[tuple[int, int, StoryboardScene]] = []
+    for start, end, owner in raw:
+        if owner is None:
+            owner = last_owner or first_owner
+        filled.append((start, end, owner))
+        last_owner = owner
+
+    # 3) 用 owner 切换点把时间轴切成连续无空洞区间 [boundary[i], boundary[i+1])。
+    boundaries: list[tuple[int, StoryboardScene]] = []
+    current: StoryboardScene | None = None
+    for start, _end, owner in filled:
+        if owner is not current:
+            boundaries.append((start, owner))
+            current = owner
+
+    spans: list[BgmSpan] = []
+    for index, (start, owner) in enumerate(boundaries):
+        end = boundaries[index + 1][0] if index + 1 < len(boundaries) else total_ms
+        path, gain = resolved[owner.scene_id]
+        spans.append(BgmSpan(start, end, path, gain))
+
+    # 4) 相邻同曲同增益合并。
+    merged: list[BgmSpan] = []
+    for span in spans:
+        if (
+            merged
+            and merged[-1].bgm_path == span.bgm_path
+            and round(merged[-1].gain_db, 1) == round(span.gain_db, 1)
+        ):
+            prev = merged[-1]
+            merged[-1] = BgmSpan(prev.start_ms, span.end_ms, prev.bgm_path, prev.gain_db)
+        else:
+            merged.append(span)
+
+    # 5) 封页/结尾向外扩展。
+    cover_ms = max(0, int(cover_duration_ms))
+    outro_ms = max(0, int(outro_duration_ms))
+    if merged:
+        first = merged[0]
+        merged[0] = BgmSpan(first.start_ms - cover_ms, first.end_ms, first.bgm_path, first.gain_db)
+        last = merged[-1]
+        merged[-1] = BgmSpan(last.start_ms, last.end_ms + outro_ms, last.bgm_path, last.gain_db)
+    return merged
+
+
+def _bgm_span_neighbours(
+    spans: Sequence[BgmSpan], index: int
+) -> tuple[BgmSpan | None, BgmSpan | None]:
+    """取相邻 span（跳过不存在的索引）。"""
+    prev_span = spans[index - 1] if index > 0 else None
+    next_span = spans[index + 1] if index + 1 < len(spans) else None
+    return prev_span, next_span
+
+
+def synthesize_multi_bgm_wav(
+    spans: Sequence[BgmSpan],
+    *,
+    total_s: float,
+    out_path: Path,
+    ffmpeg_bin: str = "ffmpeg",
+    crossfade_ms: int = DEFAULT_BGM_CROSSFADE_MS,
+) -> Path | None:
+    """把多幕 BGM 按绝对时间轴预合成一条立体声 WAV。
+
+    方案：每条非静音 :class:`BgmSpan` 独立成轨，在跨幕边界两侧各扩展半个
+    重叠区并做 ``afade`` 淡入淡出，``adelay`` 落到绝对时间点后多路
+    ``amix`` 混合；静音幕不生成轨道，混合后该时段自然无声。
+
+    * 相邻都是非静音且曲目不同：单边扩展
+      ``min(crossfade_ms, 邻段时长*0.35, 本段时长*0.35) // 2``；
+    * 邻段是静音或位于片头片尾：本段做不超过 700ms 的自身淡变；
+    * 全部 span 都静音时返回 ``None``，调用方按「无 BGM」处理。
+    """
+    total_ms = max(1, int(round(total_s * 1000)))
+    clipped: list[BgmSpan] = []
+    for span in spans:
+        start = max(0, int(span.start_ms))
+        end = min(total_ms, int(span.end_ms))
+        if end > start:
+            clipped.append(BgmSpan(start, end, span.bgm_path, span.gain_db))
+    if not clipped:
+        return None
+    if all(span.bgm_path is None for span in clipped):
+        return None
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    args: list[str] = ["-y", "-hide_banner"]
+    tracks: list[dict[str, float | int | str]] = []
+    for index, span in enumerate(clipped):
+        if span.bgm_path is None:
+            continue
+        prev_span, next_span = _bgm_span_neighbours(clipped, index)
+        duration_ms = span.end_ms - span.start_ms
+
+        def _half_extent(neighbour: BgmSpan | None) -> int:
+            if neighbour is None or neighbour.bgm_path is None:
+                return 0
+            neighbour_duration = max(1, neighbour.end_ms - neighbour.start_ms)
+            return max(
+                0,
+                min(
+                    int(crossfade_ms),
+                    int(neighbour_duration * 0.35),
+                    int(duration_ms * 0.35),
+                )
+                // 2,
+            )
+
+        left_ext = _half_extent(prev_span)
+        right_ext = _half_extent(next_span)
+        # 夹取到整片时间轴之内。
+        left_ext = min(left_ext, span.start_ms)
+        right_ext = min(right_ext, total_ms - span.end_ms)
+        track_start = span.start_ms - left_ext
+        track_end = span.end_ms + right_ext
+        track_duration_ms = track_end - track_start
+
+        # 淡变时长：跨曲重叠区两侧各 ext，总重叠 2*ext；静音/边界侧 <=700ms。
+        fade_in_ms = (2 * left_ext) if left_ext > 0 else min(_BGM_SILENT_FADE_MS, duration_ms)
+        fade_out_ms = (
+            2 * right_ext if right_ext > 0 else min(_BGM_SILENT_FADE_MS, duration_ms)
+        )
+        fade_in_ms = min(fade_in_ms, track_duration_ms)
+        fade_out_ms = min(fade_out_ms, track_duration_ms - fade_in_ms)
+
+        args += ["-stream_loop", "-1", "-i", str(span.bgm_path)]
+        tracks.append(
+            {
+                "index": len(tracks),
+                "delay": track_start,
+                "duration_s": track_duration_ms / 1000.0,
+                "fade_in_ms": fade_in_ms,
+                "fade_out_ms": fade_out_ms,
+                "gain_db": span.gain_db,
+            }
+        )
+
+    # 注意：loudnorm 必须放在 amix 之后的总线上，不能放在各轨内。
+    # 实测 ffmpeg 9 中 loudnorm 收到有限流 EOF 后会提前透传结束信号，
+    # 导致其后的 adelay 缓冲样本不被 flush（大延迟轨道整体丢失，
+    # 输出只剩 atrim 截出的前几秒）。轨内只做成型，总线统一归一化，
+    # 响度目标与单曲 BGM 链路（I=-16/TP=-1.5/LRA=11）保持一致。
+    chains: list[str] = []
+    labels: list[str] = []
+    for track in tracks:
+        idx = int(track["index"])
+        delay = int(track["delay"])
+        duration_s = float(track["duration_s"])
+        chain = (
+            f"[{idx}:a]aformat=sample_fmts=fltp:sample_rates={_AUDIO_RATE}:"
+            f"channel_layouts={_AUDIO_LAYOUT},atrim=0:{duration_s:.3f},"
+            f"volume={float(track['gain_db']):.1f}dB"
+        )
+        fade_in_ms = int(track["fade_in_ms"])
+        fade_out_ms = int(track["fade_out_ms"])
+        if fade_in_ms > 0:
+            chain += f",afade=t=in:st=0:d={fade_in_ms / 1000.0:.3f}"
+        if fade_out_ms > 0:
+            out_start = max(0.0, duration_s - fade_out_ms / 1000.0)
+            chain += f",afade=t=out:st={out_start:.3f}:d={fade_out_ms / 1000.0:.3f}"
+        chain += f",adelay={delay}|{delay},apad,atrim=0:{total_s:.3f}[bm{idx}]"
+        chains.append(chain)
+        labels.append(f"bm{idx}")
+
+    mixed, mix_chains = _mix_labels(labels, prefix="bm")
+    chains.extend(mix_chains)
+    chains.append(
+        f"[{mixed}]loudnorm=I=-16:TP=-1.5:LRA=11,apad,atrim=0:{total_s:.3f}[bgmout]"
+    )
+    args += ["-filter_complex", ";".join(chains)]
+    args += [
+        "-map",
+        "[bgmout]",
+        "-c:a",
+        "pcm_s16le",
+        "-ar",
+        str(_AUDIO_RATE),
+        "-ac",
+        "2",
+        str(out_path),
+    ]
+    run_ffmpeg(args, ffmpeg_bin=ffmpeg_bin)
+    return out_path
+
+
 def _beat_start_map(scenes: Sequence[TimelineScene], clips: Sequence[Any]) -> dict[str, int]:
     """beat_id → 音频起始毫秒。
 
@@ -667,6 +1046,7 @@ def _prepare_audio(
     audio_offset_ms: int = 0,
     bgm_fade_in_ms: int = 0,
     bgm_fade_out_ms: int = 0,
+    bgm_pre_mixed: bool = False,
 ) -> tuple[Path, Path | None, Path | None]:
     """调用 A「备音」：产出人声轨、BGM 轨与音效轨。
 
@@ -678,6 +1058,10 @@ def _prepare_audio(
     Patch v4.5：``audio_offset_ms`` 把所有人声/音效落点整体后移（给封页引导留白）；
     ``bgm_fade_in_ms`` / ``bgm_fade_out_ms`` 在 BGM 轨首尾加平滑 ``afade``。
     三个参数全为 0（默认）时滤镜链与历史行为完全一致。
+
+    Patch v4.7：``bgm_pre_mixed=True`` 表示 ``bgm_path`` 已是多幕预合成的全长
+    WAV（内含响度归一、分幕增益与交叉淡化），此时不再 ``-stream_loop``、
+    不再重复施加 ``loudnorm`` / ``volume``，只保留格式规范与 v4.5 首尾淡变。
     """
     audio_offset_ms = max(0, int(audio_offset_ms))
     voice_path = work_dir / "voice.wav"
@@ -742,8 +1126,12 @@ def _prepare_audio(
         args += ["-i", str(path)]
     bgm_index = len(usable)
     if bgm_path is not None:
-        # -stream_loop -1 让短 BGM 循环铺满整条片，末尾由 atrim 精确截断。
-        args += ["-stream_loop", "-1", "-i", str(bgm_path)]
+        if bgm_pre_mixed:
+            # Patch v4.7：预合成 WAV 已是整片全长，直接顺序读取即可。
+            args += ["-i", str(bgm_path)]
+        else:
+            # -stream_loop -1 让短 BGM 循环铺满整条片，末尾由 atrim 精确截断。
+            args += ["-stream_loop", "-1", "-i", str(bgm_path)]
     sfx_base = len(usable) + (1 if bgm_path is not None else 0)
     for path, _start, _gain in sfx_inputs:
         args += ["-i", str(path)]
@@ -767,15 +1155,23 @@ def _prepare_audio(
         chains.append(f"anullsrc=r={_AUDIO_RATE}:cl={_AUDIO_LAYOUT}:d={total_s:.3f}[voice]")
 
     if bgm_path is not None:
-        # Patch 14：先 loudnorm 响度归一（统一各来源 BGM 的音量基线）再降增益，
-        # 顺序保持「loudnorm → volume=bgm_gain_db → sidechaincompress」。
-        # Patch v4.5：atrim 之后按需追加首尾 afade（封页渐入 / 结尾随画面同步淡出）。
-        bgm_filters = (
-            f"[{bgm_index}:a]aformat=sample_fmts=fltp:sample_rates={_AUDIO_RATE}:"
-            f"channel_layouts={_AUDIO_LAYOUT},loudnorm=I=-16:TP=-1.5:LRA=11,"
-            f"volume={float(bgm_gain_db):.1f}dB,"
-            f"apad,atrim=0:{total_s:.3f}"
-        )
+        if bgm_pre_mixed:
+            # Patch v4.7：多幕预合成轨已含 loudnorm/分幕增益/交叉淡化，
+            # 这里只规范采样格式并截到整片时长，v4.5 首尾 afade 仍可叠加。
+            bgm_filters = (
+                f"[{bgm_index}:a]aformat=sample_fmts=fltp:sample_rates={_AUDIO_RATE}:"
+                f"channel_layouts={_AUDIO_LAYOUT},apad,atrim=0:{total_s:.3f}"
+            )
+        else:
+            # Patch 14：先 loudnorm 响度归一（统一各来源 BGM 的音量基线）再降增益，
+            # 顺序保持「loudnorm → volume=bgm_gain_db → sidechaincompress」。
+            # Patch v4.5：atrim 之后按需追加首尾 afade（封页渐入 / 结尾随画面同步淡出）。
+            bgm_filters = (
+                f"[{bgm_index}:a]aformat=sample_fmts=fltp:sample_rates={_AUDIO_RATE}:"
+                f"channel_layouts={_AUDIO_LAYOUT},loudnorm=I=-16:TP=-1.5:LRA=11,"
+                f"volume={float(bgm_gain_db):.1f}dB,"
+                f"apad,atrim=0:{total_s:.3f}"
+            )
         total_ms = max(1, int(round(total_s * 1000)))
         fade_in_ms = min(max(0, int(bgm_fade_in_ms)), total_ms // 2)
         fade_out_ms = min(max(0, int(bgm_fade_out_ms)), total_ms - fade_in_ms)
@@ -1205,6 +1601,7 @@ def render_timeline(
     outro_fade_out_ms: int = 0,
     bgm_fade_in_ms: int = 0,
     bgm_fade_out_ms: int = 0,
+    bgm_pre_mixed: bool = False,
 ) -> Path:
     """按时间轴渲染成片，返回成片路径。
 
@@ -1282,6 +1679,7 @@ def render_timeline(
         audio_offset_ms=eff_cover_ms,
         bgm_fade_in_ms=bgm_fade_in_ms if branding_on else 0,
         bgm_fade_out_ms=bgm_fade_out_ms if branding_on else 0,
+        bgm_pre_mixed=bgm_pre_mixed,
     )
 
     # ---- 字幕 PNG ----
@@ -1525,6 +1923,65 @@ def render_episode(
             print(f"[s7] 警告：结尾图渲染失败，本话跳过片尾：{exc}")
             outro_composed = None
 
+    # ---- Patch v4.7：按幕 BGM 多轨平滑混音（失败只降级，绝不阻断出片）----
+    # 与 render_timeline 内部夹取口径保持一致：片包实际生效时长。
+    eff_cover_ms = max(200, int(effective.cover_duration_ms)) if cover_composed else 0
+    eff_outro_ms = max(200, int(effective.outro_duration_ms)) if outro_composed else 0
+    bgm_pre_mixed = False
+    mixed_bgm_path: Path | None = None
+    mixed_bgm_gain = settings.render.bgm_gain_db
+    try:
+        storyboard = load_storyboard(storyboard_path_for(episode_dir))
+        if storyboard is not None:
+            spans = build_scene_bgm_spans(
+                storyboard,
+                timeline,
+                series_dir=series_dir,
+                series_config=series_config,
+                settings=settings,
+                cover_duration_ms=eff_cover_ms,
+                outro_duration_ms=eff_outro_ms,
+            )
+            if spans:
+                distinct_keys = {
+                    (span.bgm_path, round(span.gain_db, 1)) for span in spans
+                }
+                has_silent = any(span.bgm_path is None for span in spans)
+                if len(distinct_keys) >= 2 or has_silent:
+                    extended_total_s = (
+                        int(timeline.total_duration_ms or 0)
+                        + eff_cover_ms
+                        + eff_outro_ms
+                    ) / 1000.0
+                    mixed_bgm_path = work_dir / "multi_bgm.wav"
+                    synthesized = synthesize_multi_bgm_wav(
+                        spans,
+                        total_s=extended_total_s,
+                        out_path=mixed_bgm_path,
+                        ffmpeg_bin=resolved_ffmpeg,
+                    )
+                    if synthesized is not None:
+                        # 预合成轨已含各幕响度归一/增益/淡化，下游不再重复施加。
+                        resolved_bgm = synthesized
+                        mixed_bgm_gain = 0.0
+                        bgm_pre_mixed = True
+                        print(
+                            f"[s7] 按幕 BGM 预合成：{len(spans)} 段、"
+                            f"{len(distinct_keys)} 种曲目/增益，静音幕 "
+                            f"{sum(1 for span in spans if span.bgm_path is None)}"
+                        )
+                    else:
+                        # 全部幕都显式静音：本话不铺 BGM。
+                        resolved_bgm = None
+                else:
+                    # 单一曲目单一增益：直接复用单曲链路，零额外合成开销。
+                    only = spans[0]
+                    resolved_bgm = only.bgm_path
+                    mixed_bgm_gain = only.gain_db
+    except Exception as exc:  # noqa: BLE001 - 按幕配乐是增强项，失败回退单曲逻辑
+        print(f"[s7] 警告：按幕 BGM 处理失败，回退单曲配乐：{exc}")
+        bgm_pre_mixed = False
+
     render_timeline(
         timeline,
         episode_dir=episode_dir,
@@ -1533,7 +1990,7 @@ def render_episode(
         ffmpeg_bin=resolved_ffmpeg,
         background_blur=settings.render.background_blur,
         background_darken=settings.render.background_darken,
-        bgm_gain_db=settings.render.bgm_gain_db,
+        bgm_gain_db=mixed_bgm_gain,
         work_dir=work_dir,
         enable_sfx=settings.render.enable_sfx,
         sfx_gain_db=settings.render.sfx_gain_db,
@@ -1547,6 +2004,7 @@ def render_episode(
         outro_fade_out_ms=effective.outro_fade_out_ms,
         bgm_fade_in_ms=effective.cover_fade_in_ms if cover_composed is not None else 0,
         bgm_fade_out_ms=effective.outro_fade_out_ms if outro_composed is not None else 0,
+        bgm_pre_mixed=bgm_pre_mixed,
     )
 
     # 清理中间音频，避免污染 07_out。
@@ -1566,6 +2024,8 @@ __all__ = [
     "ASSETS_DIR_NAME",
     "AUDIO_DIR_NAME",
     "BGM_DIR_NAME",
+    "BgmSpan",
+    "DEFAULT_BGM_CROSSFADE_MS",
     "DEFAULT_FPS",
     "DEFAULT_HEIGHT",
     "DEFAULT_SFX_GAIN_DB",
@@ -1578,8 +2038,10 @@ __all__ = [
     "SUBTITLE_DIR_NAME",
     "TIMELINE_FILENAME",
     "RenderError",
+    "build_scene_bgm_spans",
     "build_scene_filter",
     "exports_dir_for",
+    "list_bgm_library",
     "out_dir_for",
     "plan_dir_for",
     "probe_duration_ms",
@@ -1587,6 +2049,8 @@ __all__ = [
     "render_timeline",
     "resolve_audio_asset",
     "resolve_default_bgm",
+    "resolve_scene_bgm_path",
     "resolve_sfx_asset",
     "run_ffmpeg",
+    "synthesize_multi_bgm_wav",
 ]

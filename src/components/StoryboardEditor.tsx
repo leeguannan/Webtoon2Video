@@ -11,6 +11,7 @@ import {
   Loader2,
   Lock,
   Merge,
+  Music,
   Plus,
   RotateCcw,
   Save,
@@ -71,6 +72,11 @@ function splitSceneAt(
     user_note: '',
     locked_quotes: [],
     visual_recap: '',
+    // 新幕不带配乐配置，等待 AI 建议或人工选择（后端按自动模式解析）。
+    bgm_mood: '',
+    bgm_suggestion: '',
+    bgm: null,
+    bgm_gain_db: null,
   });
   return renumber(next);
 }
@@ -501,6 +507,18 @@ export const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                     <Merge className="w-3.5 h-3.5" />
                     合并到上一幕
                   </button>
+                )}
+                {(scene.bgm_mood || scene.bgm_suggestion) && (
+                  <span
+                    className="inline-flex items-center gap-1.5 rounded-full border border-violet-200 bg-violet-50 px-2.5 py-1 text-[11px] text-violet-700"
+                    title="AI 配乐建议（在解说审核页可为本幕选择具体曲目）"
+                  >
+                    <Music className="h-3.5 w-3.5" />
+                    {scene.bgm_mood && <span className="font-medium">{scene.bgm_mood}</span>}
+                    {scene.bgm_suggestion && (
+                      <span className="max-w-[22rem] truncate">{scene.bgm_suggestion}</span>
+                    )}
+                  </span>
                 )}
               </div>
 

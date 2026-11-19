@@ -82,6 +82,85 @@ _LOCATION_BLOCKERS = frozenset(
 STRIP_WIDTH = 640
 MAX_STRIP_HEIGHT = 3200
 
+# --------------------------------------------------------------------------
+# Patch v4.7：按幕 BGM 情绪预设（五档）。
+# 每档含中文 label、面向用户的 description、英文搜歌关键词 search_keywords、
+# 默认配乐建议 default_suggestion，以及本地关键词打分表 keywords。
+# --------------------------------------------------------------------------
+_DEFAULT_BGM_MOOD = "suspense_lurk"
+
+BGM_MOOD_PRESETS: dict[str, dict[str, object]] = {
+    "sad_piano": {
+        "label": "忧伤钢琴",
+        "description": "60~70 BPM，钢琴与大提琴为主，适合离别、回忆、内心独白",
+        "search_keywords": ["sad", "solo piano", "cello", "ambient"],
+        "default_suggestion": (
+            "舒缓独奏钢琴搭配大提琴，约 60~70 BPM，营造忧伤回忆氛围；"
+            "搜歌关键词：sad solo piano cello ambient"
+        ),
+        "keywords": (
+            "哭", "泪", "悲伤", "难过", "离别", "告别", "回忆", "孤独", "失落",
+            "心痛", "眼泪", "呜咽", "啜泣", "遗憾", "思念",
+        ),
+    },
+    "conflict_tension": {
+        "label": "冲突对峙",
+        "description": "85~100 BPM，低音脉冲与弦乐拨奏，适合争吵、打斗、追逐",
+        "search_keywords": ["dramatic", "tension", "strings", "pulse"],
+        "default_suggestion": (
+            "低音脉冲叠加弦乐拨奏，约 85~100 BPM，制造对峙冲突的紧绷感；"
+            "搜歌关键词：dramatic tension strings pulse"
+        ),
+        "keywords": (
+            "打", "冲突", "争吵", "对峙", "追", "逃", "搏斗", "拳", "摔", "吼",
+            "怒", "争执", "扭打", "战斗", "拦住",
+        ),
+    },
+    "warm_intimate": {
+        "label": "温暖亲密",
+        "description": "70~80 BPM，电钢琴与原声吉他，适合温情、治愈、日常相处",
+        "search_keywords": ["warm", "romantic", "soft piano", "acoustic"],
+        "default_suggestion": (
+            "温暖电钢琴与原声吉他，约 70~80 BPM，适合亲密日常与治愈时刻；"
+            "搜歌关键词：warm romantic soft piano acoustic"
+        ),
+        "keywords": (
+            "笑", "温暖", "拥抱", "牵手", "温柔", "幸福", "治愈", "重逢", "安慰",
+            "陪伴", "喜欢", "心动", "轻声", "阳光",
+        ),
+    },
+    "suspense_lurk": {
+        "label": "悬疑潜伏",
+        "description": "75~85 BPM，冷合成器与低频心跳，适合潜行、谜团、未知恐惧",
+        "search_keywords": ["dark", "mystery", "ambient", "minimal"],
+        "default_suggestion": (
+            "冷色合成器铺底加低频心跳脉冲，约 75~85 BPM，营造悬疑潜伏的未知感；"
+            "搜歌关键词：dark mystery ambient minimal"
+        ),
+        "keywords": (
+            "黑影", "脚步", "悄悄", "潜伏", "谜团", "秘密", "诡异", "可疑", "偷看",
+            "屏住呼吸", "走廊", "黑暗", "未知", "窥视",
+        ),
+    },
+    "thriller_climax": {
+        "label": "惊悚高潮",
+        "description": "低音轰鸣与弦乐颤音，适合真相揭示、生死危机、高潮爆发（避免重摇滚）",
+        "search_keywords": ["dark thriller", "suspense", "horror", "drone"],
+        "default_suggestion": (
+            "低音轰鸣与弦乐颤音层层堆叠，避免重摇滚，适合真相揭示与生死危机的"
+            "高潮爆发；搜歌关键词：dark thriller suspense horror drone"
+        ),
+        "keywords": (
+            "震惊", "竟然", "真相", "崩溃", "尖叫", "血", "死亡", "爆炸", "危机",
+            "绝望", "反转", "轰然", "恐怖", "噩梦", "末日",
+        ),
+    },
+}
+
+#: VLM 整幕复核输出里的配乐两行。
+_BGM_MOOD_LINE_RE = re.compile(r"【配乐情绪】\s*([^\n\r】]+)")
+_BGM_SUGGESTION_LINE_RE = re.compile(r"【配乐建议】\s*([^\n\r】]+)")
+
 _RECAP_PROMPT = (
     "下面是同一部漫画里**同一个镜头组（连续一幕）**的若干格画面，"
     "请一次性通看后回答：\n"
@@ -89,6 +168,10 @@ _RECAP_PROMPT = (
     "2. 跨格的连贯物理动作与因果是什么"
     "（谁打谁、谁抓住谁、谁在火中倒下、最后露脸的是谁）？\n"
     "3. 最关键的 1~2 句原话气泡分别归属谁？\n"
+    "4. 最后另起两行输出这一幕的配乐建议，格式严格为：\n"
+    "【配乐情绪】仅从 sad_piano / conflict_tension / warm_intimate / "
+    "suspense_lurk / thriller_climax 五档中选一档；\n"
+    "【配乐建议】一句话中文，写清主乐器、BPM 区间与氛围，并附 3~4 个英文搜歌关键词。\n"
     "只回答事实，不要文学化描写，不要写「画面中」这类元词汇。"
 )
 
@@ -333,7 +416,9 @@ def auto_build_storyboard(
         for index, panel_ids in enumerate(scene_panel_ids, start=1)
         if panel_ids
     ]
-    return EpisodeStoryboard(episode_id=episode_id, source="auto", scenes=scenes)
+    storyboard = EpisodeStoryboard(episode_id=episode_id, source="auto", scenes=scenes)
+    # Patch v4.7：自动聚类的幕直接补上本地关键词配乐建议（不调用模型）。
+    return suggest_storyboard_bgm(storyboard, vision)
 
 
 # --------------------------------------------------------------------------
@@ -425,6 +510,104 @@ def _scene_fallback_summary(
     return " ".join(parts)
 
 
+# --------------------------------------------------------------------------
+# Patch v4.7：按幕 BGM 情绪建议（纯本地关键词打分，不调用模型）
+# --------------------------------------------------------------------------
+def _scene_bgm_text(
+    scene: StoryboardScene, panel_map: dict[str, PanelVisionInfo] | None
+) -> str:
+    """汇总一幕的全部可打分文本：幕字段 + 各格摘要/对白/拟声。"""
+    parts = [
+        scene.title or "",
+        scene.location or "",
+        scene.visual_recap or "",
+        scene.user_note or "",
+    ]
+    if panel_map:
+        for panel_id in scene.panel_ids:
+            panel = panel_map.get(panel_id)
+            if panel is None:
+                continue
+            parts.append(panel.scene_summary or "")
+            parts.extend(item.text for item in panel.dialogues if item.text)
+            parts.extend(panel.sfx_list)
+    return " ".join(parts)
+
+
+def suggest_scene_bgm(
+    scene: StoryboardScene,
+    panel_map: dict[str, PanelVisionInfo] | None = None,
+) -> tuple[str, str]:
+    """按幕内容关键词打分，稳定产出 ``(bgm_mood, bgm_suggestion)``。
+
+    打分输入覆盖幕标题/地点/视觉复核/编导备注，以及该幕各格的
+    ``scene_summary``、对白文本与 ``sfx_list``。全部档位均为 0 分时回退
+    :data:`_DEFAULT_BGM_MOOD`；平票按 :data:`BGM_MOOD_PRESETS` 的声明顺序
+    取第一个，保证同输入同输出。
+    """
+    text = _scene_bgm_text(scene, panel_map)
+    best_mood = _DEFAULT_BGM_MOOD
+    best_score = 0
+    for mood, preset in BGM_MOOD_PRESETS.items():
+        keywords = preset["keywords"]
+        score = sum(1 for keyword in keywords if keyword in text)
+        if score > best_score:
+            best_score = score
+            best_mood = mood
+    preset = BGM_MOOD_PRESETS[best_mood]
+    return best_mood, str(preset["default_suggestion"])
+
+
+def suggest_storyboard_bgm(
+    storyboard: EpisodeStoryboard,
+    vision: VisionWindowOutput | None = None,
+    *,
+    overwrite: bool = False,
+) -> EpisodeStoryboard:
+    """为整部镜头编排补全按幕配乐建议（存量话次一键补全）。
+
+    * 只处理 ``enabled`` 幕；
+    * ``overwrite=False`` 时仅补空值（已有合法 ``bgm_mood`` 的幕不动），
+      ``overwrite=True`` 时全部重算；
+    * 人工显式选择的 ``scene.bgm`` / ``scene.bgm_gain_db`` 永不覆盖。
+    """
+    panel_map: dict[str, PanelVisionInfo] | None = None
+    if vision is not None:
+        panel_map = {panel.panel_id: panel for panel in vision.panels}
+    for scene in storyboard.scenes:
+        if not scene.enabled:
+            continue
+        if not overwrite and scene.bgm_mood in BGM_MOOD_PRESETS:
+            continue
+        mood, suggestion = suggest_scene_bgm(scene, panel_map)
+        scene.bgm_mood = mood
+        scene.bgm_suggestion = suggestion
+    return storyboard
+
+
+def _parse_bgm_lines(content: str) -> tuple[str, str] | None:
+    """从 VLM 复核回答里解析 ``【配乐情绪】`` / ``【配乐建议】`` 两行。
+
+    情绪不在五档内视为解析失败（返回 ``None``），交由本地打分兜底。
+    """
+    mood_match = _BGM_MOOD_LINE_RE.search(content)
+    suggestion_match = _BGM_SUGGESTION_LINE_RE.search(content)
+    if not mood_match or not suggestion_match:
+        return None
+    mood = mood_match.group(1).strip().lower()
+    suggestion = suggestion_match.group(1).strip()
+    if mood not in BGM_MOOD_PRESETS or not suggestion:
+        return None
+    return mood, suggestion
+
+
+def _strip_bgm_lines(content: str) -> str:
+    """把 VLM 回答里的配乐两行从视觉复核文本中剥离，避免污染 S4。"""
+    cleaned = _BGM_MOOD_LINE_RE.sub("", content)
+    cleaned = _BGM_SUGGESTION_LINE_RE.sub("", cleaned)
+    return cleaned.strip()
+
+
 async def enrich_storyboard_with_vision(
     client: LLMClient | None,
     *,
@@ -467,11 +650,17 @@ async def enrich_storyboard_with_vision(
         fallback = _scene_fallback_summary(scene, panel_map)
         if not panel_paths:
             scene.visual_recap = fallback
+            if not scene.bgm_mood:
+                scene.bgm_mood, scene.bgm_suggestion = suggest_scene_bgm(scene, panel_map)
             continue
         try:
             strips = _build_strips(panel_paths)
             if not strips:
                 scene.visual_recap = fallback
+                if not scene.bgm_mood:
+                    scene.bgm_mood, scene.bgm_suggestion = suggest_scene_bgm(
+                        scene, panel_map
+                    )
                 continue
             parts: list[ContentPart] = [ContentPart(type="text", text=_RECAP_PROMPT)]
             for strip in strips:
@@ -484,11 +673,20 @@ async def enrich_storyboard_with_vision(
                 temperature=0.2,
                 max_tokens=1200,
             )
-            recap = (response.content or "").strip()
+            raw_content = (response.content or "").strip()
+            parsed_bgm = _parse_bgm_lines(raw_content)
+            # Patch v4.7：配乐两行写专属字段，并从 visual_recap 剥离干净。
+            if parsed_bgm is not None:
+                scene.bgm_mood, scene.bgm_suggestion = parsed_bgm
+            elif not scene.bgm_mood:
+                scene.bgm_mood, scene.bgm_suggestion = suggest_scene_bgm(scene, panel_map)
+            recap = _strip_bgm_lines(raw_content)
             scene.visual_recap = recap or fallback
         except Exception as exc:  # noqa: BLE001 - 单幕复核失败不阻断流水线
             print(f"[s3b_scenes] 第 {scene.scene_index} 幕视觉复核失败，回退摘要：{exc}")
             scene.visual_recap = fallback
+            if not scene.bgm_mood:
+                scene.bgm_mood, scene.bgm_suggestion = suggest_scene_bgm(scene, panel_map)
     return storyboard
 
 

@@ -16,22 +16,31 @@ import {
   Trash2,
   Volume2,
   AlertCircle,
+  Wand2,
+  Music,
+  Sparkles,
 } from 'lucide-react';
 import type {
+  AutoPacingResponse,
+  AutoPacingSummary,
+  BgmLibraryResponse,
   CameraMotion,
   EpisodeItem,
   EpisodeRenderOptions,
+  EpisodeStoryboard,
   OutroMode,
   PronunciationRule,
   ScriptBeat,
   SeriesTtsConfigResponse,
   StageId,
+  StoryboardScene,
   StudioConfig,
   VoiceOption,
 } from '../types/studio';
 import { formatMs, playPreviewTone, resolveSpokenText } from '../utils/pronunciation';
 import { PanelZoomModal, type RoleOption, type SaveStatus } from './PanelZoomModal';
 import { StoryboardEditor } from './StoryboardEditor';
+import BgmLibraryDrawer from './BgmLibraryDrawer';
 
 interface EpisodeStudioViewProps {
   episode: EpisodeItem;
@@ -57,6 +66,8 @@ interface EpisodeStudioViewProps {
   ) => Promise<boolean> | boolean;
   /** 分镜大图弹窗里的字幕原文自动保存（不触发重跑配音）。缺省时退化为本地草稿保存。 */
   onAutoSaveBeats?: (episodeId: string, beats: ScriptBeat[]) => Promise<void>;
+  /** Patch v4.6：一键叙事节奏留白（后端改写 pause_after_ms 并同步 audio_manifest）。 */
+  onAutoPacing?: (episodeId: string) => Promise<AutoPacingResponse | null>;
   /** Patch v4.5：保存本话封页/结尾片包选项（写入 render_options.json，仅重跑 S7 生效）。 */
   onUpdateEpisodeRenderOptions?: (
     episodeId: string,
@@ -110,6 +121,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   onTogglePanelBlank,
   onUpdateBeats,
   onAutoSaveBeats,
+  onAutoPacing,
   onUpdateEpisodeRenderOptions,
   onExportEpisode,
 }) => {
@@ -123,6 +135,11 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   const [brandingSaving, setBrandingSaving] = useState(false);
   const [brandingSavedAt, setBrandingSavedAt] = useState<string | null>(null);
   const [brandingError, setBrandingError] = useState<string | null>(null);
+
+  // ---- Patch v4.6：叙事节奏自动留白（后端规则改写停顿并同步 audio_manifest） ----
+  const [autoPacingLoading, setAutoPacingLoading] = useState(false);
+  const [autoPacingSummary, setAutoPacingSummary] = useState<AutoPacingSummary | null>(null);
+  const [autoPacingError, setAutoPacingError] = useState<string | null>(null);
 
   // 外部数据刷新（如切换话次、保存回包）后同步本地草稿。
   useEffect(() => {
@@ -146,6 +163,142 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     [episode.episode_id, onUpdateEpisodeRenderOptions]
   );
 
+  /**
+   * Patch v4.6：一键自动节奏留白。表格有未保存改动时拒绝执行并内联提示，
+   * 避免后端基于旧稿计算、再被本地草稿覆盖。成功后后端已同时回写
+   * script.json 与 audio_manifest.json，本地草稿与落盘值对齐并清掉脏标记，
+   * 用户只需从 S6 重跑时间轴与成片，无需重跑 S5 配音。
+   */
+  const handleRunAutoPacing = useCallback(async () => {
+    if (!onAutoPacing || autoPacingLoading) return;
+    if (tableDirtyRef.current) {
+      setSaveHint('请先保存解说稿再执行自动节奏留白');
+      return;
+    }
+    setAutoPacingLoading(true);
+    setAutoPacingError(null);
+    try {
+      const result = await onAutoPacing(episode.episode_id);
+      if (!result) {
+        setAutoPacingError('自动节奏留白执行失败，请查看后端日志后重试');
+        return;
+      }
+      draftBeatsRef.current = result.beats;
+      setDraftBeats(result.beats);
+      tableDirtyRef.current = false;
+      setTableDirty(false);
+      setSaveHint('');
+      setAutoPacingSummary(result.summary);
+    } catch (err) {
+      setAutoPacingError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setAutoPacingLoading(false);
+    }
+  }, [autoPacingLoading, episode.episode_id, onAutoPacing]);
+
+  // ---- Patch v4.7：按幕 BGM（storyboard 幕配乐 + 作品曲库） ----
+  const [sceneStoryboard, setSceneStoryboard] = useState<EpisodeStoryboard | null>(null);
+  const [bgmLibrary, setBgmLibrary] = useState<BgmLibraryResponse | null>(null);
+  const [bgmDrawerOpen, setBgmDrawerOpen] = useState(false);
+  const [suggestBgmLoading, setSuggestBgmLoading] = useState(false);
+  const [sceneBgmSavingId, setSceneBgmSavingId] = useState<string | null>(null);
+  const [bgmHint, setBgmHint] = useState('');
+  const [bgmError, setBgmError] = useState('');
+
+  // 只在解说审核 Tab 加载幕编排与曲库；storyboard 不存在（未做 S3b）时静默回退。
+  useEffect(() => {
+    if (activeTab !== 'script') return;
+    let cancelled = false;
+    const episodeBase = `/api/episodes/${encodeURIComponent(episode.episode_id)}`;
+    void (async () => {
+      const [storyboardRes, libraryRes] = await Promise.all([
+        fetch(`${episodeBase}/storyboard`),
+        fetch(`/api/series/${encodeURIComponent(seriesId)}/bgm-library`),
+      ]);
+      if (cancelled) return;
+      if (storyboardRes.ok) {
+        setSceneStoryboard((await storyboardRes.json()) as EpisodeStoryboard);
+      } else {
+        setSceneStoryboard(null);
+      }
+      if (libraryRes.ok) {
+        setBgmLibrary((await libraryRes.json()) as BgmLibraryResponse);
+      } else {
+        setBgmLibrary(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, episode.episode_id, seriesId]);
+
+  useEffect(() => {
+    if (!bgmHint) return;
+    const timer = window.setTimeout(() => setBgmHint(''), 3600);
+    return () => window.clearTimeout(timer);
+  }, [bgmHint]);
+
+  /** 把解说句按 storyboard 启用幕的 panel_ids 归组；未命中进末尾兜底组（memo 本体在 draftBeats 声明后）。 */
+
+  /** 保存单幕配乐（全量 PUT storyboard，后端按 scene_id 继承未提交字段）。 */
+  const persistSceneBgm = useCallback(
+    async (sceneId: string, patch: Partial<StoryboardScene>) => {
+      if (!sceneStoryboard) return;
+      const nextScenes = sceneStoryboard.scenes.map((scene) =>
+        scene.scene_id === sceneId ? { ...scene, ...patch } : scene
+      );
+      setSceneBgmSavingId(sceneId);
+      setBgmError('');
+      try {
+        const res = await fetch(
+          `/api/episodes/${encodeURIComponent(episode.episode_id)}/storyboard`,
+          {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ scenes: nextScenes }),
+          }
+        );
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(body.detail || `保存失败（HTTP ${res.status}）`);
+        }
+        setSceneStoryboard(body as EpisodeStoryboard);
+        setBgmHint('已保存本幕配乐，点击上方 S7 从此步重跑即可出片');
+      } catch (err) {
+        setBgmError(err instanceof Error ? err.message : '本幕配乐保存失败');
+      } finally {
+        setSceneBgmSavingId(null);
+      }
+    },
+    [sceneStoryboard, episode.episode_id]
+  );
+
+  /** 一键补全各幕 AI 配乐建议（只写 mood/suggestion，不动人工选择的曲目）。 */
+  const handleSuggestBgm = useCallback(async () => {
+    if (suggestBgmLoading) return;
+    setSuggestBgmLoading(true);
+    setBgmError('');
+    try {
+      const res = await fetch(
+        `/api/episodes/${encodeURIComponent(episode.episode_id)}/storyboard/suggest-bgm`,
+        { method: 'POST' }
+      );
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(body.detail || `配乐建议生成失败（HTTP ${res.status}）`);
+      }
+      setSceneStoryboard(body as EpisodeStoryboard);
+      const count = (body as EpisodeStoryboard).scenes.filter(
+        (scene) => scene.enabled !== false
+      ).length;
+      setBgmHint(`已补全 ${count} 幕的 AI 配乐建议，可在各幕卡片选择具体曲目`);
+    } catch (err) {
+      setBgmError(err instanceof Error ? err.message : '配乐建议生成失败');
+    } finally {
+      setSuggestBgmLoading(false);
+    }
+  }, [suggestBgmLoading, episode.episode_id]);
+
   // 封面文字覆盖：输入防抖 500ms 自动保存；空白归一为 null（后端同样会兜底）。
   useEffect(() => {
     const normalized = coverOverrideDraft.trim() ? coverOverrideDraft.trim() : null;
@@ -164,6 +317,35 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   );
   const [showFocusOverlay, setShowFocusOverlay] = useState(true);
   const [draftBeats, setDraftBeats] = useState<ScriptBeat[]>(episode.beats);
+  /** Patch v4.7：解说句按 storyboard 启用幕归组，未命中分镜进末尾兜底组。 */
+  const beatSceneGroups = useMemo(() => {
+    const scenes = (sceneStoryboard?.scenes ?? []).filter(
+      (scene) => scene.enabled !== false
+    );
+    if (scenes.length === 0) {
+      return [{ key: '__all__', scene: null as StoryboardScene | null, beats: draftBeats }];
+    }
+    const groups = scenes.map((scene) => ({
+      key: scene.scene_id,
+      scene,
+      beats: [] as ScriptBeat[],
+    }));
+    const orphan = {
+      key: '__orphan__',
+      scene: null as StoryboardScene | null,
+      beats: [] as ScriptBeat[],
+    };
+    for (const beat of draftBeats) {
+      const panelId = beat.target_panel_ids[0];
+      const owner = scenes.find((scene) => scene.panel_ids.includes(panelId));
+      if (owner) {
+        groups.find((group) => group.key === owner.scene_id)?.beats.push(beat);
+      } else {
+        orphan.beats.push(beat);
+      }
+    }
+    return orphan.beats.length > 0 ? [...groups, orphan] : groups;
+  }, [sceneStoryboard, draftBeats]);
   /** 表格内是否有未落盘的改动（改字 / 改角色 / 增删句）。 */
   const [tableDirty, setTableDirty] = useState(false);
   /** 保存中状态，避免重复点击。 */
@@ -1196,6 +1378,42 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                 <Plus className="w-3.5 h-3.5" />
                 新增解说句
               </button>
+              <button
+                type="button"
+                disabled={autoPacingLoading || !onAutoPacing}
+                onClick={() => void handleRunAutoPacing()}
+                title={tableDirty ? '请先保存解说稿再执行自动节奏留白' : '按叙事节奏规则自动优化句间停顿（pause_after_ms）'}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
+              >
+                {autoPacingLoading ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Wand2 className="w-3.5 h-3.5" />
+                )}
+                自动节奏留白
+              </button>
+              <button
+                type="button"
+                onClick={() => setBgmDrawerOpen(true)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <Music className="w-3.5 h-3.5" />
+                BGM 曲库管理
+              </button>
+              <button
+                type="button"
+                disabled={suggestBgmLoading}
+                onClick={() => void handleSuggestBgm()}
+                title="按各幕标题/地点/视觉摘要与分镜台词，AI 推断五档情绪与搜歌关键词"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
+              >
+                {suggestBgmLoading ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Sparkles className="w-3.5 h-3.5" />
+                )}
+                补全各幕配乐建议
+              </button>
               {tableDirty && (
                 <span className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg whitespace-nowrap shrink-0">
                   <AlertCircle className="w-3.5 h-3.5" />
@@ -1240,6 +1458,43 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
           <div className="mt-2 flex items-start gap-2 px-3 py-2 text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg">
             <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
             <span>{saveHint}</span>
+          </div>
+        )}
+
+        {activeTab === 'script' && autoPacingSummary && (
+          <div className="mt-2 flex items-start gap-2 px-3 py-2 text-xs text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg">
+            <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0" />
+            <div className="space-y-0.5">
+              {autoPacingSummary.updated_count > 0 ? (
+                <p>
+                  自动节奏留白完成：共调整 {autoPacingSummary.updated_count} 处停顿（跨幕{' '}
+                  {autoPacingSummary.scene_end_count} / 转折 {autoPacingSummary.turn_count} / 换气{' '}
+                  {autoPacingSummary.breath_count}），已同步 {autoPacingSummary.audio_manifest_synced}{' '}
+                  条音频清单。可直接从 S6 重跑，无需重跑 S5 配音。
+                </p>
+              ) : (
+                <p>自动节奏留白检查完成：现有停顿已符合叙事节奏规则，未做调整。</p>
+              )}
+            </div>
+          </div>
+        )}
+        {activeTab === 'script' && autoPacingError && (
+          <div className="mt-2 flex items-start gap-2 px-3 py-2 text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg">
+            <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+            <span>{autoPacingError}</span>
+          </div>
+        )}
+
+        {activeTab === 'script' && bgmHint && (
+          <div className="mt-2 flex items-start gap-2 px-3 py-2 text-xs text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg">
+            <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0" />
+            <span>{bgmHint}</span>
+          </div>
+        )}
+        {activeTab === 'script' && bgmError && (
+          <div className="mt-2 flex items-start gap-2 px-3 py-2 text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg">
+            <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+            <span>{bgmError}</span>
           </div>
         )}
 
@@ -1411,36 +1666,138 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
 
             {/* TAB 2: Script & Polyphone Editor */}
             {activeTab === 'script' && (
-              <div className="overflow-x-auto">
-                <table className="w-full text-left border-collapse">
-                  <thead>
-                    <tr className="bg-slate-50 border-b border-slate-200 text-xs font-medium text-slate-500">
-                      <th className="py-3 pl-5 pr-2 w-20">分镜</th>
-                      <th className="py-3 px-3 min-w-[260px]">
-                        字幕原文 (narration_text · 屏幕显示)
-                      </th>
-                      <th className="py-3 px-3 min-w-[220px]">
-                        TTS 送音文本（整句 · 不改字幕）
-                      </th>
-                      <th className="py-3 px-3 min-w-[210px]">
-                        Qwen TTS 情绪指令 (instruction)
-                      </th>
-                      <th className="py-3 px-3 w-36">运镜与停顿</th>
-                      <th className="py-3 pl-3 pr-5 w-32 text-right">试听 / 插入 / 删</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100 text-xs align-top">
-                    {draftBeats.map((beat) => {
-                      const panel = episode.panels.find(
-                        (p) => p.panel_id === beat.target_panel_ids[0]
-                      );
-                      const { spokenText, matchedRules } = resolveSpokenText(beat, rules);
-                      const voiceInfo = beatVoiceInfo(beat);
-                      const roleOptions = roleOptionsFor(beat);
-                      const charLen = beat.narration_text.trim().length;
-                      const isLengthWarn = charLen < 8 || charLen > 30;
-                      return (
-                        <tr key={beat.beat_id} className="hover:bg-slate-50/50">
+              <div className="space-y-5">
+                {beatSceneGroups.map((group) => {
+                  const scene = group.scene;
+                  const sceneDurationMs = group.beats.reduce(
+                    (sum, beat) => sum + (beat.audio_duration_ms || 0),
+                    0
+                  );
+                  const selectedTrack = scene?.bgm
+                    ? bgmLibrary?.tracks.find((track) => track.filename === scene.bgm)
+                    : undefined;
+                  return (
+                    <section
+                      key={group.key}
+                      className="bg-white border border-slate-200 rounded-xl overflow-hidden"
+                    >
+                      {scene && (
+                        <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-3 border-b border-slate-100 bg-slate-50/60">
+                          <span className="inline-flex items-center justify-center min-w-[3.5rem] px-2 py-1 rounded-md bg-slate-900 text-white text-xs font-semibold">
+                            第 {scene.scene_index} 幕
+                          </span>
+                          <div className="min-w-[10rem]">
+                            <p className="text-sm font-semibold text-slate-800">
+                              {scene.title || '未命名幕'}
+                              {scene.location && (
+                                <span className="ml-2 text-xs font-normal text-slate-500">
+                                  · {scene.location}
+                                </span>
+                              )}
+                            </p>
+                            <p className="text-[11px] text-slate-500">
+                              {group.beats.length} 句 · 配音合计{' '}
+                              {(sceneDurationMs / 1000).toFixed(1)}s
+                            </p>
+                          </div>
+                          {(scene.bgm_mood || scene.bgm_suggestion) && (
+                            <span
+                              className="inline-flex items-center gap-1.5 rounded-full border border-violet-200 bg-violet-50 px-2.5 py-1 text-[11px] text-violet-700 max-w-[24rem]"
+                              title={scene.bgm_suggestion}
+                            >
+                              <Music className="h-3.5 w-3.5 shrink-0" />
+                              {scene.bgm_mood && (
+                                <span className="font-medium shrink-0">{scene.bgm_mood}</span>
+                              )}
+                              {scene.bgm_suggestion && (
+                                <span className="truncate">{scene.bgm_suggestion}</span>
+                              )}
+                            </span>
+                          )}
+                          <div className="flex items-center gap-2 ml-auto">
+                            <select
+                              value={scene.bgm ?? ''}
+                              disabled={sceneBgmSavingId === scene.scene_id}
+                              onChange={(event) =>
+                                void persistSceneBgm(scene.scene_id, {
+                                  bgm: event.target.value === '' ? null : event.target.value,
+                                })
+                              }
+                              title="本幕 BGM：自动按情绪匹配 / 显式静音 / 指定曲目"
+                              className="max-w-[11rem] px-2 py-1.5 text-[11px] bg-white border border-slate-200 rounded-lg"
+                            >
+                              <option value="">自动匹配（按情绪/作品默认）</option>
+                              <option value="none">本幕静音（none）</option>
+                              {(bgmLibrary?.tracks ?? []).map((track) => (
+                                <option key={`${track.scope}-${track.filename}`} value={track.filename}>
+                                  {track.scope === 'series' ? '作品' : '全局'}·{track.filename}
+                                </option>
+                              ))}
+                            </select>
+                            <select
+                              value={scene.bgm_gain_db ?? ''}
+                              disabled={sceneBgmSavingId === scene.scene_id}
+                              onChange={(event) =>
+                                void persistSceneBgm(scene.scene_id, {
+                                  bgm_gain_db:
+                                    event.target.value === '' ? null : Number(event.target.value),
+                                })
+                              }
+                              title="本幕 BGM 音量增益"
+                              className="px-2 py-1.5 text-[11px] bg-white border border-slate-200 rounded-lg"
+                            >
+                              <option value="">默认音量</option>
+                              <option value={-10}>-10 dB</option>
+                              <option value={-12}>-12 dB</option>
+                              <option value={-14}>-14 dB</option>
+                              <option value={-16}>-16 dB</option>
+                              <option value={-18}>-18 dB</option>
+                            </select>
+                            {selectedTrack && (
+                              <audio
+                                controls
+                                preload="none"
+                                src={selectedTrack.url}
+                                className="h-8 w-40"
+                                title="试听本幕曲目"
+                              />
+                            )}
+                            {sceneBgmSavingId === scene.scene_id && (
+                              <Loader2 className="h-4 w-4 animate-spin text-blue-600" />
+                            )}
+                          </div>
+                        </div>
+                      )}
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left border-collapse">
+                          <thead>
+                            <tr className="bg-slate-50 border-b border-slate-200 text-xs font-medium text-slate-500">
+                              <th className="py-3 pl-5 pr-2 w-20">分镜</th>
+                              <th className="py-3 px-3 min-w-[260px]">
+                                字幕原文 (narration_text · 屏幕显示)
+                              </th>
+                              <th className="py-3 px-3 min-w-[220px]">
+                                TTS 送音文本（整句 · 不改字幕）
+                              </th>
+                              <th className="py-3 px-3 min-w-[210px]">
+                                Qwen TTS 情绪指令 (instruction)
+                              </th>
+                              <th className="py-3 px-3 w-36">运镜与停顿</th>
+                              <th className="py-3 pl-3 pr-5 w-32 text-right">试听 / 插入 / 删</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100 text-xs align-top">
+                            {group.beats.map((beat) => {
+                              const panel = episode.panels.find(
+                                (p) => p.panel_id === beat.target_panel_ids[0]
+                              );
+                              const { spokenText, matchedRules } = resolveSpokenText(beat, rules);
+                              const voiceInfo = beatVoiceInfo(beat);
+                              const roleOptions = roleOptionsFor(beat);
+                              const charLen = beat.narration_text.trim().length;
+                              const isLengthWarn = charLen < 8 || charLen > 30;
+                              return (
+                                <tr key={beat.beat_id} className="hover:bg-slate-50/50">
                           <td className="py-3.5 pl-5 pr-2">
                             <div className="space-y-1.5">
                               <div className="font-mono-tabular font-semibold text-slate-700">
@@ -1667,6 +2024,10 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                     })}
                   </tbody>
                 </table>
+              </div>
+                    </section>
+                  );
+                })}
               </div>
             )}
 
@@ -2004,6 +2365,13 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
           </>
         )}
       </section>
+
+      {/* Patch v4.7：作品曲库管理抽屉（情绪关键词 / 试听 / 上传 / 删除） */}
+      <BgmLibraryDrawer
+        seriesId={seriesId}
+        open={bgmDrawerOpen}
+        onClose={() => setBgmDrawerOpen(false)}
+      />
 
       {/* 分镜大图 + 字幕原文编辑（改完自动保存） */}
       <PanelZoomModal

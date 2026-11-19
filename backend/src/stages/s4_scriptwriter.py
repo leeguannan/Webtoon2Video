@@ -14,7 +14,8 @@ from __future__ import annotations
 import logging
 import re
 import sys
-from collections.abc import Awaitable, Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -598,6 +599,284 @@ def _splice_scene_beats(
 
 #: 篇章摘要压缩器（Stage 4 用百炼 ``qwen-plus`` 压缩待归档原文）。
 ArcCompressor = Callable[[str], Awaitable[str]]
+
+
+# ---------------------------------------------------------------------------
+# Patch v4.6：叙事节奏自动留白（句间停顿 / 转折留白，纯函数 + 确定性规则）
+# ---------------------------------------------------------------------------
+#: 引号引导句的停顿上限（<= 该值视为引导词，规则 0 保护，绝不拉长）。
+PACE_LEAD_IN_MAX_MS = 80
+#: 规则 A：跨幕结尾留白。
+PACE_SCENE_END_MS = 650
+#: 规则 B：转折 / 悬念揭示 / 高潮留白。
+PACE_TURN_MS = 700
+#: 规则 C：长连说换气口留白。
+PACE_BREATH_MS = 480
+#: 连续语音累计达到该时长即考虑插换气口。
+PACE_STREAK_TRIGGER_MS = 11000
+#: 两次长停顿之间至少隔开的 beat 数，避免连续重停顿打断节奏。
+PACE_MIN_BEAT_GAP = 3
+#: 原始停顿达到该值即视为既有换气口，重置连续语音累计（规则 C 口径）。
+PACE_EXISTING_LONG_MS = 420
+#: 「长停顿」间隔判定阈值（原本或本轮产生的 pause >= 该值，规则 B 口径）。
+PACE_LONG_PAUSE_MS = 450
+#: 停顿合法区间（与 ``ScriptBeat.pause_after_ms`` 的 pydantic 约束一致）。
+PACE_PAUSE_MIN_MS = 0
+PACE_PAUSE_MAX_MS = 2000
+
+#: 高置信度转折 / 揭示关键词（命中即候选 700ms 留白）。
+PACE_TURN_KEYWORDS: tuple[str, ...] = (
+    "其实", "竟然", "居然", "然而", "没想到", "却发现", "真相", "秘密",
+    "另一面", "原来", "直到这时", "可就在这时", "谁也没想到", "不仅如此",
+    "更可怕的是", "突然", "骤然", "猛地", "开始播放",
+)
+#: 可触发转折留白的音效标签。
+PACE_TURN_SFX: frozenset[str] = frozenset(
+    {"heart_thump", "gasp", "crash", "door_slam"}
+)
+#: 悬念 / 震惊尾句标点组合。
+PACE_SUSPENSE_ENDINGS: tuple[str, ...] = ("……", "…？", "？！", "...？")
+#: 允许插换气口的自然句末标点。
+PACE_BREATH_ENDINGS: tuple[str, ...] = ("。", "！", "？", "”", "……")
+
+
+@dataclass(slots=True)
+class PacingReport:
+    """自动节奏留白的执行明细（供接口回显与 Stage 4 日志）。"""
+
+    updated_count: int = 0
+    scene_end_count: int = 0
+    turn_count: int = 0
+    breath_count: int = 0
+    changed_beat_ids: list[str] = field(default_factory=list)
+
+
+def _beat_text(beat: dict[str, Any]) -> str:
+    return str(beat.get("narration_text") or "")
+
+
+def _beat_speaker(beat: dict[str, Any]) -> str:
+    return str(beat.get("speaker_role") or "narrator")
+
+
+def _is_lead_in(beat: dict[str, Any], next_beat: dict[str, Any] | None) -> bool:
+    """规则 0：引号引导句保护——这类短停顿绝不允许被任何规则拉长。"""
+    if next_beat is None:
+        return False
+    text = _beat_text(beat).strip()
+    current_pause = int(beat.get("pause_after_ms") or 0)
+    # 旁白引导词（「XX 说道：」）且后面还跟着一条 beat。
+    if _beat_speaker(beat) == "narrator" and text.endswith(("：", ":")):
+        return True
+    # 显式短停顿（<=80ms）且下一条是角色台词：念完引导词立刻接角色声音。
+    next_speaker = _beat_speaker(next_beat)
+    next_text = _beat_text(next_beat)
+    if current_pause <= PACE_LEAD_IN_MAX_MS and (
+        next_speaker != "narrator" or "“" in next_text
+    ):
+        return True
+    return False
+
+
+def _is_suspense_ending(text: str) -> bool:
+    """悬念 / 震惊尾句：特殊尾标点，或去标点后 <=16 字的短反问 / 惊呼。"""
+    stripped = text.strip()
+    if stripped.endswith(PACE_SUSPENSE_ENDINGS):
+        return True
+    if stripped.endswith(("？", "！")):
+        core = re.sub(r"[^\w\u4e00-\u9fff]", "", stripped)
+        if len(core) <= 16:
+            return True
+    return False
+
+
+def _scene_panel_index(
+    scenes: Sequence[StoryboardScene] | None,
+) -> dict[str, int]:
+    """启用幕（``enabled=True`` 且 ``panel_ids`` 非空）序号 → 面板映射。
+
+    幕序号按 ``scenes`` 中的出现顺序从 1 递增，只统计启用幕，用于判定
+    每条 beat 归属的启用幕与跨幕边界。
+    """
+    panel_to_scene: dict[str, int] = {}
+    if not scenes:
+        return panel_to_scene
+    ordinal = 0
+    for scene in scenes:
+        if not getattr(scene, "enabled", True) or not scene.panel_ids:
+            continue
+        ordinal += 1
+        for panel_id in scene.panel_ids:
+            panel_to_scene.setdefault(str(panel_id), ordinal)
+    return panel_to_scene
+
+
+def _beat_scene_ordinal(
+    beat: dict[str, Any], panel_to_scene: dict[str, int]
+) -> int | None:
+    """按 ``target_panel_ids`` 取该 beat 归属的启用幕序号（映射不到返 None）。"""
+    for panel_id in beat.get("target_panel_ids") or []:
+        ordinal = panel_to_scene.get(str(panel_id))
+        if ordinal is not None:
+            return ordinal
+    return None
+
+
+def apply_narrative_pacing(
+    beats: Sequence[dict[str, Any]],
+    *,
+    scenes: Sequence[StoryboardScene] | None = None,
+    audio_durations_ms: Mapping[str, int] | None = None,
+    min_long_gap_beats: int = PACE_MIN_BEAT_GAP,
+    streak_trigger_ms: int = PACE_STREAK_TRIGGER_MS,
+) -> tuple[list[dict[str, Any]], PacingReport]:
+    """对解说句的 ``pause_after_ms`` 做叙事节奏留白（纯函数，不改入参）。
+
+    规则优先级：规则 0（引号引导句保护）> 规则 A（跨幕结尾 650ms）>
+    规则 B（转折 / 悬念 / 高潮 700ms）> 规则 C（长连说换气 480ms）。
+    每条 beat 最多命中一个规则；只抬高、不压低停顿，结果统一夹逼到
+    ``[0, 2000]``。返回 ``(新 beat 列表, PacingReport)``，入参原对象与
+    ``narration_text`` / ``tts_text`` / ``speaker_role`` /
+    ``target_panel_ids`` / ``beat_id`` 顺序均不被修改。
+    """
+    paced = [dict(beat) for beat in beats]
+    report = PacingReport()
+    if not paced:
+        return paced, report
+
+    durations = dict(audio_durations_ms or {})
+    panel_to_scene = _scene_panel_index(scenes)
+    active_scene_count = len(set(panel_to_scene.values()))
+    scene_ordinals = [
+        _beat_scene_ordinal(beat, panel_to_scene) for beat in paced
+    ]
+    original_pauses = [int(beat.get("pause_after_ms") or 0) for beat in paced]
+
+    streak_ms = 0
+    last_long_idx: int | None = None
+    total = len(paced)
+
+    for i, beat in enumerate(paced):
+        text = _beat_text(beat)
+        stripped = text.strip()
+        original = original_pauses[i]
+        next_beat = paced[i + 1] if i + 1 < total else None
+        is_lead = _is_lead_in(beat, next_beat)
+
+        # 当前句语音时长：优先真实 TTS 时长，否则按去空白字幕字数估算。
+        beat_id = str(beat.get("beat_id") or "")
+        real_duration = int(durations.get(beat_id) or 0)
+        if real_duration > 0:
+            duration_ms = real_duration
+        else:
+            char_count = len(re.sub(r"\s+", "", text))
+            duration_ms = max(900, char_count * 210)
+
+        # 既有停顿本身就是换气 / 长停顿：>=420 重置连说累计；>=450 记录
+        # 长停顿位置（规则 B/C 的最小间隔都以它为基准）。
+        if original >= PACE_EXISTING_LONG_MS:
+            streak_ms = 0
+        if original >= PACE_LONG_PAUSE_MS:
+            last_long_idx = i
+        streak_ms += duration_ms
+
+        # 规则 0：引导句只累加连说时长，绝不拉长，也不重置换气状态。
+        if is_lead:
+            continue
+
+        gap_ok = (
+            last_long_idx is None or (i - last_long_idx) >= min_long_gap_beats
+        )
+        new_pause = original
+        rule_hit: str | None = None
+
+        # ---- 规则 A：跨幕结尾留白 650ms ----
+        crosses_scene = False
+        if i + 1 < total:
+            current_scene = scene_ordinals[i]
+            next_scene = scene_ordinals[i + 1]
+            if (
+                current_scene is not None
+                and next_scene is not None
+                and current_scene != next_scene
+            ):
+                crosses_scene = True
+        elif active_scene_count >= 2:
+            # 全话最后一条且存在 >=2 个启用幕：收尾留白。
+            crosses_scene = True
+        if crosses_scene:
+            raised = max(original, PACE_SCENE_END_MS)
+            if raised > original:
+                new_pause = raised
+                rule_hit = "scene_end"
+
+        # ---- 规则 B：转折 / 悬念揭示 / 高潮留白 700ms ----
+        if rule_hit is None and gap_ok:
+            sfx_cue = str(beat.get("sfx_cue") or "")
+            keyword_hit = any(
+                keyword in text for keyword in PACE_TURN_KEYWORDS
+            )
+            if (
+                keyword_hit
+                or _is_suspense_ending(text)
+                or sfx_cue in PACE_TURN_SFX
+            ):
+                raised = max(original, PACE_TURN_MS)
+                if raised > original:
+                    new_pause = raised
+                    rule_hit = "turn"
+
+        # ---- 规则 C：长连说换气口 480ms ----
+        if (
+            rule_hit is None
+            and gap_ok
+            and i + 1 < total
+            and streak_ms >= streak_trigger_ms
+            and stripped.endswith(PACE_BREATH_ENDINGS)
+        ):
+            # 距下一幕边界至少隔开 2 句：边界（新幕第一句的下标）最早 i+3。
+            next_boundary: int | None = None
+            for j in range(i + 1, total):
+                left = scene_ordinals[j - 1]
+                right = scene_ordinals[j]
+                if (
+                    left is not None
+                    and right is not None
+                    and left != right
+                ):
+                    next_boundary = j
+                    break
+            boundary_ok = (
+                next_boundary is None or (next_boundary - i) >= 3
+            )
+            if boundary_ok:
+                raised = max(original, PACE_BREATH_MS)
+                if raised > original:
+                    new_pause = raised
+                    rule_hit = "breath"
+
+        if rule_hit is not None:
+            beat["pause_after_ms"] = max(
+                PACE_PAUSE_MIN_MS, min(PACE_PAUSE_MAX_MS, new_pause)
+            )
+            report.changed_beat_ids.append(beat_id)
+            streak_ms = 0
+            last_long_idx = i
+            if rule_hit == "scene_end":
+                report.scene_end_count += 1
+            elif rule_hit == "turn":
+                report.turn_count += 1
+            else:
+                report.breath_count += 1
+
+    # 统一夹逼（含未被规则触达的 beat，防御非法历史值），不改任何其它字段。
+    for beat in paced:
+        beat["pause_after_ms"] = max(
+            PACE_PAUSE_MIN_MS,
+            min(PACE_PAUSE_MAX_MS, int(beat.get("pause_after_ms") or 0)),
+        )
+    report.updated_count = len(report.changed_beat_ids)
+    return paced, report
 
 
 class ScriptWriterError(RuntimeError):
@@ -2535,6 +2814,25 @@ async def write_episode_script(
                         f"[s4_scriptwriter] 补写后仍有 {len(errors)} 项校验异常：{errors}",
                         file=sys.stderr,
                     )
+
+    # Patch v4.6：叙事节奏自动留白。短剧本（<6 拍且非多幕）保持模型原始停顿，
+    # 避免把一两句话的短解说也按长篇节奏拉开；S4 阶段尚无真实 TTS 时长，
+    # 规则 C 的句长按字幕字数估算（真实时长在 Web 端 auto-pacing 接口里补齐）。
+    if len(merged_beats) >= 6 or (scene_mode and len(active_scenes) >= 2):
+        merged_beats, pacing_report = apply_narrative_pacing(
+            merged_beats,
+            scenes=active_scenes if scene_mode else None,
+        )
+        if pacing_report.updated_count > 0:
+            print(
+                "[s4_scriptwriter] 自动节奏留白："
+                f"共调整 {pacing_report.updated_count} 处停顿"
+                f"（跨幕 {pacing_report.scene_end_count} / "
+                f"转折 {pacing_report.turn_count} / "
+                f"换气 {pacing_report.breath_count}），"
+                f"beat={pacing_report.changed_beat_ids}",
+                file=sys.stderr,
+            )
 
     payload = {
         "hook_title": overview.get("hook_title"),
