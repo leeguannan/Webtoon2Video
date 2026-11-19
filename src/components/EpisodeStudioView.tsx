@@ -1673,9 +1673,19 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                     (sum, beat) => sum + (beat.audio_duration_ms || 0),
                     0
                   );
-                  const selectedTrack = scene?.bgm
+                  const explicitTrack = scene?.bgm
                     ? bgmLibrary?.tracks.find((track) => track.filename === scene.bgm)
                     : undefined;
+                  // 自动匹配：本幕未显式选曲时，按情绪档同名曲目（去后缀）尝试命中，
+                  // 与后端 resolve_scene_bgm_path 的 mood 同名匹配口径一致。
+                  const autoMatchedTrack =
+                    scene && !scene.bgm && scene.bgm_mood
+                      ? bgmLibrary?.tracks.find(
+                          (track) => track.filename.replace(/\.[^.]+$/, '') === scene.bgm_mood
+                        )
+                      : undefined;
+                  const selectedTrack = explicitTrack ?? autoMatchedTrack;
+                  const isAutoMatched = !explicitTrack && !!autoMatchedTrack;
                   return (
                     <section
                       key={group.key}
@@ -1753,13 +1763,21 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                               <option value={-16}>-16 dB</option>
                               <option value={-18}>-18 dB</option>
                             </select>
+                            {isAutoMatched && autoMatchedTrack && (
+                              <span
+                                className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] text-emerald-700 whitespace-nowrap"
+                                title="本幕未显式选曲，按情绪档自动命中的曲目"
+                              >
+                                自动命中：{autoMatchedTrack.filename}
+                              </span>
+                            )}
                             {selectedTrack && (
                               <audio
                                 controls
                                 preload="none"
                                 src={selectedTrack.url}
                                 className="h-8 w-40"
-                                title="试听本幕曲目"
+                                title={isAutoMatched ? '试听自动命中的曲目' : '试听本幕曲目'}
                               />
                             )}
                             {sceneBgmSavingId === scene.scene_id && (
@@ -2371,6 +2389,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         seriesId={seriesId}
         open={bgmDrawerOpen}
         onClose={() => setBgmDrawerOpen(false)}
+        onLibraryChange={setBgmLibrary}
       />
 
       {/* 分镜大图 + 字幕原文编辑（改完自动保存） */}

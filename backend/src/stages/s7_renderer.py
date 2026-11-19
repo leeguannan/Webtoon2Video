@@ -34,6 +34,7 @@ import json
 import re
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -896,6 +897,14 @@ def synthesize_multi_bgm_wav(
       ``min(crossfade_ms, 邻段时长*0.35, 本段时长*0.35) // 2``；
     * 邻段是静音或位于片头片尾：本段做不超过 700ms 的自身淡变；
     * 全部 span 都静音时返回 ``None``，调用方按「无 BGM」处理。
+
+    **响度归一为什么放在单文件预处理阶段**：``loudnorm`` 是「把整体响度拉到
+    目标值」的滤镜，一旦放在多轨总线或各轨内部，各幕自己设的 ``volume``
+    降增益会被重新拉回 -16 LUFS（实测 -14dB 被拉回 -15.3dB，直接盖过人声）；
+    而放在轨内且其后紧跟 ``adelay`` 时，ffmpeg 9 收到有限流 EOF 会提前透传
+    结束信号，导致大延迟轨的缓冲样本不被 flush（整轨丢失）。所以这里改为：
+    每首曲目先**单独**做一次 ``loudnorm`` 预处理（无 ``adelay``，两个坑都避开），
+    多轨阶段只做 ``volume`` / ``afade`` / ``adelay`` 成型，混合后不再归一化。
     """
     total_ms = max(1, int(round(total_s * 1000)))
     clipped: list[BgmSpan] = []
@@ -910,102 +919,133 @@ def synthesize_multi_bgm_wav(
         return None
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    args: list[str] = ["-y", "-hide_banner"]
-    tracks: list[dict[str, float | int | str]] = []
-    for index, span in enumerate(clipped):
-        if span.bgm_path is None:
-            continue
-        prev_span, next_span = _bgm_span_neighbours(clipped, index)
-        duration_ms = span.end_ms - span.start_ms
 
-        def _half_extent(neighbour: BgmSpan | None) -> int:
-            if neighbour is None or neighbour.bgm_path is None:
-                return 0
-            neighbour_duration = max(1, neighbour.end_ms - neighbour.start_ms)
-            return max(
-                0,
-                min(
-                    int(crossfade_ms),
-                    int(neighbour_duration * 0.35),
-                    int(duration_ms * 0.35),
+    # ---- 步骤一：去重后的每首曲目单独做一次响度归一预处理 ----
+    unique_paths: list[Path] = []
+    for span in clipped:
+        if span.bgm_path is not None and span.bgm_path not in unique_paths:
+            unique_paths.append(span.bgm_path)
+
+    norm_dir = Path(
+        tempfile.mkdtemp(dir=str(out_path.parent), prefix=".bgm_norm_")
+    )
+    try:
+        norm_map: dict[Path, Path] = {}
+        for index, source in enumerate(unique_paths):
+            norm_path = norm_dir / f"norm_{index}.wav"
+            run_ffmpeg(
+                [
+                    "-y",
+                    "-hide_banner",
+                    "-i",
+                    str(source),
+                    "-ar",
+                    str(_AUDIO_RATE),
+                    "-ac",
+                    "2",
+                    "-af",
+                    "loudnorm=I=-16:TP=-1.5:LRA=11",
+                    "-c:a",
+                    "pcm_s16le",
+                    str(norm_path),
+                ],
+                ffmpeg_bin=ffmpeg_bin,
+            )
+            norm_map[source] = norm_path
+
+        # ---- 步骤二：多轨按绝对时间轴成型 ----
+        args: list[str] = ["-y", "-hide_banner"]
+        tracks: list[dict[str, float | int | str]] = []
+        for index, span in enumerate(clipped):
+            if span.bgm_path is None:
+                continue
+            prev_span, next_span = _bgm_span_neighbours(clipped, index)
+            duration_ms = span.end_ms - span.start_ms
+
+            def _half_extent(neighbour: BgmSpan | None) -> int:
+                if neighbour is None or neighbour.bgm_path is None:
+                    return 0
+                neighbour_duration = max(1, neighbour.end_ms - neighbour.start_ms)
+                return max(
+                    0,
+                    min(
+                        int(crossfade_ms),
+                        int(neighbour_duration * 0.35),
+                        int(duration_ms * 0.35),
+                    )
+                    // 2,
                 )
-                // 2,
+
+            left_ext = _half_extent(prev_span)
+            right_ext = _half_extent(next_span)
+            # 夹取到整片时间轴之内。
+            left_ext = min(left_ext, span.start_ms)
+            right_ext = min(right_ext, total_ms - span.end_ms)
+            track_start = span.start_ms - left_ext
+            track_end = span.end_ms + right_ext
+            track_duration_ms = track_end - track_start
+
+            # 淡变时长：跨曲重叠区两侧各 ext，总重叠 2*ext；静音/边界侧 <=700ms。
+            fade_in_ms = (2 * left_ext) if left_ext > 0 else min(_BGM_SILENT_FADE_MS, duration_ms)
+            fade_out_ms = (
+                2 * right_ext if right_ext > 0 else min(_BGM_SILENT_FADE_MS, duration_ms)
+            )
+            fade_in_ms = min(fade_in_ms, track_duration_ms)
+            fade_out_ms = min(fade_out_ms, track_duration_ms - fade_in_ms)
+
+            args += ["-stream_loop", "-1", "-i", str(norm_map[span.bgm_path])]
+            tracks.append(
+                {
+                    "index": len(tracks),
+                    "delay": track_start,
+                    "duration_s": track_duration_ms / 1000.0,
+                    "fade_in_ms": fade_in_ms,
+                    "fade_out_ms": fade_out_ms,
+                    "gain_db": span.gain_db,
+                }
             )
 
-        left_ext = _half_extent(prev_span)
-        right_ext = _half_extent(next_span)
-        # 夹取到整片时间轴之内。
-        left_ext = min(left_ext, span.start_ms)
-        right_ext = min(right_ext, total_ms - span.end_ms)
-        track_start = span.start_ms - left_ext
-        track_end = span.end_ms + right_ext
-        track_duration_ms = track_end - track_start
+        chains: list[str] = []
+        labels: list[str] = []
+        for track in tracks:
+            idx = int(track["index"])
+            delay = int(track["delay"])
+            duration_s = float(track["duration_s"])
+            chain = (
+                f"[{idx}:a]aformat=sample_fmts=fltp:sample_rates={_AUDIO_RATE}:"
+                f"channel_layouts={_AUDIO_LAYOUT},atrim=0:{duration_s:.3f},"
+                f"volume={float(track['gain_db']):.1f}dB"
+            )
+            fade_in_ms = int(track["fade_in_ms"])
+            fade_out_ms = int(track["fade_out_ms"])
+            if fade_in_ms > 0:
+                chain += f",afade=t=in:st=0:d={fade_in_ms / 1000.0:.3f}"
+            if fade_out_ms > 0:
+                out_start = max(0.0, duration_s - fade_out_ms / 1000.0)
+                chain += f",afade=t=out:st={out_start:.3f}:d={fade_out_ms / 1000.0:.3f}"
+            chain += f",adelay={delay}|{delay},apad,atrim=0:{total_s:.3f}[bm{idx}]"
+            chains.append(chain)
+            labels.append(f"bm{idx}")
 
-        # 淡变时长：跨曲重叠区两侧各 ext，总重叠 2*ext；静音/边界侧 <=700ms。
-        fade_in_ms = (2 * left_ext) if left_ext > 0 else min(_BGM_SILENT_FADE_MS, duration_ms)
-        fade_out_ms = (
-            2 * right_ext if right_ext > 0 else min(_BGM_SILENT_FADE_MS, duration_ms)
-        )
-        fade_in_ms = min(fade_in_ms, track_duration_ms)
-        fade_out_ms = min(fade_out_ms, track_duration_ms - fade_in_ms)
-
-        args += ["-stream_loop", "-1", "-i", str(span.bgm_path)]
-        tracks.append(
-            {
-                "index": len(tracks),
-                "delay": track_start,
-                "duration_s": track_duration_ms / 1000.0,
-                "fade_in_ms": fade_in_ms,
-                "fade_out_ms": fade_out_ms,
-                "gain_db": span.gain_db,
-            }
-        )
-
-    # 注意：loudnorm 必须放在 amix 之后的总线上，不能放在各轨内。
-    # 实测 ffmpeg 9 中 loudnorm 收到有限流 EOF 后会提前透传结束信号，
-    # 导致其后的 adelay 缓冲样本不被 flush（大延迟轨道整体丢失，
-    # 输出只剩 atrim 截出的前几秒）。轨内只做成型，总线统一归一化，
-    # 响度目标与单曲 BGM 链路（I=-16/TP=-1.5/LRA=11）保持一致。
-    chains: list[str] = []
-    labels: list[str] = []
-    for track in tracks:
-        idx = int(track["index"])
-        delay = int(track["delay"])
-        duration_s = float(track["duration_s"])
-        chain = (
-            f"[{idx}:a]aformat=sample_fmts=fltp:sample_rates={_AUDIO_RATE}:"
-            f"channel_layouts={_AUDIO_LAYOUT},atrim=0:{duration_s:.3f},"
-            f"volume={float(track['gain_db']):.1f}dB"
-        )
-        fade_in_ms = int(track["fade_in_ms"])
-        fade_out_ms = int(track["fade_out_ms"])
-        if fade_in_ms > 0:
-            chain += f",afade=t=in:st=0:d={fade_in_ms / 1000.0:.3f}"
-        if fade_out_ms > 0:
-            out_start = max(0.0, duration_s - fade_out_ms / 1000.0)
-            chain += f",afade=t=out:st={out_start:.3f}:d={fade_out_ms / 1000.0:.3f}"
-        chain += f",adelay={delay}|{delay},apad,atrim=0:{total_s:.3f}[bm{idx}]"
-        chains.append(chain)
-        labels.append(f"bm{idx}")
-
-    mixed, mix_chains = _mix_labels(labels, prefix="bm")
-    chains.extend(mix_chains)
-    chains.append(
-        f"[{mixed}]loudnorm=I=-16:TP=-1.5:LRA=11,apad,atrim=0:{total_s:.3f}[bgmout]"
-    )
-    args += ["-filter_complex", ";".join(chains)]
-    args += [
-        "-map",
-        "[bgmout]",
-        "-c:a",
-        "pcm_s16le",
-        "-ar",
-        str(_AUDIO_RATE),
-        "-ac",
-        "2",
-        str(out_path),
-    ]
-    run_ffmpeg(args, ffmpeg_bin=ffmpeg_bin)
+        mixed, mix_chains = _mix_labels(labels, prefix="bm")
+        chains.extend(mix_chains)
+        # 总线上**不再**做 loudnorm：各幕的降增益必须原样保留。
+        chains.append(f"[{mixed}]apad,atrim=0:{total_s:.3f}[bgmout]")
+        args += ["-filter_complex", ";".join(chains)]
+        args += [
+            "-map",
+            "[bgmout]",
+            "-c:a",
+            "pcm_s16le",
+            "-ar",
+            str(_AUDIO_RATE),
+            "-ac",
+            "2",
+            str(out_path),
+        ]
+        run_ffmpeg(args, ffmpeg_bin=ffmpeg_bin)
+    finally:
+        shutil.rmtree(norm_dir, ignore_errors=True)
     return out_path
 
 
@@ -1931,7 +1971,11 @@ def render_episode(
     mixed_bgm_path: Path | None = None
     mixed_bgm_gain = settings.render.bgm_gain_db
     try:
-        storyboard = load_storyboard(storyboard_path_for(episode_dir))
+        if bgm_path:
+            # 显式传入 bgm_path 时以用户指定为准，不进入按幕多轨逻辑。
+            storyboard = None
+        else:
+            storyboard = load_storyboard(storyboard_path_for(episode_dir))
         if storyboard is not None:
             spans = build_scene_bgm_spans(
                 storyboard,

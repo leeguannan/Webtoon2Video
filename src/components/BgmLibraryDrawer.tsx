@@ -14,6 +14,8 @@ interface BgmLibraryDrawerProps {
   seriesId: string;
   open: boolean;
   onClose: () => void;
+  /** 曲库变化（上传/删除成功）后回传最新列表，供幕下拉即时刷新。 */
+  onLibraryChange?: (next: BgmLibraryResponse) => void;
 }
 
 const ACCEPTED_EXTENSIONS = ['.mp3', '.m4a', '.wav', '.ogg'];
@@ -27,6 +29,7 @@ export default function BgmLibraryDrawer({
   seriesId,
   open,
   onClose,
+  onLibraryChange,
 }: BgmLibraryDrawerProps) {
   const [data, setData] = useState<BgmLibraryResponse | null>(null);
   const [loading, setLoading] = useState(false);
@@ -118,6 +121,7 @@ export default function BgmLibraryDrawer({
         throw new Error(body.detail || `上传失败（HTTP ${res.status}）`);
       }
       setData(body as BgmLibraryResponse);
+      onLibraryChange?.(body as BgmLibraryResponse);
       setHint(moodSlot ? `已绑定为「${moodSlot}」情绪默认曲目` : '曲目已上传到作品曲库');
       if (fileInputRef.current) {
         fileInputRef.current.value = '';
@@ -146,6 +150,7 @@ export default function BgmLibraryDrawer({
         throw new Error(body.detail || `删除失败（HTTP ${res.status}）`);
       }
       setData(body as BgmLibraryResponse);
+      onLibraryChange?.(body as BgmLibraryResponse);
       setConfirmDelete('');
       setHint('已删除作品曲目');
     } catch (err) {

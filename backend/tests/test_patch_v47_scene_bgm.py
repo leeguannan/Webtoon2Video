@@ -470,6 +470,55 @@ def test_synthesize_returns_none_when_all_silent(tmp_path: Path) -> None:
     assert not (tmp_path / "silent.wav").exists()
 
 
+def _mean_dbfs(wav_path: Path) -> float:
+    """整段 WAV 的平均音量（dBFS）。"""
+    with wave.open(str(wav_path), "rb") as wav:
+        raw = wav.readframes(wav.getnframes())
+    values = struct.unpack("<%dh" % (len(raw) // 2), raw)
+    if not values:
+        return -120.0
+    rms = math.sqrt(sum(value * value for value in values) / len(values))
+    if rms <= 0:
+        return -120.0
+    return 20.0 * math.log10(rms / 32768.0)
+
+
+@needs_ffmpeg
+def test_synthesize_multi_bgm_wav_keeps_scene_gain(tmp_path: Path) -> None:
+    """各幕降增益必须原样生效，不能被总线 loudnorm 拉回 -16 LUFS。
+
+    回归背景：修复前 ``volume`` 在轨内、``loudnorm`` 在总线，-14dB 的降增益
+    被重新拉回 -16 LUFS（实测 -15.3dB），直接盖过人声。
+    """
+    source = _write_sine_wav(tmp_path / "tone.wav", frequency=440.0, seconds=2.0)
+
+    quiet = s7_renderer.synthesize_multi_bgm_wav(
+        [s7_renderer.BgmSpan(0, 2000, source, -14.0)],
+        total_s=2.0,
+        out_path=tmp_path / "quiet.wav",
+        ffmpeg_bin=FFMPEG_BIN,
+    )
+    loud = s7_renderer.synthesize_multi_bgm_wav(
+        [s7_renderer.BgmSpan(0, 2000, source, 0.0)],
+        total_s=2.0,
+        out_path=tmp_path / "loud.wav",
+        ffmpeg_bin=FFMPEG_BIN,
+    )
+    assert quiet is not None and quiet.is_file()
+    assert loud is not None and loud.is_file()
+
+    quiet_db = _mean_dbfs(quiet)
+    loud_db = _mean_dbfs(loud)
+    # -14dB 的轨平均音量必须显著低于 -22 dBFS。
+    assert quiet_db < -22.0, f"降增益被总线 loudnorm 抹平：{quiet_db:.2f} dBFS"
+    # 且相对 0dB 版本至少再低 6dB，说明增益确实逐轨生效。
+    assert loud_db - quiet_db > 6.0, (
+        f"增益未生效：0dB={loud_db:.2f} dBFS，-14dB={quiet_db:.2f} dBFS"
+    )
+    # 预处理临时文件必须清理干净。
+    assert not list(tmp_path.glob(".bgm_norm_*"))
+
+
 # ---------------------------------------------------------------------------
 # 组 5：Web API
 # ---------------------------------------------------------------------------
