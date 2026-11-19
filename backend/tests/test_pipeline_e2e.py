@@ -3,6 +3,10 @@
 不联网、不花钱：视觉与撰稿用 stub LLM 客户端，语音用 stub TTS 客户端，
 只有最后的 FFmpeg 编码是真跑（没有 ffmpeg 时整体跳过）。
 
+三个测试共用同一个 module 级同步 fixture（``_e2e_run_result``）：整条
+Stage 0~7 流水线（2 话）只跑一次真 FFmpeg 渲染，各测试在同一份产物上
+做不同维度的断言，避免重复渲染拖慢用例。
+
 覆盖的关键点：
 
 - Stage 0~7 依次落盘（``01_raw`` → ``07_out``）；
@@ -13,12 +17,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import re
 import shutil
 import subprocess
 import wave
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -193,6 +199,16 @@ class StubTTS:
         return None
 
 
+@dataclass(frozen=True)
+class _E2ERunResult:
+    """一次共享流水线运行的产物句柄。"""
+
+    result: dict
+    workspace: Path
+    out_dir: Path
+    tts: StubTTS
+
+
 def _make_source(root: Path, episodes: int = 2) -> Path:
     for episode_no in range(1, episodes + 1):
         folder = root / f"ep_{episode_no:03d}"
@@ -221,11 +237,17 @@ def _probe(path: Path) -> dict:
     return json.loads(result.stdout)
 
 
-@pytest.mark.anyio
-async def test_w2v_run_produces_nine_by_sixteen_video(tmp_path: Path) -> None:
-    source = _make_source(tmp_path / "src")
-    workspace = tmp_path / "ws"
-    out_dir = tmp_path / "out"
+@pytest.fixture(scope="module")
+def _e2e_run_result(tmp_path_factory: pytest.TempPathFactory) -> _E2ERunResult:
+    """整条 2 话流水线只跑一次。
+
+    刻意写成同步 fixture + ``asyncio.run``：module 级 ``async def`` fixture
+    会与 anyio 默认的函数级 event loop 撞 ``ScopeMismatch``。
+    """
+    base = tmp_path_factory.mktemp("pipeline_e2e")
+    source = _make_source(base / "src")
+    workspace = base / "ws"
+    out_dir = base / "out"
     llm = StubLLM()
     tts = StubTTS()
 
@@ -234,15 +256,24 @@ async def test_w2v_run_produces_nine_by_sixteen_video(tmp_path: Path) -> None:
         pronunciation_overrides={"银行": "yín háng"},
     )
 
-    result = await run_series(
-        str(source),
-        config=config,
-        episodes_spec="1-2",
-        concurrency=2,
-        client_factory=lambda: llm,
-        tts_factory=lambda: tts,
-        out_dir=str(out_dir),
+    result = asyncio.run(
+        run_series(
+            str(source),
+            config=config,
+            episodes_spec="1-2",
+            concurrency=2,
+            client_factory=lambda: llm,
+            tts_factory=lambda: tts,
+            out_dir=str(out_dir),
+        )
     )
+    return _E2ERunResult(result=result, workspace=workspace, out_dir=out_dir, tts=tts)
+
+
+def test_w2v_run_produces_nine_by_sixteen_video(_e2e_run_result: _E2ERunResult) -> None:
+    result = _e2e_run_result.result
+    workspace = _e2e_run_result.workspace
+    out_dir = _e2e_run_result.out_dir
 
     assert result["command"] == "run"
     assert result["series_id"].startswith("wt_local_")
@@ -282,26 +313,13 @@ async def test_w2v_run_produces_nine_by_sixteen_video(tmp_path: Path) -> None:
     assert len(list(out_dir.glob("*.mp4"))) == 2
 
 
-@pytest.mark.anyio
-async def test_pronunciation_override_never_pollutes_subtitles(tmp_path: Path) -> None:
+def test_pronunciation_override_never_pollutes_subtitles(
+    _e2e_run_result: _E2ERunResult,
+) -> None:
     """铁律：多音字替换只进送音文本，字幕保持原字。"""
-    source = _make_source(tmp_path / "src", episodes=1)
-    workspace = tmp_path / "ws"
-    llm = StubLLM()
-    tts = StubTTS()
-
-    config = AppConfig(
-        workspace=WorkspaceConfig(root=workspace),
-        pronunciation_overrides={"银行": "yín háng"},
-    )
-    result = await run_series(
-        str(source),
-        config=config,
-        episodes_spec="1",
-        concurrency=1,
-        client_factory=lambda: llm,
-        tts_factory=lambda: tts,
-    )
+    result = _e2e_run_result.result
+    workspace = _e2e_run_result.workspace
+    tts = _e2e_run_result.tts
 
     # 送进 TTS 的文本带注音
     assert any("yín háng" in text for text in tts.texts)
@@ -313,23 +331,10 @@ async def test_pronunciation_override_never_pollutes_subtitles(tmp_path: Path) -
     assert "yín háng" not in ass_text
 
 
-@pytest.mark.anyio
-async def test_timeline_is_audio_first(tmp_path: Path) -> None:
+def test_timeline_is_audio_first(_e2e_run_result: _E2ERunResult) -> None:
     """画面时长跟着音频走，而不是拍脑袋估。"""
-    source = _make_source(tmp_path / "src", episodes=1)
-    workspace = tmp_path / "ws"
-    llm = StubLLM()
-    tts = StubTTS()
-    config = AppConfig(workspace=WorkspaceConfig(root=workspace))
-
-    result = await run_series(
-        str(source),
-        config=config,
-        episodes_spec="1",
-        concurrency=1,
-        client_factory=lambda: llm,
-        tts_factory=lambda: tts,
-    )
+    result = _e2e_run_result.result
+    workspace = _e2e_run_result.workspace
     series_dir = workspace / result["series_id"]
     episode_dir = series_dir / "episodes" / "ep_001"
 
