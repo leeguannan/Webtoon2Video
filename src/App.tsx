@@ -16,6 +16,7 @@ import type {
   CharacterProfile,
   EpisodeDigest,
   EpisodeItem,
+  EpisodeRenderOptions,
   EpisodeResetResponse,
   PlotThread,
   PronunciationRule,
@@ -475,6 +476,24 @@ export default function App() {
       );
     },
     []
+  );
+
+  /**
+   * Patch v4.5：保存单话封页/结尾片包选项并同步本地状态。
+   * 后端写入 episodes/ep_XXX/render_options.json，重跑 S7 即生效。
+   */
+  const handleUpdateEpisodeRenderOptions = useCallback(
+    async (episodeId: string, options: EpisodeRenderOptions) => {
+      const result = await apiFetch<{
+        episode_id: string;
+        render_options: EpisodeRenderOptions;
+      }>(`/episodes/${encodeURIComponent(episodeId)}/render-options`, {
+        method: 'PUT',
+        body: JSON.stringify(options),
+      });
+      patchEpisode(episodeId, (ep) => ({ ...ep, render_options: result.render_options }));
+    },
+    [patchEpisode]
   );
 
   /* -------------------- SSE 实时日志与状态 -------------------- */
@@ -1252,6 +1271,7 @@ export default function App() {
               }}
               onExportEpisode={handleExportEpisode}
               onExportSeriesZip={handleExportSeriesZip}
+              onUpdateEpisodeRenderOptions={handleUpdateEpisodeRenderOptions}
             />
           )}
 
@@ -1267,6 +1287,7 @@ export default function App() {
               onTogglePanelBlank={handleTogglePanelBlank}
               onUpdateBeats={handleUpdateBeats}
               onAutoSaveBeats={handleAutoSaveBeats}
+              onUpdateEpisodeRenderOptions={handleUpdateEpisodeRenderOptions}
               onExportEpisode={handleExportEpisode}
             />
           )}

@@ -142,6 +142,64 @@ export interface SeriesTtsConfigResponse extends SeriesTtsConfig {
   minimax_voices?: VoiceOption[];
 }
 
+// ---------------------------------------------------------------------------
+// Patch v4.5：作品级通用封页写字 + 双结尾图片包
+// ---------------------------------------------------------------------------
+/** 单话结尾图策略：inherit=跟随作品默认，none=不加结尾，continue=待续，final=完结。 */
+export type OutroMode = 'inherit' | 'none' | 'continue' | 'final';
+
+/** 作品级默认结尾策略（单话的 inherit 会解析成它）。 */
+export type SeriesDefaultOutroMode = 'none' | 'continue' | 'final';
+
+/** 封页话次文字的排版规格（与后端 CoverTextSpec 字段一致）。 */
+export interface CoverTextSpec {
+  enabled: boolean;
+  /** 文字锚点的归一化横坐标（0.05~0.95）。 */
+  x_ratio: number;
+  /** 文字锚点的归一化纵坐标（0.05~0.95）。 */
+  y_ratio: number;
+  font_size: number;
+  color: string;
+  stroke_color: string;
+  stroke_width: number;
+  font_name: string;
+  /** 文案模板，占位符：{ep}=中文/阿拉伯话次、{ep_no}=恒阿拉伯数字。 */
+  template: string;
+  use_chinese_numeral: boolean;
+}
+
+/** 作品级片包配置（series_config.yaml 的 branding 键）。 */
+export interface SeriesBrandingConfig {
+  cover_image: string | null;
+  outro_continue_image: string | null;
+  outro_final_image: string | null;
+  cover_duration_ms: number;
+  cover_fade_in_ms: number;
+  cover_fade_out_ms: number;
+  outro_duration_ms: number;
+  outro_fade_in_ms: number;
+  outro_fade_out_ms: number;
+  default_outro_mode: SeriesDefaultOutroMode;
+  cover_text: CoverTextSpec;
+}
+
+/** GET /api/series/{id}/branding 的完整响应（配置 + 图片 URL + 字体清单）。 */
+export interface SeriesBrandingResponse extends SeriesBrandingConfig {
+  series_id: string;
+  cover_url: string | null;
+  outro_continue_url: string | null;
+  outro_final_url: string | null;
+  font_options: Array<{ name: string; path: string }>;
+}
+
+/** 单话片包选项（episodes/ep_XXX/render_options.json）。 */
+export interface EpisodeRenderOptions {
+  cover_enabled: boolean;
+  /** 单话封面文字覆盖；null/空串 = 按模板自动生成「第一话」。 */
+  cover_text_override: string | null;
+  outro_mode: OutroMode;
+}
+
 export interface EpisodeItem {
   episode_no: number;
   episode_id: string;
@@ -156,6 +214,8 @@ export interface EpisodeItem {
   stages: StageProgress[];
   panels: PanelItem[];
   beats: ScriptBeat[];
+  /** Patch v4.5：单话封页/结尾片包选项（后端缺省返回全默认值）。 */
+  render_options?: EpisodeRenderOptions;
   logs: string[];
 }
 

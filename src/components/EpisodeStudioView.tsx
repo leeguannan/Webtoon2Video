@@ -20,6 +20,8 @@ import {
 import type {
   CameraMotion,
   EpisodeItem,
+  EpisodeRenderOptions,
+  OutroMode,
   PronunciationRule,
   ScriptBeat,
   SeriesTtsConfigResponse,
@@ -55,8 +57,26 @@ interface EpisodeStudioViewProps {
   ) => Promise<boolean> | boolean;
   /** 分镜大图弹窗里的字幕原文自动保存（不触发重跑配音）。缺省时退化为本地草稿保存。 */
   onAutoSaveBeats?: (episodeId: string, beats: ScriptBeat[]) => Promise<void>;
+  /** Patch v4.5：保存本话封页/结尾片包选项（写入 render_options.json，仅重跑 S7 生效）。 */
+  onUpdateEpisodeRenderOptions?: (
+    episodeId: string,
+    options: EpisodeRenderOptions
+  ) => Promise<void> | void;
   onExportEpisode: (episodeId: string, format: 'mp4' | 'ass' | 'script') => void;
 }
+
+const DEFAULT_RENDER_OPTIONS: EpisodeRenderOptions = {
+  cover_enabled: true,
+  cover_text_override: null,
+  outro_mode: 'inherit',
+};
+
+const EPISODE_OUTRO_OPTIONS: Array<{ value: OutroMode; label: string }> = [
+  { value: 'inherit', label: '跟随作品默认' },
+  { value: 'continue', label: '待续' },
+  { value: 'final', label: '完结' },
+  { value: 'none', label: '不加结尾' },
+];
 
 type StudioTab = 'panels' | 'storyboard' | 'script' | 'timeline' | 'preview';
 
@@ -90,9 +110,53 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   onTogglePanelBlank,
   onUpdateBeats,
   onAutoSaveBeats,
+  onUpdateEpisodeRenderOptions,
   onExportEpisode,
 }) => {
   const [activeTab, setActiveTab] = useState<StudioTab>('script');
+
+  // ---- Patch v4.5：本话封页与结尾片包（render_options.json，仅重跑 S7 生效） ----
+  const brandingOptions: EpisodeRenderOptions = episode.render_options ?? DEFAULT_RENDER_OPTIONS;
+  const [coverOverrideDraft, setCoverOverrideDraft] = useState(
+    brandingOptions.cover_text_override ?? ''
+  );
+  const [brandingSaving, setBrandingSaving] = useState(false);
+  const [brandingSavedAt, setBrandingSavedAt] = useState<string | null>(null);
+  const [brandingError, setBrandingError] = useState<string | null>(null);
+
+  // 外部数据刷新（如切换话次、保存回包）后同步本地草稿。
+  useEffect(() => {
+    setCoverOverrideDraft(episode.render_options?.cover_text_override ?? '');
+  }, [episode.episode_id, episode.render_options?.cover_text_override]);
+
+  const persistRenderOptions = useCallback(
+    async (next: EpisodeRenderOptions) => {
+      if (!onUpdateEpisodeRenderOptions) return;
+      setBrandingSaving(true);
+      setBrandingError(null);
+      try {
+        await onUpdateEpisodeRenderOptions(episode.episode_id, next);
+        setBrandingSavedAt(new Date().toLocaleTimeString('zh-CN', { hour12: false }));
+      } catch (err) {
+        setBrandingError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setBrandingSaving(false);
+      }
+    },
+    [episode.episode_id, onUpdateEpisodeRenderOptions]
+  );
+
+  // 封面文字覆盖：输入防抖 500ms 自动保存；空白归一为 null（后端同样会兜底）。
+  useEffect(() => {
+    const normalized = coverOverrideDraft.trim() ? coverOverrideDraft.trim() : null;
+    if ((episode.render_options?.cover_text_override ?? null) === normalized) return;
+    const timer = setTimeout(() => {
+      void persistRenderOptions({ ...brandingOptions, cover_text_override: normalized });
+    }, 500);
+    return () => clearTimeout(timer);
+    // brandingOptions 每次渲染都是新对象，只依赖草稿与当前落盘值，避免重复触发。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [coverOverrideDraft, episode.render_options?.cover_text_override]);
   /** Patch v4.0 Patch 20：镜头编排 Tab 的幕数（由 StoryboardEditor 加载后回传）。 */
   const [storyboardSceneCount, setStoryboardSceneCount] = useState<number | null>(null);
   const [selectedPanelId, setSelectedPanelId] = useState<string>(
@@ -1005,6 +1069,87 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
             </div>
           </div>
         )}
+      </section>
+
+      {/* Patch v4.5：本话封页与结尾片包（仅重跑 S7 合成成片即可生效，无需重跑 S4~S6） */}
+      <section className="bg-white border border-slate-200 rounded-xl px-5 py-4">
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+          <h3 className="inline-flex items-center gap-2 text-sm font-semibold text-slate-900">
+            <Film className="w-4 h-4 text-blue-600" />
+            本话封页与结尾片包
+            <span className="text-xs font-normal text-slate-400">仅重跑 S7 生效</span>
+          </h3>
+          <div className="inline-flex items-center gap-2 text-xs text-slate-500">
+            {brandingSaving && (
+              <>
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-600" />
+                正在保存…
+              </>
+            )}
+            {!brandingSaving && brandingError && (
+              <span className="inline-flex items-center gap-1 text-red-600">
+                <AlertCircle className="w-3.5 h-3.5" />
+                {brandingError}
+              </span>
+            )}
+            {!brandingSaving && !brandingError && brandingSavedAt && (
+              <span className="text-emerald-600">
+                已保存 {brandingSavedAt} · 修改后仅需从 S7 合成成片重跑即可生效
+              </span>
+            )}
+            {!brandingSaving && !brandingError && !brandingSavedAt && (
+              <span>修改后仅需从 S7 合成成片重跑即可生效</span>
+            )}
+          </div>
+        </div>
+        <div className="flex flex-wrap items-end gap-4">
+          <label className="inline-flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={brandingOptions.cover_enabled}
+              onChange={(e) =>
+                void persistRenderOptions({
+                  ...brandingOptions,
+                  cover_enabled: e.target.checked,
+                })
+              }
+              className="accent-blue-600 cursor-pointer"
+            />
+            启用作品通用封页
+          </label>
+          <label className="block min-w-[220px] flex-1 max-w-sm">
+            <span className="block text-xs text-slate-500 mb-1">
+              封面文字覆盖（留空自动填如「第一话」）
+            </span>
+            <input
+              type="text"
+              value={coverOverrideDraft}
+              onChange={(e) => setCoverOverrideDraft(e.target.value)}
+              placeholder="留空则按作品模板自动生成"
+              className="w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600"
+            />
+          </label>
+          <label className="block">
+            <span className="block text-xs text-slate-500 mb-1">结尾图</span>
+            <select
+              aria-label="本话结尾图模式"
+              value={brandingOptions.outro_mode}
+              onChange={(e) =>
+                void persistRenderOptions({
+                  ...brandingOptions,
+                  outro_mode: e.target.value as OutroMode,
+                })
+              }
+              className="rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 cursor-pointer"
+            >
+              {EPISODE_OUTRO_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
       </section>
 
       {/* Main Studio Workspace Tabs */}

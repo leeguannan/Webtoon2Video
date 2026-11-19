@@ -38,6 +38,12 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from core.branding_render import (
+    load_episode_render_options,
+    render_cover_image,
+    render_outro_image,
+    resolve_effective_branding,
+)
 from core.config import AppConfig, assets_root, load_series_config
 from core.schemas import RenderTimeline, SfxEvent, SubtitleLine, TimelineScene, load_model
 
@@ -658,6 +664,9 @@ def _prepare_audio(
     enable_sfx: bool = True,
     sfx_gain_db: float = DEFAULT_SFX_GAIN_DB,
     assets_dir: Path | None = None,
+    audio_offset_ms: int = 0,
+    bgm_fade_in_ms: int = 0,
+    bgm_fade_out_ms: int = 0,
 ) -> tuple[Path, Path | None, Path | None]:
     """调用 A「备音」：产出人声轨、BGM 轨与音效轨。
 
@@ -665,7 +674,12 @@ def _prepare_audio(
 
     **为什么先落盘再进成片调用**：``sidechaincompress`` 的侧链输入只能取自输入文件流，
     人声轨必须是真实文件才能作为闪避触发器。
+
+    Patch v4.5：``audio_offset_ms`` 把所有人声/音效落点整体后移（给封页引导留白）；
+    ``bgm_fade_in_ms`` / ``bgm_fade_out_ms`` 在 BGM 轨首尾加平滑 ``afade``。
+    三个参数全为 0（默认）时滤镜链与历史行为完全一致。
     """
+    audio_offset_ms = max(0, int(audio_offset_ms))
     voice_path = work_dir / "voice.wav"
     bgm_norm_path = work_dir / "bgm.wav"
     sfx_norm_path = work_dir / "sfx.wav"
@@ -680,7 +694,13 @@ def _prepare_audio(
             # 缺音频不阻断渲染：画面照常出片，只是这句没有配音。
             print(f"[s7] 警告：找不到音频 {getattr(clip, 'audio_path', '')!r}，该 beat 静音处理")
             continue
-        usable.append((resolved, int(starts.get(str(getattr(clip, "beat_id", "") or ""), 0))))
+        usable.append(
+            (
+                resolved,
+                int(starts.get(str(getattr(clip, "beat_id", "") or ""), 0))
+                + audio_offset_ms,
+            )
+        )
 
     # ---- 音效轨（Patch v3.1 Patch 11 B4）----
     sfx_inputs: list[tuple[Path, int, float]] = []
@@ -702,7 +722,11 @@ def _prepare_audio(
                 # 事件显式给了不同于 schema 默认值的音量就用它，否则以渲染配置为准。
                 gain = float(event_gain)
             sfx_inputs.append(
-                (asset, max(0, int(getattr(event, "start_ms", 0) or 0)), float(gain))
+                (
+                    asset,
+                    max(0, int(getattr(event, "start_ms", 0) or 0)) + audio_offset_ms,
+                    float(gain),
+                )
             )
 
     # Patch 14：显性混音日志——bgm 文件名/增益与 sfx 实际可用数/事件总数一眼可查，
@@ -745,12 +769,25 @@ def _prepare_audio(
     if bgm_path is not None:
         # Patch 14：先 loudnorm 响度归一（统一各来源 BGM 的音量基线）再降增益，
         # 顺序保持「loudnorm → volume=bgm_gain_db → sidechaincompress」。
-        chains.append(
+        # Patch v4.5：atrim 之后按需追加首尾 afade（封页渐入 / 结尾随画面同步淡出）。
+        bgm_filters = (
             f"[{bgm_index}:a]aformat=sample_fmts=fltp:sample_rates={_AUDIO_RATE}:"
             f"channel_layouts={_AUDIO_LAYOUT},loudnorm=I=-16:TP=-1.5:LRA=11,"
             f"volume={float(bgm_gain_db):.1f}dB,"
-            f"apad,atrim=0:{total_s:.3f}[bgm]"
+            f"apad,atrim=0:{total_s:.3f}"
         )
+        total_ms = max(1, int(round(total_s * 1000)))
+        fade_in_ms = min(max(0, int(bgm_fade_in_ms)), total_ms // 2)
+        fade_out_ms = min(max(0, int(bgm_fade_out_ms)), total_ms - fade_in_ms)
+        if fade_in_ms > 0:
+            bgm_filters += f",afade=t=in:st=0:d={fade_in_ms / 1000.0:.3f}"
+        if fade_out_ms > 0:
+            out_start_s = max(0.0, (total_ms - fade_out_ms) / 1000.0)
+            bgm_filters += (
+                f",afade=t=out:st={out_start_s:.3f}:d={fade_out_ms / 1000.0:.3f}"
+            )
+        bgm_filters += "[bgm]"
+        chains.append(bgm_filters)
 
     sfx_labels: list[str] = []
     for offset, (_path, start, gain) in enumerate(sfx_inputs):
@@ -867,6 +904,18 @@ def _render_segment(
     background_darken: float,
     out_path: Path,
     ffmpeg_bin: str,
+    # ---- Patch v4.5：作品级封页 / 双结尾片包（全默认 = 历史行为 100% 一致）----
+    cover_png: Path | None = None,
+    cover_duration_ms: int = 0,
+    cover_fade_in_ms: int = 0,
+    cover_fade_out_ms: int = 0,
+    outro_png: Path | None = None,
+    outro_duration_ms: int = 0,
+    outro_fade_in_ms: int = 0,
+    outro_fade_out_ms: int = 0,
+    seg_audio_start_ms: int | None = None,
+    seg_audio_len_ms: int | None = None,
+    subtitle_shift_ms: int = 0,
 ) -> Path:
     """渲染一个分段，输出带音轨的独立 mp4。
 
@@ -875,12 +924,67 @@ def _render_segment(
 
     段内时间一律相对 ``seg_start_ms``：字幕的 ``enable='between(t,…)'``
     用相对时间，音频用 ``-ss``/``-t`` 在输入端切片。
+
+    Patch v4.5：封页只在第一段接入、结尾只在最后一段接入（单段时两者同段）。
+    所有片包参数缺省时，输入列表、滤镜链与输出时长与历史链路逐字一致。
     """
     scene_count = len(scenes)
     seg_s = max(0.001, seg_len_ms / 1000.0)
-    audio_start_s = max(0.0, seg_start_ms / 1000.0)
 
-    # ---- 输入列表：背景 N 个 → 前景 N 个 → 字幕 M 个 →（可选 BGM）→ 人声 ----
+    # ---- 封页时长数学（夹取保证 xfade/concat 的输入时长恒合法）----
+    cover_active = cover_png is not None
+    outro_active = outro_png is not None
+    if cover_active:
+        eff_cover_ms = max(200, int(cover_duration_ms))
+        eff_cover_fade_out = min(
+            max(0, int(cover_fade_out_ms)),
+            max(0, eff_cover_ms - 100),
+            max(0, seg_len_ms - 100),
+        )
+        eff_cover_fade_in = min(
+            max(0, int(cover_fade_in_ms)),
+            max(0, eff_cover_ms - eff_cover_fade_out),
+        )
+    else:
+        eff_cover_ms = 0
+        eff_cover_fade_in = 0
+        eff_cover_fade_out = 0
+
+    # ---- 结尾时长数学 ----
+    if outro_active:
+        eff_outro_ms = max(200, int(outro_duration_ms))
+        eff_outro_fade_in = min(
+            max(0, int(outro_fade_in_ms)),
+            max(0, eff_outro_ms - 100),
+            max(0, seg_len_ms - 100),
+        )
+        eff_outro_fade_out = min(
+            max(0, int(outro_fade_out_ms)),
+            max(0, eff_outro_ms - eff_outro_fade_in),
+        )
+    else:
+        eff_outro_ms = 0
+        eff_outro_fade_in = 0
+        eff_outro_fade_out = 0
+
+    #: 结尾起点 = 正文 + 封页（xfade offset 基准）。
+    pre_outro_ms = seg_len_ms + eff_cover_ms
+    seg_total_ms = seg_len_ms + eff_cover_ms + eff_outro_ms
+    seg_total_s = max(0.001, seg_total_ms / 1000.0)
+
+    # 音频切片窗口：不传片包参数时回退历史口径（seg_start / seg_len）。
+    if seg_audio_start_ms is not None:
+        audio_start_s = max(0.0, seg_audio_start_ms / 1000.0)
+    else:
+        audio_start_s = max(0.0, seg_start_ms / 1000.0)
+    if seg_audio_len_ms is not None:
+        audio_len_s = max(0.001, seg_audio_len_ms / 1000.0)
+    else:
+        audio_len_s = seg_s
+    subtitle_shift_s = max(0.0, int(subtitle_shift_ms) / 1000.0)
+    branding_active = cover_active or outro_active
+
+    # ---- 输入列表：背景 N → 前景 N → 字幕 M →（封页）→（结尾）→ BGM → 人声 → 音效 ----
     args: list[str] = ["-y", "-hide_banner"]
     for path, scene in zip(backgrounds, scenes):
         seconds = max(0.001, float(scene.duration_ms) / 1000.0)
@@ -892,17 +996,35 @@ def _render_segment(
         args += ["-loop", "1", "-framerate", str(fps), "-t", f"{seg_s:.3f}", "-i", str(png)]
 
     subtitle_base = scene_count * 2
-    bgm_index = subtitle_base + len(subtitles)
+    next_input = subtitle_base + len(subtitles)
+    cover_index: int | None = None
+    outro_index: int | None = None
+    if cover_active:
+        cover_index = next_input
+        next_input += 1
+        args += [
+            "-loop", "1", "-framerate", str(fps),
+            "-t", f"{eff_cover_ms / 1000.0:.3f}", "-i", str(cover_png),
+        ]
+    if outro_active:
+        outro_index = next_input
+        next_input += 1
+        args += [
+            "-loop", "1", "-framerate", str(fps),
+            "-t", f"{eff_outro_ms / 1000.0:.3f}", "-i", str(outro_png),
+        ]
+
+    bgm_index = next_input
     voice_index = bgm_index
     if bgm_path is not None:
         args += [
-            "-ss", f"{audio_start_s:.3f}", "-t", f"{seg_s:.3f}", "-i", str(bgm_path),
+            "-ss", f"{audio_start_s:.3f}", "-t", f"{audio_len_s:.3f}", "-i", str(bgm_path),
         ]
         voice_index = bgm_index + 1
-    args += ["-ss", f"{audio_start_s:.3f}", "-t", f"{seg_s:.3f}", "-i", str(voice_path)]
+    args += ["-ss", f"{audio_start_s:.3f}", "-t", f"{audio_len_s:.3f}", "-i", str(voice_path)]
     sfx_index = voice_index + 1
     if sfx_path is not None:
-        args += ["-ss", f"{audio_start_s:.3f}", "-t", f"{seg_s:.3f}", "-i", str(sfx_path)]
+        args += ["-ss", f"{audio_start_s:.3f}", "-t", f"{audio_len_s:.3f}", "-i", str(sfx_path)]
 
     # ---- 画面链 ----
     chains: list[str] = []
@@ -925,12 +1047,43 @@ def _render_segment(
         + f"concat=n={len(scenes)}:v=1:a=0[vcat]"
     )
 
-    # 字幕逐条 overlay：串行叠加（overlay 的副输入不能是图内 label 的多路并联）。
     video_label = "vcat"
+    if branding_active:
+        # 统一帧率/时间基/像素格式，xfade 与 concat 都要求两侧输入参数一致。
+        chains.append(f"[vcat]fps={fps},settb=AVTB,format=yuv420p[vbody]")
+        video_label = "vbody"
+
+        # ---- 封页：黑场淡入 → 停顿 → 叠化到正文第 1 帧 ----
+        if cover_active:
+            cover_chain = f"[{cover_index}:v]"
+            if eff_cover_fade_in > 0:
+                cover_chain += f"fade=t=in:st=0:d={eff_cover_fade_in / 1000.0:.3f},"
+            cover_chain += f"fps={fps},settb=AVTB,format=yuv420p[vcover]"
+            chains.append(cover_chain)
+            if eff_cover_fade_out >= 50:
+                # 正文头部 clone 出叠化区，xfade 后正文第 1 帧在 t=eff_cover_ms 精确全显。
+                fade_out_s = eff_cover_fade_out / 1000.0
+                chains.append(
+                    f"[{video_label}]tpad=start_duration={fade_out_s:.3f}:start_mode=clone[vbodypre]"
+                )
+                offset_s = (eff_cover_ms - eff_cover_fade_out) / 1000.0
+                chains.append(
+                    f"[vcover][vbodypre]xfade=transition=fade:duration={fade_out_s:.3f}:"
+                    f"offset={offset_s:.3f}[vwithcover]"
+                )
+            else:
+                chains.append(f"[vcover][{video_label}]concat=n=2:v=1:a=0[vwithcover]")
+            video_label = "vwithcover"
+
+    # 字幕逐条 overlay：串行叠加（overlay 的副输入不能是图内 label 的多路并联）。
+    # 第一段字幕整体后移 eff_cover_ms，封页停顿期间画面上绝对没有字幕。
     for offset, (line, _png, offset_x, offset_y) in enumerate(subtitles):
         chains.append(f"[{subtitle_base + offset}:v]format=rgba[sub{offset}]")
-        start = max(0.0, (float(line.start_ms) - seg_start_ms) / 1000.0)
-        end = min(seg_s, max(start + 0.05, (float(line.end_ms) - seg_start_ms) / 1000.0))
+        start = (
+            max(0.0, (float(line.start_ms) - seg_start_ms) / 1000.0) + subtitle_shift_s
+        )
+        end_raw = (float(line.end_ms) - seg_start_ms) / 1000.0 + subtitle_shift_s
+        end = min(seg_total_s, max(start + 0.05, end_raw))
         next_label = f"vsub{offset}"
         chains.append(
             f"[{video_label}][sub{offset}]overlay={offset_x}:{offset_y}:"
@@ -938,7 +1091,32 @@ def _render_segment(
         )
         video_label = next_label
 
-    # ---- 音频链 ----
+    # ---- 结尾：正文末帧之上叠化浮现 → 停留 → 随 fade out 淡出至黑场 ----
+    if outro_active:
+        chains.append(f"[{video_label}]fps={fps},settb=AVTB,format=yuv420p[vmain]")
+        outro_chain = f"[{outro_index}:v]"
+        if eff_outro_fade_out > 0:
+            fade_out_start_s = (eff_outro_ms - eff_outro_fade_out) / 1000.0
+            outro_chain += (
+                f"fade=t=out:st={fade_out_start_s:.3f}:"
+                f"d={eff_outro_fade_out / 1000.0:.3f},"
+            )
+        outro_chain += f"fps={fps},settb=AVTB,format=yuv420p[voutro]"
+        chains.append(outro_chain)
+        if eff_outro_fade_in >= 50:
+            fade_in_s = eff_outro_fade_in / 1000.0
+            chains.append(
+                f"[vmain]tpad=stop_duration={fade_in_s:.3f}:stop_mode=clone[vmainpad]"
+            )
+            chains.append(
+                f"[vmainpad][voutro]xfade=transition=fade:duration={fade_in_s:.3f}:"
+                f"offset={pre_outro_ms / 1000.0:.3f}[vfinal]"
+            )
+        else:
+            chains.append("[vmain][voutro]concat=n=2:v=1:a=0[vfinal]")
+        video_label = "vfinal"
+
+    # ---- 音频链（切片/补齐时长统一用 audio_len_s，无片包时等于 seg_s）----
     if bgm_path is not None:
         # 两个输入都写成「输入文件流」：sidechaincompress 的 request pad 不接受图内 label。
         chains.append(
@@ -946,7 +1124,7 @@ def _render_segment(
             f"threshold={_SIDECHAIN_THRESHOLD}:ratio={_SIDECHAIN_RATIO}:"
             f"attack={_SIDECHAIN_ATTACK_MS}:release={_SIDECHAIN_RELEASE_MS}[duck]"
         )
-        chains.append(f"[duck]apad,atrim=0:{seg_s:.3f}[bgmv]")
+        chains.append(f"[duck]apad,atrim=0:{audio_len_s:.3f}[bgmv]")
         chains.append(
             f"[{voice_index}:a]aformat=sample_fmts=fltp:sample_rates={_AUDIO_RATE}:"
             f"channel_layouts={_AUDIO_LAYOUT}[vin]"
@@ -965,17 +1143,17 @@ def _render_segment(
     elif sfx_path is not None:
         chains.append(
             f"[{voice_index}:a]aformat=sample_fmts=fltp:sample_rates={_AUDIO_RATE}:"
-            f"channel_layouts={_AUDIO_LAYOUT},apad,atrim=0:{seg_s:.3f}[vin]"
+            f"channel_layouts={_AUDIO_LAYOUT},apad,atrim=0:{audio_len_s:.3f}[vin]"
         )
         chains.append(
             f"[{sfx_index}:a]aformat=sample_fmts=fltp:sample_rates={_AUDIO_RATE}:"
-            f"channel_layouts={_AUDIO_LAYOUT},apad,atrim=0:{seg_s:.3f}[sfxv]"
+            f"channel_layouts={_AUDIO_LAYOUT},apad,atrim=0:{audio_len_s:.3f}[sfxv]"
         )
         chains.append("[vin][sfxv]amix=inputs=2:duration=first:normalize=0[aout]")
     else:
         chains.append(
             f"[{voice_index}:a]aformat=sample_fmts=fltp:sample_rates={_AUDIO_RATE}:"
-            f"channel_layouts={_AUDIO_LAYOUT},apad,atrim=0:{seg_s:.3f}[aout]"
+            f"channel_layouts={_AUDIO_LAYOUT},apad,atrim=0:{audio_len_s:.3f}[aout]"
         )
 
     args += ["-filter_complex", ";".join(chains)]
@@ -991,7 +1169,7 @@ def _render_segment(
         "-ac", "2",
         "-r", str(fps),
         "-s", f"{width}x{height}",
-        "-t", f"{seg_s:.3f}",
+        "-t", f"{seg_total_s:.3f}",
         "-movflags", "+faststart",
         str(out_path),
     ]
@@ -1016,6 +1194,17 @@ def render_timeline(
     enable_sfx: bool = True,
     sfx_gain_db: float = DEFAULT_SFX_GAIN_DB,
     assets_dir: Path | None = None,
+    # ---- Patch v4.5：片包参数（全默认 = 历史行为 100% 一致）----
+    cover_png: Path | None = None,
+    cover_duration_ms: int = 0,
+    cover_fade_in_ms: int = 0,
+    cover_fade_out_ms: int = 0,
+    outro_png: Path | None = None,
+    outro_duration_ms: int = 0,
+    outro_fade_in_ms: int = 0,
+    outro_fade_out_ms: int = 0,
+    bgm_fade_in_ms: int = 0,
+    bgm_fade_out_ms: int = 0,
 ) -> Path:
     """按时间轴渲染成片，返回成片路径。
 
@@ -1027,6 +1216,10 @@ def render_timeline(
     * BGM：``sidechaincompress``（侧链 = 人声轨）做闪避，再与人声 ``amix`` 混合；
     * 音效：``timeline.sfx_events`` 里的事件已在备音阶段 ``adelay`` 对齐 + 降音量，
       这里再与人声、BGM 三路混音。
+
+    Patch v4.5：``cover_png`` 只接到第一段、``outro_png`` 只接到最后一段；
+    备音轨按封页时长整体后移人声/音效并加长到「封页 + 正文 + 结尾」，
+    BGM 首尾可加 ``afade``。不传任何片包参数时与历史链路完全一致。
     """
     episode_dir = Path(episode_dir).expanduser()
     out_path = Path(out_path).expanduser()
@@ -1046,7 +1239,15 @@ def render_timeline(
     total_ms = int(timeline.total_duration_ms or 0)
     if total_ms <= 0:
         raise RenderError(f"时间轴总时长非法：{total_ms} ms")
-    total_s = total_ms / 1000.0
+
+    # ---- Patch v4.5：片包生效时长（备音轨与分段切片都按扩展总时长对齐）----
+    cover_active = cover_png is not None
+    outro_active = outro_png is not None
+    eff_cover_ms = max(200, int(cover_duration_ms)) if cover_active else 0
+    eff_outro_ms = max(200, int(outro_duration_ms)) if outro_active else 0
+    branding_on = cover_active or outro_active
+    extended_total_ms = total_ms + eff_cover_ms + eff_outro_ms
+    total_s = extended_total_ms / 1000.0
 
     image_paths: list[Path] = []
     for scene in scenes:
@@ -1078,6 +1279,9 @@ def render_timeline(
         enable_sfx=enable_sfx,
         sfx_gain_db=sfx_gain_db,
         assets_dir=assets_dir,
+        audio_offset_ms=eff_cover_ms,
+        bgm_fade_in_ms=bgm_fade_in_ms if branding_on else 0,
+        bgm_fade_out_ms=bgm_fade_out_ms if branding_on else 0,
     )
 
     # ---- 字幕 PNG ----
@@ -1122,6 +1326,7 @@ def render_timeline(
     # 整话塞进一个滤镜图会因为输入数过多（74 场景 = 222 个输入）把内存打爆，
     # 详见 _MAX_SCENES_PER_SEGMENT 的说明。这里按场景数切段，段产物再无损拼接。
     segment_paths: list[Path] = []
+    segment_count = (len(scenes) + _MAX_SCENES_PER_SEGMENT - 1) // _MAX_SCENES_PER_SEGMENT
     for seg_index, seg_start in enumerate(
         range(0, len(scenes), _MAX_SCENES_PER_SEGMENT)
     ):
@@ -1137,6 +1342,21 @@ def render_timeline(
         ]
         seg_len_ms = sum(int(scene.duration_ms) for scene in seg_scenes)
         seg_out = work_dir / f"seg_{seg_index:04d}.mp4"
+
+        # Patch v4.5：封页只接第一段、结尾只接最后一段（单段时两者同段）。
+        is_first_segment = seg_index == 0
+        is_last_segment = seg_index == segment_count - 1
+        seg_cover_ms = eff_cover_ms if is_first_segment else 0
+        seg_outro_ms = eff_outro_ms if is_last_segment else 0
+        if branding_on:
+            seg_audio_start_ms = (
+                0 if is_first_segment else eff_cover_ms + seg_begin_ms
+            )
+            seg_audio_len_ms = seg_len_ms + seg_cover_ms + seg_outro_ms
+        else:
+            seg_audio_start_ms = None
+            seg_audio_len_ms = None
+
         _render_segment(
             timeline=timeline,
             scenes=seg_scenes,
@@ -1155,6 +1375,17 @@ def render_timeline(
             background_darken=background_darken,
             out_path=seg_out,
             ffmpeg_bin=ffmpeg_bin,
+            cover_png=cover_png if cover_active and is_first_segment else None,
+            cover_duration_ms=cover_duration_ms,
+            cover_fade_in_ms=cover_fade_in_ms,
+            cover_fade_out_ms=cover_fade_out_ms,
+            outro_png=outro_png if outro_active and is_last_segment else None,
+            outro_duration_ms=outro_duration_ms,
+            outro_fade_in_ms=outro_fade_in_ms,
+            outro_fade_out_ms=outro_fade_out_ms,
+            seg_audio_start_ms=seg_audio_start_ms,
+            seg_audio_len_ms=seg_audio_len_ms,
+            subtitle_shift_ms=seg_cover_ms,
         )
         segment_paths.append(seg_out)
 
@@ -1258,6 +1489,42 @@ def render_episode(
     out_path = out_dir / f"{resolved_episode_id}.mp4"
     work_dir = out_dir / "_work"
 
+    # ---- Patch v4.5：作品级封页写字 + 双结尾图片包（底图缺失只跳过、不中断）----
+    series_config = load_series_config(series_dir)
+    episode_options = load_episode_render_options(episode_dir)
+    effective = resolve_effective_branding(series_config, episode_options, series_dir)
+
+    cover_composed: Path | None = None
+    if effective.cover_enabled and effective.cover_image_path is not None:
+        try:
+            cover_composed = work_dir / "cover_composed.png"
+            render_cover_image(
+                effective.cover_image_path,
+                cover_composed,
+                episode_no=int(episode_no),
+                cover_text=effective.cover_text,
+                override_text=effective.cover_text_override,
+                width=settings.video.width,
+                height=settings.video.height,
+            )
+        except Exception as exc:  # noqa: BLE001 - 片包是增强项，失败只降级不阻断
+            print(f"[s7] 警告：封页渲染失败，本话跳过片头：{exc}")
+            cover_composed = None
+
+    outro_composed: Path | None = None
+    if effective.outro_mode != "none" and effective.outro_image_path is not None:
+        try:
+            outro_composed = work_dir / "outro_composed.png"
+            render_outro_image(
+                effective.outro_image_path,
+                outro_composed,
+                width=settings.video.width,
+                height=settings.video.height,
+            )
+        except Exception as exc:  # noqa: BLE001 - 片包是增强项，失败只降级不阻断
+            print(f"[s7] 警告：结尾图渲染失败，本话跳过片尾：{exc}")
+            outro_composed = None
+
     render_timeline(
         timeline,
         episode_dir=episode_dir,
@@ -1270,6 +1537,16 @@ def render_episode(
         work_dir=work_dir,
         enable_sfx=settings.render.enable_sfx,
         sfx_gain_db=settings.render.sfx_gain_db,
+        cover_png=cover_composed,
+        cover_duration_ms=effective.cover_duration_ms,
+        cover_fade_in_ms=effective.cover_fade_in_ms,
+        cover_fade_out_ms=effective.cover_fade_out_ms,
+        outro_png=outro_composed,
+        outro_duration_ms=effective.outro_duration_ms,
+        outro_fade_in_ms=effective.outro_fade_in_ms,
+        outro_fade_out_ms=effective.outro_fade_out_ms,
+        bgm_fade_in_ms=effective.cover_fade_in_ms if cover_composed is not None else 0,
+        bgm_fade_out_ms=effective.outro_fade_out_ms if outro_composed is not None else 0,
     )
 
     # 清理中间音频，避免污染 07_out。

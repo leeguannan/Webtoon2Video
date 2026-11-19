@@ -33,20 +33,31 @@ import tempfile
 import time
 import zipfile
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal
 from urllib.parse import quote
 
 import yaml
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from sse_starlette.sse import EventSourceResponse
 
+from core.branding_render import (
+    BRANDING_SLOTS,
+    EpisodeRenderOptions,
+    decode_base64_image,
+    load_episode_render_options,
+    render_cover_image,
+    save_branding_image,
+    save_episode_render_options,
+)
 from core.config import (
     AppConfig,
     ConfigError,
+    SERIES_CONFIG_FILENAME,
+    SeriesBrandingConfig,
     SeriesTTSConfig,
     WorkspaceConfig,
     assets_root,
@@ -58,6 +69,7 @@ from core.config import (
     recommended_voice_for_tts_model,
     resolve_voice_for_tts_model,
 )
+from core.subtitle_render import FONT_CANDIDATES
 from core.manifest import ManifestManager, infer_stage_artifacts, infer_stage_status
 from core.panel_ids import panel_sort_key
 from core.schemas import (
@@ -544,6 +556,36 @@ class PronunciationRulesRequest(BaseModel):
     rules: list[dict[str, Any]] = Field(default_factory=list)
 
 
+# ---- Patch v4.5：作品级封页 / 双结尾片包 ----
+class BrandingUpdateRequest(BaseModel):
+    """``PUT /api/series/{sid}/branding`` 请求体（字段均可选，只改传入项）。"""
+
+    cover_text: dict[str, Any] | None = None
+    cover_duration_ms: int | None = None
+    cover_fade_in_ms: int | None = None
+    cover_fade_out_ms: int | None = None
+    outro_duration_ms: int | None = None
+    outro_fade_in_ms: int | None = None
+    outro_fade_out_ms: int | None = None
+    default_outro_mode: Literal["none", "continue", "final"] | None = None
+
+
+class BrandingUploadRequest(BaseModel):
+    """``POST /api/series/{sid}/branding/upload`` 请求体。"""
+
+    slot: str
+    content_base64: str
+    filename: str | None = None
+
+
+class CoverPreviewRequest(BaseModel):
+    """``POST /api/series/{sid}/branding/cover-preview`` 请求体。"""
+
+    episode_no: int | None = None
+    cover_text: dict[str, Any] | None = None
+    cover_text_override: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # 工作区视图（磁盘状态 → 前端数据结构）
 # ---------------------------------------------------------------------------
@@ -645,6 +687,7 @@ class WorkspaceView:
             "stages": stages,
             "panels": panels,
             "beats": beats,
+            "render_options": load_episode_render_options(episode_dir).model_dump(),
             "logs": logs,
         }
 
@@ -942,6 +985,80 @@ class WorkspaceView:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Patch v4.5：作品级封页 / 双结尾片包辅助
+# ---------------------------------------------------------------------------
+#: 上传槽位 → series_config.yaml 中的图片字段名。
+_BRANDING_SLOT_FIELDS: dict[str, str] = {
+    "cover": "cover_image",
+    "outro_continue": "outro_continue_image",
+    "outro_final": "outro_final_image",
+}
+#: 槽位 → GET payload 中的静态 URL 字段名。
+_BRANDING_URL_FIELDS: dict[str, str] = {
+    "cover": "cover_url",
+    "outro_continue": "outro_continue_url",
+    "outro_final": "outro_final_url",
+}
+
+
+def _branding_image_url(series_id: str, series_dir: Path, rel_path: str | None) -> str | None:
+    """把 branding 相对路径拼成带 mtime 防缓存参数的静态 URL；文件缺失返回 ``None``。"""
+    if not rel_path:
+        return None
+    image_path = series_dir / rel_path
+    if not image_path.is_file():
+        return None
+    return f"/workspace/{series_id}/{rel_path}?v={image_path.stat().st_mtime_ns}"
+
+
+def _series_branding_payload(series_id: str, series_dir: Path) -> dict[str, Any]:
+    """组装 GET /branding 的完整响应（配置 + 三个图片 URL + 可用字体）。"""
+    branding = load_series_config(series_dir).branding
+    payload: dict[str, Any] = {"series_id": series_id}
+    payload.update(branding.model_dump())
+    for slot, url_field in _BRANDING_URL_FIELDS.items():
+        rel_path = getattr(branding, _BRANDING_SLOT_FIELDS[slot])
+        payload[url_field] = _branding_image_url(series_id, series_dir, rel_path)
+    payload["font_options"] = [
+        {"name": name, "path": path}
+        for name, path in FONT_CANDIDATES
+        if Path(path).is_file()
+    ]
+    return payload
+
+
+def _persist_branding(series_dir: Path, branding: SeriesBrandingConfig) -> None:
+    """把 branding 配置安全合并写回 ``series_config.yaml``，保留其它顶层键。"""
+    series_dir.mkdir(parents=True, exist_ok=True)
+    path = series_dir / SERIES_CONFIG_FILENAME
+    data: dict[str, Any] = {}
+    if path.is_file():
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            data = loaded
+    data["branding"] = branding.model_dump()
+    path.write_text(
+        yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8"
+    )
+
+
+def _resolve_episode_dir(view: "WorkspaceView", episode_id: str) -> tuple[str, Path, int]:
+    """把 ``{series_id}_ep_{no:03d}`` 复合 ID 反解为（作品 ID、单话目录、话次）。"""
+    if "_ep_" not in episode_id:
+        raise HTTPException(status_code=404, detail=f"无法识别的单话 ID：{episode_id}")
+    series_id, suffix = episode_id.rsplit("_ep_", 1)
+    if not suffix.isdigit():
+        raise HTTPException(status_code=404, detail=f"无法识别的单话 ID：{episode_id}")
+    episode_no = int(suffix)
+    if series_id not in view.series_ids():
+        raise HTTPException(status_code=404, detail=f"作品不存在：{series_id}")
+    episode_dir = view.episode_dir(series_id, episode_no)
+    if not episode_dir.is_dir():
+        raise HTTPException(status_code=404, detail=f"单话目录不存在：{episode_id}")
+    return series_id, episode_dir, episode_no
+
+
 class _VisionPayload(BaseModel):
     """Stage 3 面板结果的最小读取模型。"""
 
@@ -1143,6 +1260,142 @@ def create_app(
             yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8"
         )
         return _series_tts_payload(app.state.config, view, series_id)
+
+    # ---- Patch v4.5：作品级封页写字 + 双结尾图片包 ----
+    @app.get("/api/series/{series_id}/branding")
+    async def get_series_branding(series_id: str) -> dict[str, Any]:
+        """读取作品片包配置 + 三张图片的静态 URL + 可用字体清单。"""
+        if series_id not in view.series_ids():
+            raise HTTPException(status_code=404, detail=f"作品不存在：{series_id}")
+        series_dir = view.registry.series_dir(series_id)
+        return _series_branding_payload(series_id, series_dir)
+
+    @app.put("/api/series/{series_id}/branding")
+    async def put_series_branding(
+        series_id: str, payload: BrandingUpdateRequest
+    ) -> dict[str, Any]:
+        """更新片包配置（不含图片上传）；``*_image`` 字段不受影响。"""
+        if series_id not in view.series_ids():
+            raise HTTPException(status_code=404, detail=f"作品不存在：{series_id}")
+        series_dir = view.registry.series_dir(series_id)
+        branding = load_series_config(series_dir).branding
+        updates = payload.model_dump(exclude_unset=True, exclude_none=True)
+        cover_text_patch = updates.pop("cover_text", None)
+        if cover_text_patch is not None:
+            try:
+                branding.cover_text = branding.cover_text.model_copy(
+                    update=cover_text_patch
+                )
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=400, detail=f"封页文字参数不合法：{exc.errors()}"
+                ) from exc
+        try:
+            branding = branding.model_copy(update=updates)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"片包配置不合法：{exc.errors()}"
+            ) from exc
+        _persist_branding(series_dir, branding)
+        return _series_branding_payload(series_id, series_dir)
+
+    @app.post("/api/series/{series_id}/branding/upload")
+    async def upload_series_branding_image(
+        series_id: str, payload: BrandingUploadRequest
+    ) -> dict[str, Any]:
+        """解码 Base64 图片，规范化为 PNG 存入 ``assets/branding/{slot}.png``。"""
+        if series_id not in view.series_ids():
+            raise HTTPException(status_code=404, detail=f"作品不存在：{series_id}")
+        if payload.slot not in BRANDING_SLOTS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"非法图片槽位：{payload.slot}（可选：{', '.join(BRANDING_SLOTS)}）",
+            )
+        try:
+            raw_bytes = decode_base64_image(payload.content_base64)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"图片解码失败：{exc}") from exc
+        series_dir = view.registry.series_dir(series_id)
+        branding_dir = series_dir / "assets" / "branding"
+        branding_dir.mkdir(parents=True, exist_ok=True)
+        out_path = branding_dir / f"{payload.slot}.png"
+        try:
+            save_branding_image(raw_bytes, out_path)
+        except Exception as exc:  # noqa: BLE001 - Pillow 打开失败等统一转 400
+            raise HTTPException(status_code=400, detail=f"图片无法识别：{exc}") from exc
+
+        branding = load_series_config(series_dir).branding
+        rel_path = f"assets/branding/{payload.slot}.png"
+        setattr(branding, _BRANDING_SLOT_FIELDS[payload.slot], rel_path)
+        _persist_branding(series_dir, branding)
+        return _series_branding_payload(series_id, series_dir)
+
+    @app.delete("/api/series/{series_id}/branding/{slot}")
+    async def delete_series_branding_image(series_id: str, slot: str) -> dict[str, Any]:
+        """删除槽位 PNG 并把配置中的对应字段置空。"""
+        if series_id not in view.series_ids():
+            raise HTTPException(status_code=404, detail=f"作品不存在：{series_id}")
+        if slot not in BRANDING_SLOTS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"非法图片槽位：{slot}（可选：{', '.join(BRANDING_SLOTS)}）",
+            )
+        series_dir = view.registry.series_dir(series_id)
+        image_path = series_dir / "assets" / "branding" / f"{slot}.png"
+        image_path.unlink(missing_ok=True)
+        branding = load_series_config(series_dir).branding
+        setattr(branding, _BRANDING_SLOT_FIELDS[slot], None)
+        _persist_branding(series_dir, branding)
+        return _series_branding_payload(series_id, series_dir)
+
+    @app.post("/api/series/{series_id}/branding/cover-preview")
+    async def preview_series_cover(
+        series_id: str, payload: CoverPreviewRequest
+    ) -> Response:
+        """用已上传封面底图 + Pillow 实时渲染一张含真实文字的 PNG。"""
+        if series_id not in view.series_ids():
+            raise HTTPException(status_code=404, detail=f"作品不存在：{series_id}")
+        series_dir = view.registry.series_dir(series_id)
+        branding = load_series_config(series_dir).branding
+        if not branding.cover_image:
+            raise HTTPException(status_code=404, detail="尚未上传通用封页底图")
+        cover_path = series_dir / branding.cover_image
+        if not cover_path.is_file():
+            raise HTTPException(status_code=404, detail="封页底图文件缺失，请重新上传")
+
+        cover_text = branding.cover_text
+        if payload.cover_text is not None:
+            try:
+                cover_text = cover_text.model_copy(update=payload.cover_text)
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=400, detail=f"封页文字参数不合法：{exc.errors()}"
+                ) from exc
+
+        with tempfile.NamedTemporaryFile(prefix="cover_preview_", suffix=".png", delete=False) as handle:
+            tmp_path = Path(handle.name)
+        try:
+            render_cover_image(
+                cover_path,
+                tmp_path,
+                episode_no=int(payload.episode_no or 1),
+                cover_text=cover_text,
+                override_text=payload.cover_text_override,
+                width=app.state.config.video.width,
+                height=app.state.config.video.height,
+            )
+            return Response(content=tmp_path.read_bytes(), media_type="image/png")
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    @app.put("/api/episodes/{episode_id}/render-options")
+    async def put_episode_render_options(
+        episode_id: str, options: EpisodeRenderOptions
+    ) -> dict[str, Any]:
+        """保存单话片包选项到 ``episodes/ep_XXX/render_options.json``。"""
+        _series_id, episode_dir, _episode_no = _resolve_episode_dir(view, episode_id)
+        save_episode_render_options(episode_dir, options)
+        return {"episode_id": episode_id, "render_options": options.model_dump()}
 
     @app.put("/api/series/{series_id}/memory")
     async def update_memory(series_id: str, payload: MemoryUpdateRequest) -> dict[str, Any]:

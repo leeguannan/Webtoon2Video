@@ -11,8 +11,15 @@ import {
   ArrowRight,
   AlertCircle,
 } from 'lucide-react';
-import type { EpisodeItem, RunMode, SeriesItem } from '../types/studio';
+import type {
+  EpisodeItem,
+  EpisodeRenderOptions,
+  OutroMode,
+  RunMode,
+  SeriesItem,
+} from '../types/studio';
 import { formatMs, parseEpisodeRangeExpression } from '../utils/pronunciation';
+import { SeriesBrandingPanel } from './SeriesBrandingPanel';
 import { SeriesTtsPanel } from './SeriesTtsPanel';
 
 interface CatalogViewProps {
@@ -26,7 +33,15 @@ interface CatalogViewProps {
   onOpenEpisode: (episodeId: string) => void;
   onExportEpisode: (episodeId: string, format: 'mp4' | 'ass' | 'script') => void;
   onExportSeriesZip: (seriesId: string) => void;
+  onUpdateEpisodeRenderOptions: (episodeId: string, options: EpisodeRenderOptions) => void;
 }
+
+const OUTRO_MODE_OPTIONS: Array<{ value: OutroMode; label: string }> = [
+  { value: 'inherit', label: '结尾：跟随默认' },
+  { value: 'continue', label: '结尾：待续' },
+  { value: 'final', label: '结尾：完结' },
+  { value: 'none', label: '结尾：不加' },
+];
 
 type StatusFilter = 'all' | 'done' | 'pending' | 'locked';
 
@@ -41,6 +56,7 @@ export const CatalogView: React.FC<CatalogViewProps> = ({
   onOpenEpisode,
   onExportEpisode,
   onExportSeriesZip,
+  onUpdateEpisodeRenderOptions,
 }) => {
   const [urlInput, setUrlInput] = useState(series.list_url);
   const [rangeInput, setRangeInput] = useState('1-3');
@@ -120,6 +136,9 @@ export const CatalogView: React.FC<CatalogViewProps> = ({
     <div className="space-y-6">
       {/* Patch v3.2 Patch 13：作品级配音设置（音色 / 语速 / 静态试听） */}
       <SeriesTtsPanel seriesId={series.series_id} />
+
+      {/* Patch v4.5：作品级封页写字与双结尾图片包 */}
+      <SeriesBrandingPanel seriesId={series.series_id} />
 
       {/* Stage 0 URL Capture Bar */}
       <section className="bg-white border border-slate-200 rounded-xl p-5">
@@ -306,7 +325,7 @@ export const CatalogView: React.FC<CatalogViewProps> = ({
                 <th className="py-3 px-3 w-36">当前进度</th>
                 <th className="py-3 px-3 w-36">状态</th>
                 <th className="py-3 px-3 w-28 text-right">成片时长</th>
-                <th className="py-3 pl-3 pr-5 w-32 text-right">操作</th>
+                <th className="py-3 pl-3 pr-5 w-64 text-right">操作</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 text-sm">
@@ -362,6 +381,30 @@ export const CatalogView: React.FC<CatalogViewProps> = ({
                     </td>
                     <td className="py-3 pl-3 pr-5 text-right">
                       <div className="inline-flex items-center justify-end gap-3">
+                        {/* Patch v4.5：单话结尾图模式，切换即自动保存，仅重跑 S7 生效 */}
+                        <select
+                          aria-label={`第 ${ep.episode_no} 话结尾图模式`}
+                          value={ep.render_options?.outro_mode ?? 'inherit'}
+                          disabled={ep.is_locked}
+                          onChange={(e) => {
+                            const current: EpisodeRenderOptions = ep.render_options ?? {
+                              cover_enabled: true,
+                              cover_text_override: null,
+                              outro_mode: 'inherit',
+                            };
+                            onUpdateEpisodeRenderOptions(ep.episode_id, {
+                              ...current,
+                              outro_mode: e.target.value as OutroMode,
+                            });
+                          }}
+                          className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 disabled:opacity-50 cursor-pointer whitespace-nowrap"
+                        >
+                          {OUTRO_MODE_OPTIONS.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
                         {isVideoReady && (
                           <button
                             type="button"

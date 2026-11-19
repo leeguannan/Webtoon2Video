@@ -231,6 +231,66 @@ class AppConfig(_StrictModel):
         return self.workspace_root() / series_id
 
 
+class CoverTextSpec(_StrictModel):
+    """封页话次文字规格（Patch v4.5：作品级通用封页自动写字）。
+
+    坐标采用相对 1080×1920 画布的归一化比例，``anchor="mm"`` 居中绘制，
+    因此换任意分辨率底图都能落在同一视觉位置。
+    """
+
+    #: 是否在封页自动写话次文字。
+    enabled: bool = True
+    #: 文字锚点 X 归一化坐标（0.05 ~ 0.95）。
+    x_ratio: float = Field(default=0.5, ge=0.05, le=0.95)
+    #: 文字锚点 Y 归一化坐标（0.05 ~ 0.95）。
+    y_ratio: float = Field(default=0.78, ge=0.05, le=0.95)
+    #: 字号（像素，按 1080×1920 画布标定）。
+    font_size: int = Field(default=72, ge=24, le=160)
+    #: 文字填充色（HEX，非法值由渲染层兜底为白色）。
+    color: str = "#FFFFFF"
+    #: 描边色（HEX，非法值由渲染层兜底为黑色）。
+    stroke_color: str = "#000000"
+    #: 描边宽度（0 = 不描边）。
+    stroke_width: int = Field(default=5, ge=0, le=16)
+    #: 字体名称，复用 ``core.subtitle_render`` 的字体解析与回退。
+    font_name: str = "Hiragino Sans GB"
+    #: 文案模板，占位符：``{ep}``（受中文数字开关影响）、``{ep_no}``（恒阿拉伯数字）。
+    template: str = "第{ep}话"
+    #: True 时 ``{ep}`` 渲染为中文数字（第一话），否则阿拉伯数字（第1话）。
+    use_chinese_numeral: bool = True
+
+
+class SeriesBrandingConfig(_StrictModel):
+    """作品级封页 / 双结尾图片包配置（Patch v4.5）。
+
+    三张图片路径都相对 ``series_dir``；时长单位均为毫秒。
+    旧版 ``series_config.yaml`` 不含本字段时，pydantic 自动填充整套默认值。
+    """
+
+    #: 通用封页底图（相对作品目录，如 ``assets/branding/cover.png``）。
+    cover_image: str | None = None
+    #: 「待续」结尾图。
+    outro_continue_image: str | None = None
+    #: 「完结」结尾图。
+    outro_final_image: str | None = None
+    #: 封页引导总时长（含淡入、停顿与叠化转场）。
+    cover_duration_ms: int = Field(default=2000, ge=500, le=8000)
+    #: 封页从黑场柔和淡入时长。
+    cover_fade_in_ms: int = Field(default=350, ge=0, le=2000)
+    #: 封页向正文第 1 帧叠化（``xfade=fade``）时长。
+    cover_fade_out_ms: int = Field(default=450, ge=0, le=2000)
+    #: 结尾图总停留时长（含浮现叠化与淡出）。
+    outro_duration_ms: int = Field(default=2500, ge=500, le=10000)
+    #: 结尾图在正文末帧之上缓缓叠化浮现时长。
+    outro_fade_in_ms: int = Field(default=700, ge=0, le=2500)
+    #: 结尾图与 BGM 同步淡出至黑场/静音时长。
+    outro_fade_out_ms: int = Field(default=600, ge=0, le=2500)
+    #: 作品默认结尾模式（单话可在 render_options 里覆盖）。
+    default_outro_mode: Literal["none", "continue", "final"] = "continue"
+    #: 封页话次文字规格。
+    cover_text: CoverTextSpec = Field(default_factory=CoverTextSpec)
+
+
 class SeriesConfig(_StrictModel):
     """作品级覆盖（``workspace/{series_id}/series_config.yaml``）。"""
 
@@ -243,6 +303,8 @@ class SeriesConfig(_StrictModel):
     #: Patch v3.2 Patch 13 B1：作品级配音设置（讲解者/通用男女声/角色专属）。
     #: ``None`` 表示作品没配置过 → 整体沿用全局模板 ``AppConfig.tts``。
     tts: SeriesTTSConfig | None = None
+    #: Patch v4.5：作品级通用封页写字 + 双结尾图 + 平滑转场片包。
+    branding: SeriesBrandingConfig = Field(default_factory=SeriesBrandingConfig)
 
 
 def _package_root() -> Path:
