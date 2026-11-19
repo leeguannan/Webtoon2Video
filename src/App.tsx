@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Bell,
+  BellOff,
   BookOpen,
   Brain,
   CheckCircle2,
@@ -9,6 +11,8 @@ import {
   Plus,
   Sliders,
   Video,
+  Volume2,
+  VolumeX,
   X,
 } from 'lucide-react';
 import type {
@@ -33,6 +37,17 @@ import { CatalogView } from './components/CatalogView';
 import { EpisodeStudioView } from './components/EpisodeStudioView';
 import { ConfigDictView } from './components/ConfigDictView';
 import { MemoryView } from './components/MemoryView';
+import {
+  getDesktopNotificationPermission,
+  loadRenderNotifyPrefs,
+  playRenderCompleteChime,
+  playRenderFailedTone,
+  primeNotificationAudio,
+  requestDesktopNotificationPermission,
+  saveRenderNotifyPrefs,
+  showDesktopNotification,
+  type RenderNotifyPrefs,
+} from './utils/notifications';
 
 type NavView = 'catalog' | 'studio' | 'memory' | 'config';
 
@@ -333,10 +348,29 @@ export default function App() {
   const [booted, setBooted] = useState(false);
   /** 后端不保存勾选态，这里单独维护。 */
   const [selectedMap, setSelectedMap] = useState<Record<string, boolean>>({});
+  /** Patch v4.10：成片完成的声音/桌面通知偏好（localStorage 持久化）。 */
+  const [notifyPrefs, setNotifyPrefs] = useState<RenderNotifyPrefs>(() => loadRenderNotifyPrefs());
+  /** Patch v4.10：当前浏览器的桌面通知权限。 */
+  const [desktopPermission, setDesktopPermission] = useState<NotificationPermission | 'unsupported'>(
+    () => getDesktopNotificationPermission()
+  );
 
   const timersRef = useRef<number[]>([]);
   const seriesRef = useRef<SeriesItem[]>([]);
   const pollTickRef = useRef(0);
+  /**
+   * Patch v4.10：通知偏好的实时快照。
+   * 状态跃迁检测的 effect 只依赖 [booted, seriesList]，
+   * 用 ref 读取最新偏好，避免用户开关提醒时把 effect 重新触发一遍。
+   */
+  const notifyPrefsRef = useRef<RenderNotifyPrefs>(notifyPrefs);
+  /** Patch v4.10：各话次 s7_renderer 的上一次状态，用于检测跃迁。 */
+  const prevS7StatusRef = useRef<Map<string, StageStatus>>(new Map());
+  /** Patch v4.10：是否已经建立过基线（首次建立基线时不发任何通知）。 */
+  const s7BaselineReadyRef = useRef(false);
+  /** Patch v4.10：标签页标题闪烁定时器与原始标题。 */
+  const titleFlashTimerRef = useRef<number | null>(null);
+  const originalTitleRef = useRef<string>('');
 
   useEffect(() => {
     seriesRef.current = seriesList;
@@ -553,6 +587,189 @@ export default function App() {
 
     return () => source.close();
   }, [activeEpisodeId, patchEpisode, refreshSeries]);
+
+  /* -------------------- Patch v4.10：成片完成提醒 -------------------- */
+
+  /** 通知偏好变更：state + ref + localStorage 三处同步。 */
+  const updateNotifyPrefs = useCallback((patch: Partial<RenderNotifyPrefs>) => {
+    const next = { ...notifyPrefsRef.current, ...patch };
+    notifyPrefsRef.current = next;
+    setNotifyPrefs(next);
+    saveRenderNotifyPrefs(next);
+  }, []);
+
+  /** 停止标签页标题闪烁并还原原标题。 */
+  const stopTitleFlash = useCallback(() => {
+    if (titleFlashTimerRef.current === null) return;
+    window.clearInterval(titleFlashTimerRef.current);
+    titleFlashTimerRef.current = null;
+    document.title = originalTitleRef.current;
+    originalTitleRef.current = '';
+  }, []);
+
+  /** 在标签页标题上轮播闪烁提示（页面在后台时用户看不见 toast）。 */
+  const startTitleFlash = useCallback(
+    (message: string) => {
+      stopTitleFlash();
+      originalTitleRef.current = document.title;
+      document.title = message;
+      let showMessage = false;
+      titleFlashTimerRef.current = window.setInterval(() => {
+        showMessage = !showMessage;
+        document.title = showMessage ? message : originalTitleRef.current;
+      }, 700);
+    },
+    [stopTitleFlash]
+  );
+
+  /* 偏好 state → ref 同步（切换开关时立即生效，且不触发状态跃迁 effect）。 */
+  useEffect(() => {
+    notifyPrefsRef.current = notifyPrefs;
+  }, [notifyPrefs]);
+
+  /* 首次交互解锁音频：浏览器要求音频必须在用户手势之后才能播放。 */
+  useEffect(() => {
+    const unlock = () => {
+      primeNotificationAudio();
+    };
+    window.addEventListener('pointerdown', unlock, { once: true, capture: true });
+    window.addEventListener('keydown', unlock, { once: true, capture: true });
+    return () => {
+      window.removeEventListener('pointerdown', unlock, true);
+      window.removeEventListener('keydown', unlock, true);
+    };
+  }, []);
+
+  /* 切回前台时停止标题闪烁；组件卸载时同样清理。 */
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        stopTitleFlash();
+        /* 用户可能在浏览器设置里改过通知权限，回到前台时同步一次。 */
+        setDesktopPermission(getDesktopNotificationPermission());
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      stopTitleFlash();
+    };
+  }, [stopTitleFlash]);
+
+  /* S7 状态跃迁检测：只认「本次会话里从非 done 变成 done」的跃迁。 */
+  useEffect(() => {
+    if (!booted) return;
+
+    const current = new Map<string, StageStatus>();
+    seriesList.forEach((series) => {
+      series.episodes.forEach((ep) => {
+        const stage = ep.stages.find((s) => s.id === 's7_renderer');
+        if (stage) current.set(ep.episode_id, stage.status);
+      });
+    });
+
+    /* 首次就绪：只建立基线，绝不对历史已完成的话次发通知。 */
+    if (!s7BaselineReadyRef.current) {
+      prevS7StatusRef.current = current;
+      s7BaselineReadyRef.current = true;
+      return;
+    }
+
+    const prefs = notifyPrefsRef.current;
+    seriesList.forEach((series) => {
+      series.episodes.forEach((ep) => {
+        const stage = ep.stages.find((s) => s.id === 's7_renderer');
+        if (!stage) return;
+        const prev = prevS7StatusRef.current.get(ep.episode_id);
+        const now = stage.status;
+
+        const finished = prev !== undefined && prev !== 'done' && now === 'done';
+        const failed = prev === 'running' && now === 'failed';
+        if (!finished && !failed) return;
+
+        if (prefs.soundEnabled) {
+          if (finished) playRenderCompleteChime();
+          else playRenderFailedTone();
+        }
+
+        const label = `${series.series_title} · ${ep.title}`;
+        if (finished) {
+          showToast(`成片已生成：${label}，可试看或导出`);
+        } else {
+          showToast(`成片合成失败：${label}，请到审核台查看日志`);
+        }
+
+        if (prefs.desktopEnabled && getDesktopNotificationPermission() === 'granted') {
+          showDesktopNotification({
+            title: finished ? '成片已生成' : '成片合成失败',
+            body: finished
+              ? `${label}，可试看或导出`
+              : `${label}，请到审核台查看日志`,
+            tag: `w2v-s7-${ep.episode_id}`,
+            onClick: () => {
+              setActiveSeriesId(series.series_id);
+              setActiveEpisodeId(ep.episode_id);
+              setNavView('studio');
+            },
+          });
+        }
+
+        if (document.hidden) {
+          startTitleFlash(
+            finished ? `【成片完成】${ep.title}` : `【合成失败】${ep.title}`
+          );
+        }
+      });
+    });
+
+    prevS7StatusRef.current = current;
+  }, [booted, seriesList, showToast, startTitleFlash]);
+
+  /** 声音提醒开关：打开时当场播一声确认音，让用户确认音量正常。 */
+  const handleToggleSound = useCallback(() => {
+    const nextOn = !notifyPrefsRef.current.soundEnabled;
+    updateNotifyPrefs({ soundEnabled: nextOn });
+    if (nextOn) {
+      primeNotificationAudio();
+      playRenderCompleteChime();
+      showToast('已开启成片完成提示音');
+    } else {
+      showToast('已关闭成片完成提示音');
+    }
+  }, [updateNotifyPrefs, showToast]);
+
+  /** 桌面通知开关：首次点击需要向浏览器申请权限。 */
+  const handleToggleDesktop = useCallback(async () => {
+    const permission = getDesktopNotificationPermission();
+    setDesktopPermission(permission);
+
+    if (permission === 'unsupported') {
+      showToast('当前浏览器不支持桌面通知，可改用提示音与页内提醒');
+      return;
+    }
+    if (permission === 'denied') {
+      showToast('浏览器已拒绝通知权限，请在地址栏站点设置中允许通知后重试');
+      return;
+    }
+    if (permission === 'default') {
+      const result = await requestDesktopNotificationPermission();
+      setDesktopPermission(result);
+      if (result === 'granted') {
+        updateNotifyPrefs({ desktopEnabled: true });
+        primeNotificationAudio();
+        playRenderCompleteChime();
+        showToast('桌面通知已开启，成片完成时会提醒你');
+      } else {
+        updateNotifyPrefs({ desktopEnabled: false });
+        showToast('未获得通知权限，成片完成时仍会用页内提示与提示音提醒');
+      }
+      return;
+    }
+    /* 已授权：在开/关之间切换。 */
+    const nextOn = !notifyPrefsRef.current.desktopEnabled;
+    updateNotifyPrefs({ desktopEnabled: nextOn });
+    showToast(nextOn ? '已开启桌面通知' : '已关闭桌面通知');
+  }, [updateNotifyPrefs, showToast]);
 
   /* -------------------- 操作回调 -------------------- */
 
@@ -1228,6 +1445,67 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-3 shrink-0">
+            {/* Patch v4.10：成片完成提醒开关（声音 + 桌面通知） */}
+            <div className="flex items-center gap-1 pr-3 border-r border-slate-200">
+              <button
+                type="button"
+                onClick={handleToggleSound}
+                title={
+                  notifyPrefs.soundEnabled
+                    ? '成片完成提示音：已开启（点击关闭）'
+                    : '成片完成提示音：已关闭（点击开启）'
+                }
+                aria-label={
+                  notifyPrefs.soundEnabled
+                    ? '关闭成片完成提示音'
+                    : '开启成片完成提示音'
+                }
+                aria-pressed={notifyPrefs.soundEnabled}
+                className={`inline-flex items-center justify-center w-8 h-8 rounded-lg border transition-colors cursor-pointer ${
+                  notifyPrefs.soundEnabled
+                    ? 'text-blue-600 bg-blue-50 border-blue-200 hover:bg-blue-100'
+                    : 'text-slate-400 bg-white border-slate-200 hover:bg-slate-100'
+                }`}
+              >
+                {notifyPrefs.soundEnabled ? (
+                  <Volume2 className="w-4 h-4" />
+                ) : (
+                  <VolumeX className="w-4 h-4" />
+                )}
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleToggleDesktop()}
+                title={
+                  desktopPermission === 'denied'
+                    ? '桌面通知：浏览器已拒绝授权，请在地址栏站点设置中允许'
+                    : desktopPermission === 'default'
+                    ? '桌面通知：未授权（点击授权）'
+                    : notifyPrefs.desktopEnabled
+                    ? '桌面通知：已开启（点击关闭）'
+                    : '桌面通知：已关闭（点击开启）'
+                }
+                aria-label={
+                  desktopPermission === 'denied'
+                    ? '桌面通知已被浏览器拒绝'
+                    : notifyPrefs.desktopEnabled
+                    ? '关闭成片完成桌面通知'
+                    : '开启成片完成桌面通知'
+                }
+                aria-pressed={notifyPrefs.desktopEnabled && desktopPermission === 'granted'}
+                className={`inline-flex items-center justify-center w-8 h-8 rounded-lg border transition-colors cursor-pointer ${
+                  notifyPrefs.desktopEnabled && desktopPermission === 'granted'
+                    ? 'text-blue-600 bg-blue-50 border-blue-200 hover:bg-blue-100'
+                    : 'text-slate-400 bg-white border-slate-200 hover:bg-slate-100'
+                }`}
+              >
+                {notifyPrefs.desktopEnabled && desktopPermission === 'granted' ? (
+                  <Bell className="w-4 h-4" />
+                ) : (
+                  <BellOff className="w-4 h-4" />
+                )}
+              </button>
+            </div>
             {navView === 'studio' ? (
               <>
                 {activeEpisode &&
