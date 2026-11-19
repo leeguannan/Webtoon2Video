@@ -2,14 +2,17 @@
 
 覆盖六组：
 1. 引号引导词的短停顿任何情况下都不被拉长；
-2. 多幕边界 / 全话收尾的跨幕留白 650ms；
-3. 转折关键词 / 悬念短尾句 / sfx_cue 的 700ms 留白与最小间隔约束；
+2. 多幕边界 / 全话收尾的跨幕留白 1150ms；
+3. 转折关键词 / 悬念短尾句 / sfx_cue 的 950ms 留白与最小间隔约束；
 4. 连续长句累计超 11s 后在自然句末插 480ms 换气口；
 5. write_episode_script 接入保护（<6 拍且非多幕不动显式停顿，>=6 拍才应用）；
 6. Web API：PUT script 同步 audio_manifest 并传导到 S6 时间轴；
    POST auto-pacing 同时落盘 script.json 与 audio_manifest.json。
 
 全部离线：纯函数 + respx mock LLM + TestClient，不触网、不消耗百炼额度。
+
+Patch v4.8：跨幕留白由 650ms 加宽到 1150ms、大转折由 700ms 加宽到 950ms
+（给下一幕 BGM 留出侧链压缩释放后的淡入铺底），换气口 480ms 保持不变。
 """
 
 from __future__ import annotations
@@ -111,6 +114,16 @@ def _two_scenes() -> list[StoryboardScene]:
 
 
 # --------------------------------------------------------------------------
+# 0. 留白档位常量（Patch v4.8 加宽后的口径）
+# --------------------------------------------------------------------------
+def test_pacing_constants_match_patch_v48_bands() -> None:
+    """跨幕 1150ms / 大转折 950ms / 换气 480ms：档位是成片节奏的硬契约。"""
+    assert PACE_SCENE_END_MS == 1150
+    assert PACE_TURN_MS == 950
+    assert PACE_BREATH_MS == 480
+
+
+# --------------------------------------------------------------------------
 # 1. 引号引导词保护
 # --------------------------------------------------------------------------
 def test_lead_in_pause_never_extended() -> None:
@@ -140,9 +153,9 @@ def test_lead_in_pause_never_extended() -> None:
 
 
 # --------------------------------------------------------------------------
-# 2. 跨幕留白 650ms
+# 2. 跨幕留白 1150ms
 # --------------------------------------------------------------------------
-def test_scene_boundary_pause_is_650() -> None:
+def test_scene_boundary_pause_uses_scene_end_ms() -> None:
     beats = [
         _beat(f"b{i}", f"短句{i}号。", panels=[f"p{i}"])
         for i in range(1, 7)
@@ -155,10 +168,10 @@ def test_scene_boundary_pause_is_650() -> None:
     assert report.scene_end_count == 2
     assert set(report.changed_beat_ids) == {"b3", "b6"}
 
-    # 只抬高不压低：原本更大的停顿保持原值。
-    beats[2]["pause_after_ms"] = 800
+    # 只抬高不压低：原本更大的停顿保持原值（1200 > 1150）。
+    beats[2]["pause_after_ms"] = 1200
     out2, report2 = apply_narrative_pacing(beats, scenes=_two_scenes())
-    assert out2[2]["pause_after_ms"] == 800
+    assert out2[2]["pause_after_ms"] == 1200
     assert "b3" not in report2.changed_beat_ids
 
 
@@ -175,9 +188,9 @@ def test_disabled_scene_is_ignored() -> None:
 
 
 # --------------------------------------------------------------------------
-# 3. 转折 / 悬念 / 音效留白 700ms 与最小间隔约束
+# 3. 转折 / 悬念 / 音效留白 950ms 与最小间隔约束
 # --------------------------------------------------------------------------
-def test_turn_signals_set_700() -> None:
+def test_turn_signals_use_turn_ms() -> None:
     # 关键词
     beats = _short_beats(6)
     beats[3] = _beat("b4", "然而真相远比想象可怕。")
@@ -513,7 +526,7 @@ async def test_run_stage4_six_beat_script_applies_pacing(tmp_path: Path) -> None
             series_title="节奏测试漫画",
         )
 
-    # 6 拍满足门槛：b4 含「然而/真相」转折关键词，停顿被抬到 700ms。
+    # 6 拍满足门槛：b4 含「然而/真相」转折关键词，停顿被抬到 950ms。
     assert len(script.beats) == 6
     by_id = {beat.beat_id: beat for beat in script.beats}
     assert by_id["b4"].pause_after_ms == PACE_TURN_MS

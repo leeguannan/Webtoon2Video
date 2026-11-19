@@ -47,7 +47,7 @@ interface EpisodeStudioViewProps {
   seriesId: string;
   config: StudioConfig;
   rules: PronunciationRule[];
-  onRerunFromStage: (episodeId: string, stageId: StageId) => void;
+  onRerunFromStage: (episodeId: string, stageId: StageId) => Promise<void> | void;
   /** 按步向后级联清理（Patch v4.1 Patch 21）：清空该步及下游旧产物与完成标记。 */
   onResetFromStage?: (
     episodeId: string,
@@ -189,6 +189,10 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
       setTableDirty(false);
       setSaveHint('');
       setAutoPacingSummary(result.summary);
+      // Patch v4.8：停顿被后端改写过 → 必须重建时间轴，跳过 S6 会吃到旧停顿。
+      if (result.summary.updated_count > 0) {
+        setNeedsTimelineRebuild(true);
+      }
     } catch (err) {
       setAutoPacingError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -362,6 +366,16 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   const [resetIncludeHuman, setResetIncludeHuman] = useState(false);
   const [resetBusy, setResetBusy] = useState(false);
 
+  // ---- Patch v4.8：重跑前草稿防残留保护 ----
+  /** 句间停顿被改动过：必须先重建时间轴（S6）再出片，跳过 S6 会吃到旧停顿。 */
+  const [needsTimelineRebuild, setNeedsTimelineRebuild] = useState(false);
+  /** 正在发起的重跑阶段（非空时禁用步骤条按钮，避免重复提交）。 */
+  const [rerunningStage, setRerunningStage] = useState<StageId | null>(null);
+  /** 待用户裁决的重跑（草稿改了送音内容，但用户想从 S6/S7 直接跑）。 */
+  const [pendingRerunChoice, setPendingRerunChoice] = useState<StageId | null>(null);
+  /** 重跑相关的内联说明（例如停顿已更新、自动升级到 S6）。 */
+  const [rerunNotice, setRerunNotice] = useState('');
+
   // 分镜大图弹窗 + 字幕原文保存（切换分镜 / 关闭弹窗时落盘，编辑过程中不写库）
   const [zoomBeatId, setZoomBeatId] = useState<string | null>(null);
   /** 当前弹窗打开的那一条解说（弹窗里的角色候选与配音预览都基于它）。 */
@@ -414,6 +428,13 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     setVideoTimeMs(0);
     setIsPlayingVideo(false);
   }, [episode.episode_id, episode.beats, episode.panels]);
+
+  // Patch v4.8：换话次时清掉「停顿已改 / 待裁决重跑」的跨话残留状态。
+  useEffect(() => {
+    setNeedsTimelineRebuild(false);
+    setPendingRerunChoice(null);
+    setRerunNotice('');
+  }, [episode.episode_id]);
 
   // Patch v3.4：拉作品级配音设置——审核台要显示「本句配音用哪个角色 / 哪个音色」，
   // 并允许就地改角色（改完保存并重跑 Stage 5 生效）。
@@ -783,6 +804,10 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     );
     draftBeatsRef.current = next;
     setDraftBeats(next);
+    // Patch v4.8：改了句间停顿就必须重建时间轴，否则从 S7 重跑会吃到旧停顿。
+    if (key === 'pause_after_ms') {
+      setNeedsTimelineRebuild(true);
+    }
     markTableDirty();
   };
 
@@ -1011,6 +1036,156 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     }
   };
 
+  /**
+   * Patch v4.8：草稿里是否改动了「必须重跑 Stage 5 才会生效」的字段。
+   *
+   * 对比本地草稿与后端已落盘的 `episode.beats`（停顿不在其中——停顿改完
+   * 只需重建时间轴，不必重跑配音）。改动送音文本 / 角色 / 情绪 / 音色 /
+   * 语速，或增删句子时，旧配音就是残留数据，必须提醒用户从 S5 重跑。
+   */
+  const hasVoiceRelevantDraftChanges = useCallback((): boolean => {
+    const draft = draftBeatsRef.current;
+    const saved = episode.beats ?? [];
+    if (draft.length !== saved.length) return true;
+    const savedMap = new Map(saved.map((beat) => [beat.beat_id, beat]));
+    const norm = (value: unknown): unknown =>
+      value === null || value === undefined ? '' : value;
+    for (const beat of draft) {
+      const other = savedMap.get(beat.beat_id);
+      if (!other) return true;
+      if (
+        (beat.narration_text ?? '') !== (other.narration_text ?? '') ||
+        (beat.tts_text ?? '') !== (other.tts_text ?? '') ||
+        (beat.speaker_role ?? '') !== (other.speaker_role ?? '') ||
+        (beat.emotion_instruction ?? '') !== (other.emotion_instruction ?? '') ||
+        norm(beat.voice_override) !== norm(other.voice_override) ||
+        norm(beat.speed_override) !== norm(other.speed_override)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }, [episode.beats]);
+
+  /**
+   * Patch v4.8：统一接管步骤条上的「从此步重跑」。
+   *
+   * 三道保护：
+   * 1. 有未保存草稿时，先校验并自动落盘（同步 audio_manifest），失败即中止；
+   * 2. 草稿改过送音内容却想从 S6/S7 跑 → 内联横幅让用户选「从 S5 重跑」还是「仍从当前阶段跑」；
+   * 3. 停顿被改过却想跳过 S6 → 自动把起点升级成 S6（0 TTS 成本），并说明原因。
+   */
+  const handleStageRerunClick = useCallback(
+    async (stageId: StageId) => {
+      if (rerunningStage) return;
+
+      // ① 草稿是否影响配音（必须在自动保存之前比较：保存后两边就一致了）。
+      const voiceChanged = hasVoiceRelevantDraftChanges();
+      const dirty = tableDirtyRef.current || pendingRef.current !== null;
+
+      // ② 目标阶段为 S5/S6/S7 且有未保存草稿 → 先自动落盘。
+      if (dirty && (stageId === 's5_tts' || stageId === 's6_timeline' || stageId === 's7_renderer')) {
+        const beats = draftBeatsRef.current;
+        const invalid = beats.find((b) => (b.narration_text ?? '').trim().length < 2);
+        if (invalid) {
+          setSaveHint(
+            `「${invalid.beat_id}」的字幕原文为空或不足 2 字，后端会拒收整批，请先补齐再重跑。`
+          );
+          return;
+        }
+        setSaveHint('');
+        setSavingBeats(true);
+        try {
+          const ok = await onUpdateBeats(episode.episode_id, beats, false);
+          if (ok === false) {
+            setSaveHint('保存失败：后端拒绝了这次保存，已中止重跑，草稿仍保留在本地。');
+            return;
+          }
+          tableDirtyRef.current = false;
+          tableDirtyEpisodeRef.current = '';
+          setTableDirty(false);
+          pendingRef.current = null;
+        } catch (err) {
+          setSaveHint(
+            `保存失败，已中止重跑：${err instanceof Error ? err.message : String(err)}`
+          );
+          return;
+        } finally {
+          setSavingBeats(false);
+        }
+      }
+
+      // ③ 停顿改过却要跳过 S6 → 自动升级起点，保证新停顿进入成片。
+      let targetStage = stageId;
+      if (stageId === 's7_renderer' && needsTimelineRebuild) {
+        targetStage = 's6_timeline';
+        setNeedsTimelineRebuild(false);
+        setRerunNotice('检测到句间停顿已更新，已自动先保存并从 Stage 6 开始重跑以确保停顿生效');
+      }
+
+      // ④ 草稿改了送音内容却要从 S6/S7 跑 → 内联横幅让用户决定。
+      if (voiceChanged && (targetStage === 's6_timeline' || targetStage === 's7_renderer')) {
+        setPendingRerunChoice(targetStage);
+        setRerunNotice('');
+        return;
+      }
+
+      setPendingRerunChoice(null);
+      setRerunningStage(targetStage);
+      try {
+        await onRerunFromStage(episode.episode_id, targetStage);
+        // 从 S6 或更早阶段重跑会连带重建时间轴，停顿标记可以清掉。
+        if (targetStage !== 's7_renderer') {
+          setNeedsTimelineRebuild(false);
+        }
+      } catch (err) {
+        setSaveHint(err instanceof Error ? err.message : '重跑失败，请稍后重试');
+      } finally {
+        setRerunningStage(null);
+      }
+    },
+    [
+      episode.episode_id,
+      hasVoiceRelevantDraftChanges,
+      needsTimelineRebuild,
+      onRerunFromStage,
+      onUpdateBeats,
+      rerunningStage,
+    ]
+  );
+
+  /** 横幅里的「仍从当前阶段重跑」：放弃重跑配音，继续用旧音频出片。 */
+  const handleRerunKeepStage = useCallback(async () => {
+    const stage = pendingRerunChoice;
+    if (!stage) return;
+    setPendingRerunChoice(null);
+    setRerunningStage(stage);
+    try {
+      await onRerunFromStage(episode.episode_id, stage);
+      if (stage !== 's7_renderer') {
+        setNeedsTimelineRebuild(false);
+      }
+    } catch (err) {
+      setSaveHint(err instanceof Error ? err.message : '重跑失败，请稍后重试');
+    } finally {
+      setRerunningStage(null);
+    }
+  }, [episode.episode_id, onRerunFromStage, pendingRerunChoice]);
+
+  /** 横幅里的「改为从 Stage 5 重跑配音（推荐）」：旧配音作废，重新合成。 */
+  const handleRerunFromStage5 = useCallback(async () => {
+    setPendingRerunChoice(null);
+    setRerunningStage('s5_tts');
+    try {
+      await onRerunFromStage(episode.episode_id, 's5_tts');
+      setNeedsTimelineRebuild(false);
+    } catch (err) {
+      setSaveHint(err instanceof Error ? err.message : '重跑失败，请稍后重试');
+    } finally {
+      setRerunningStage(null);
+    }
+  }, [episode.episode_id, onRerunFromStage]);
+
   // 有未落盘的改动时，刷新 / 关页面前提醒一次，避免草稿被静默丢掉。
   useEffect(() => {
     if (!tableDirty) return;
@@ -1166,10 +1341,11 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                 <div className="flex flex-col gap-1.5">
                   <button
                     type="button"
-                    onClick={() => onRerunFromStage(episode.episode_id, st.id)}
-                    className="w-full py-1 px-2 text-[11px] font-medium text-slate-700 bg-white border border-slate-200 rounded hover:border-blue-400 hover:text-blue-600 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    disabled={rerunningStage !== null}
+                    onClick={() => void handleStageRerunClick(st.id)}
+                    className="w-full py-1 px-2 text-[11px] font-medium text-slate-700 bg-white border border-slate-200 rounded hover:border-blue-400 hover:text-blue-600 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
                   >
-                    从此步重跑
+                    {rerunningStage === st.id ? '正在重跑…' : '从此步重跑'}
                   </button>
                   {st.id !== 's0_catalog' && (
                     <button
@@ -1252,6 +1428,50 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
           </div>
         )}
       </section>
+
+      {/* Patch v4.8：重跑前草稿防残留保护——保存失败即中止；送音内容改动需用户裁决；停顿改动自动升级起点。 */}
+      {pendingRerunChoice && (
+        <div className="mt-3 p-3.5 rounded-lg border border-amber-200 bg-amber-50/70 text-xs text-amber-900">
+          <div className="flex items-start gap-2">
+            <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600" />
+            <div className="flex-1 space-y-2">
+              <p className="font-medium">
+                检测到解说稿改动会影响配音（送音文本 / 角色 / 情绪 / 音色 / 语速 / 增删句）。
+              </p>
+              <p className="text-amber-800/90">
+                直接从{' '}
+                {pendingRerunChoice === 's7_renderer' ? 'Stage 7' : 'Stage 6'}{' '}
+                重跑会沿用旧配音，新改动不会出现在成片里。草稿已自动保存，请选择重跑起点：
+              </p>
+              <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                <button
+                  type="button"
+                  disabled={rerunningStage !== null}
+                  onClick={() => void handleRerunFromStage5()}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-blue-600 rounded hover:bg-blue-700 transition-colors cursor-pointer disabled:opacity-50"
+                >
+                  {rerunningStage === 's5_tts' && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                  改为从 Stage 5 重跑配音（推荐）
+                </button>
+                <button
+                  type="button"
+                  disabled={rerunningStage !== null}
+                  onClick={() => void handleRerunKeepStage()}
+                  className="px-3 py-1.5 text-xs font-medium text-slate-600 bg-white border border-slate-200 rounded hover:bg-slate-50 transition-colors cursor-pointer disabled:opacity-50"
+                >
+                  仍从当前阶段重跑
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+      {!pendingRerunChoice && rerunNotice && (
+        <div className="mt-3 flex items-start gap-2 px-3 py-2 text-xs text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg">
+          <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0" />
+          <span>{rerunNotice}</span>
+        </div>
+      )}
 
       {/* Patch v4.5：本话封页与结尾片包（仅重跑 S7 合成成片即可生效，无需重跑 S4~S6） */}
       <section className="bg-white border border-slate-200 rounded-xl px-5 py-4">
@@ -1464,14 +1684,30 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         {activeTab === 'script' && autoPacingSummary && (
           <div className="mt-2 flex items-start gap-2 px-3 py-2 text-xs text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg">
             <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0" />
-            <div className="space-y-0.5">
+            <div className="space-y-0.5 flex-1">
               {autoPacingSummary.updated_count > 0 ? (
-                <p>
-                  自动节奏留白完成：共调整 {autoPacingSummary.updated_count} 处停顿（跨幕{' '}
-                  {autoPacingSummary.scene_end_count} / 转折 {autoPacingSummary.turn_count} / 换气{' '}
-                  {autoPacingSummary.breath_count}），已同步 {autoPacingSummary.audio_manifest_synced}{' '}
-                  条音频清单。可直接从 S6 重跑，无需重跑 S5 配音。
-                </p>
+                <>
+                  <p>
+                    自动节奏留白完成：共调整 {autoPacingSummary.updated_count} 处停顿（跨幕{' '}
+                    {autoPacingSummary.scene_end_count} / 转折 {autoPacingSummary.turn_count} / 换气{' '}
+                    {autoPacingSummary.breath_count}），已同步 {autoPacingSummary.audio_manifest_synced}{' '}
+                    条音频清单。可直接从 S6 重跑，无需重跑 S5 配音。
+                  </p>
+                  {/* Patch v4.8：一键从 S6 重跑成片（只重建时间轴，0 TTS 费用），避免用户手点步骤条又吃到旧停顿。 */}
+                  <button
+                    type="button"
+                    disabled={rerunningStage !== null}
+                    onClick={() => void handleStageRerunClick('s6_timeline')}
+                    className="mt-1.5 inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-emerald-600 rounded hover:bg-emerald-700 transition-colors cursor-pointer disabled:opacity-50"
+                  >
+                    {rerunningStage === 's6_timeline' ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <Film className="w-3.5 h-3.5" />
+                    )}
+                    立即从 S6 重跑成片（0 TTS 费用）
+                  </button>
+                </>
               ) : (
                 <p>自动节奏留白检查完成：现有停顿已符合叙事节奏规则，未做调整。</p>
               )}
@@ -1996,7 +2232,11 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                                   updateBeatField(
                                     beat.beat_id,
                                     'pause_after_ms',
-                                    Number(e.target.value) || 0
+                                    // Patch v4.8：整数 + 0~2000ms 钳位，避免越界值让时间轴算崩。
+                                    Math.max(
+                                      0,
+                                      Math.min(2000, Math.round(Number(e.target.value) || 0))
+                                    )
                                   )
                                 }
                                 className="w-full px-2 py-1 text-[11px] font-mono-tabular bg-white border border-slate-200 rounded"

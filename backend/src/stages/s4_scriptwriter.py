@@ -606,10 +606,10 @@ ArcCompressor = Callable[[str], Awaitable[str]]
 # ---------------------------------------------------------------------------
 #: 引号引导句的停顿上限（<= 该值视为引导词，规则 0 保护，绝不拉长）。
 PACE_LEAD_IN_MAX_MS = 80
-#: 规则 A：跨幕结尾留白。
-PACE_SCENE_END_MS = 650
-#: 规则 B：转折 / 悬念揭示 / 高潮留白。
-PACE_TURN_MS = 700
+#: 规则 A：跨幕结尾留白（Patch v4.8 加宽：1150ms，给下一幕 BGM 留出淡入铺底）。
+PACE_SCENE_END_MS = 1150
+#: 规则 B：转折 / 悬念揭示 / 高潮留白（Patch v4.8 加宽：950ms）。
+PACE_TURN_MS = 950
 #: 规则 C：长连说换气口留白。
 PACE_BREATH_MS = 480
 #: 连续语音累计达到该时长即考虑插换气口。
@@ -624,7 +624,7 @@ PACE_LONG_PAUSE_MS = 450
 PACE_PAUSE_MIN_MS = 0
 PACE_PAUSE_MAX_MS = 2000
 
-#: 高置信度转折 / 揭示关键词（命中即候选 700ms 留白）。
+#: 高置信度转折 / 揭示关键词（命中即候选 950ms 留白）。
 PACE_TURN_KEYWORDS: tuple[str, ...] = (
     "其实", "竟然", "居然", "然而", "没想到", "却发现", "真相", "秘密",
     "另一面", "原来", "直到这时", "可就在这时", "谁也没想到", "不仅如此",
@@ -732,8 +732,8 @@ def apply_narrative_pacing(
 ) -> tuple[list[dict[str, Any]], PacingReport]:
     """对解说句的 ``pause_after_ms`` 做叙事节奏留白（纯函数，不改入参）。
 
-    规则优先级：规则 0（引号引导句保护）> 规则 A（跨幕结尾 650ms）>
-    规则 B（转折 / 悬念 / 高潮 700ms）> 规则 C（长连说换气 480ms）。
+    规则优先级：规则 0（引号引导句保护）> 规则 A（跨幕结尾 1150ms）>
+    规则 B（转折 / 悬念 / 高潮 950ms）> 规则 C（长连说换气 480ms）。
     每条 beat 最多命中一个规则；只抬高、不压低停顿，结果统一夹逼到
     ``[0, 2000]``。返回 ``(新 beat 列表, PacingReport)``，入参原对象与
     ``narration_text`` / ``tts_text`` / ``speaker_role`` /
@@ -790,7 +790,7 @@ def apply_narrative_pacing(
         new_pause = original
         rule_hit: str | None = None
 
-        # ---- 规则 A：跨幕结尾留白 650ms ----
+        # ---- 规则 A：跨幕结尾留白 1150ms ----
         crosses_scene = False
         if i + 1 < total:
             current_scene = scene_ordinals[i]
@@ -810,7 +810,7 @@ def apply_narrative_pacing(
                 new_pause = raised
                 rule_hit = "scene_end"
 
-        # ---- 规则 B：转折 / 悬念揭示 / 高潮留白 700ms ----
+        # ---- 规则 B：转折 / 悬念揭示 / 高潮留白 950ms ----
         if rule_hit is None and gap_ok:
             sfx_cue = str(beat.get("sfx_cue") or "")
             keyword_hit = any(

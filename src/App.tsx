@@ -682,7 +682,8 @@ export default function App() {
   const handleRerunFromStage = (episodeId: string, stageId: StageId) => {
     const idx = STAGE_ORDER.indexOf(stageId);
     const mode: RunMode = idx >= 5 ? 'full_video' : runMode;
-    void rerunEpisode(episodeId, stageId, mode);
+    // Patch v4.8：把 Promise 交回给审核台，便于它在重跑前先保存草稿 / 提示升级起点。
+    return rerunEpisode(episodeId, stageId, mode);
   };
 
   /** 按步向后级联清理：清空该步及下游的旧产物与完成标记，状态回到「待执行」。 */
