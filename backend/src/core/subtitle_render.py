@@ -46,6 +46,12 @@ DEFAULT_STROKE_WIDTH = 4
 #: 阴影偏移（像素）。
 DEFAULT_SHADOW_OFFSET = 3
 
+#: 避头尾禁则（kinsoku）：禁止出现在行首的字符——后置标点/闭引号/闭括号等。
+_NO_LINE_START_CHARS = frozenset("，。、；：？！…—·’”）】》」』.,;:!?)]}%")
+
+#: 避头尾禁则：禁止出现在行尾的字符——开引号/左括号等，必须随后续文字一起换行。
+_NO_LINE_END_CHARS = frozenset("“‘（【《「『([")
+
 
 def _iter_font_files() -> list[tuple[str, Path]]:
     """返回候选字体中**当前机器上真实存在**的 ``(名称, 路径)`` 列表。"""
@@ -115,6 +121,61 @@ def strip_render_unsafe_chars(text: str) -> str:
     return sanitize_narration_and_tts(text or "")
 
 
+def _is_legal_cut(current: str, cut: int) -> bool:
+    """切分下标是否满足避头尾：新行首字非后置标点，旧行末字非前置符号。"""
+    return (
+        1 <= cut < len(current)
+        and current[cut] not in _NO_LINE_START_CHARS
+        and current[cut - 1] not in _NO_LINE_END_CHARS
+    )
+
+
+def _find_kinsoku_cut(
+    current: str,
+    char: str,
+    idx: int,
+    paragraph: str,
+    font: ImageFont.FreeTypeFont,
+    max_width: float,
+    stroke_width: int,
+) -> int | None:
+    """避头尾禁则下的回退切分下标；无禁则冲突或找不到合法切分时返回 ``None``。
+
+    返回 ``None`` 时调用方按朴素位置安全折行（``current`` 整行落下、``char``
+    起新行），保证极窄宽度下也不会死循环或丢字。
+    """
+    # 普通字符在普通位置超宽：没有禁则冲突，维持朴素折行位置。
+    if char not in _NO_LINE_START_CHARS and current[-1] not in _NO_LINE_END_CHARS:
+        return None
+
+    tail_all_punct = idx == len(paragraph) - 1 or all(
+        rest in _NO_LINE_START_CHARS for rest in paragraph[idx + 1 :]
+    )
+
+    def fits(cut: int) -> bool:
+        return font.getlength(current[cut:] + char) + 2 * stroke_width <= max_width
+
+    # 句末标点且已到段落尾部：优先让新行至少带回 2 个非标点字符，
+    # 避免「单字+标点」孤尾（如「闪过。」被拆成「闪 / 过。」）。
+    if char in _NO_LINE_START_CHARS and tail_all_punct:
+        for cut in range(len(current) - 1, 1, -1):
+            if not _is_legal_cut(current, cut) or not fits(cut):
+                continue
+            moved = current[cut:]
+            normal_count = sum(
+                c not in _NO_LINE_START_CHARS and c not in _NO_LINE_END_CHARS
+                for c in moved
+            )
+            if normal_count >= 2:
+                return cut
+
+    # 常规避头/避尾：尽量少回退，取最大的合法切分（新行至少带 1 字）。
+    for cut in range(len(current) - 1, 0, -1):
+        if _is_legal_cut(current, cut):
+            return cut
+    return None
+
+
 def wrap_text(
     text: str,
     font: ImageFont.FreeTypeFont,
@@ -126,6 +187,11 @@ def wrap_text(
 
     为什么需要折行：竖屏 1080 宽的成片上，一句 30 字的解说按 64px 字号会顶满整行，
     烧录后几乎贴着左右边缘；折到 ``max_width`` 以内更符合竖屏排版习惯。
+
+    折行同时执行中文避头尾禁则（kinsoku）：后置标点（``，。：`` 等）不许落到
+    行首，前置符号（``“（《`` 等）不许留在行尾；句末长句在宽度允许时至少带
+    2 个非标点字符换行，避免「单字+标点」孤尾。禁则只调整切分位置、不改字面，
+    单段落始终满足 ``"".join(wrapped_lines) == paragraph``。
     """
     lines: list[str] = []
     for paragraph in _split_paragraphs(text):
@@ -133,14 +199,22 @@ def wrap_text(
             lines.append("")
             continue
         current = ""
-        for char in paragraph:
-            trial = current + char
-            width = font.getlength(trial) + 2 * stroke_width
-            if current and width > max_width:
-                lines.append(current)
-                current = char
+        for idx, char in enumerate(paragraph):
+            if current and (
+                font.getlength(current + char) + 2 * stroke_width > max_width
+            ):
+                cut = _find_kinsoku_cut(
+                    current, char, idx, paragraph, font, max_width, stroke_width
+                )
+                if cut is None:
+                    # 安全兜底：窄宽度/行首连续禁则字符时按原位置折行。
+                    lines.append(current)
+                    current = char
+                else:
+                    lines.append(current[:cut])
+                    current = current[cut:] + char
             else:
-                current = trial
+                current += char
         lines.append(current)
     return lines or [""]
 
