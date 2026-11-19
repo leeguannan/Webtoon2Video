@@ -80,7 +80,7 @@ class StubLLM:
                 "panels": [
                     {
                         "panel_id": panel_id,
-                        "scene_summary": f"少年站在高处俯瞰城市，画面偏冷。",
+                        "scene_summary": "少年站在高处俯瞰城市，画面偏冷。",
                         "dialogues": [
                             {"speaker_guess": "主角", "text": "我们必须往上爬。", "emotion": "tense"}
                         ],
