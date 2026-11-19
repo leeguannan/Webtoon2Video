@@ -1690,8 +1690,10 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                   <p>
                     自动节奏留白完成：共调整 {autoPacingSummary.updated_count} 处停顿（跨幕{' '}
                     {autoPacingSummary.scene_end_count} / 转折 {autoPacingSummary.turn_count} / 换气{' '}
-                    {autoPacingSummary.breath_count}），已同步 {autoPacingSummary.audio_manifest_synced}{' '}
-                    条音频清单。可直接从 S6 重跑，无需重跑 S5 配音。
+                    {autoPacingSummary.breath_count} / 切分镜{' '}
+                    {autoPacingSummary.panel_switch_count ?? 0}），已同步{' '}
+                    {autoPacingSummary.audio_manifest_synced} 条音频清单。可直接从 S6 重跑，无需重跑 S5
+                    配音。
                   </p>
                   {/* Patch v4.8：一键从 S6 重跑成片（只重建时间轴，0 TTS 费用），避免用户手点步骤条又吃到旧停顿。 */}
                   <button

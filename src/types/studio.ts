@@ -379,6 +379,8 @@ export interface AutoPacingSummary {
   scene_end_count: number;
   turn_count: number;
   breath_count: number;
+  /** Patch v4.9：跨分镜切换底线留白命中次数。 */
+  panel_switch_count?: number;
   changed_beat_ids: string[];
   /** 同步进 05_audio/audio_manifest.json 的条目数。 */
   audio_manifest_synced: number;

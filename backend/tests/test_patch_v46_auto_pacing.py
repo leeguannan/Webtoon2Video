@@ -43,7 +43,10 @@ from providers.llm_bailian import BailianClient
 from stages import s4_scriptwriter, s6_timeline
 from stages.s4_scriptwriter import (
     PACE_BREATH_MS,
+    PACE_EXISTING_LONG_MS,
     PACE_LEAD_IN_MAX_MS,
+    PACE_LONG_PAUSE_MS,
+    PACE_PANEL_SWITCH_MS,
     PACE_SCENE_END_MS,
     PACE_TURN_MS,
     PacingReport,
@@ -114,13 +117,17 @@ def _two_scenes() -> list[StoryboardScene]:
 
 
 # --------------------------------------------------------------------------
-# 0. 留白档位常量（Patch v4.8 加宽后的口径）
+# 0. 留白档位常量（Patch v4.8 加宽 / Patch v4.9 新增规则 D 后的口径）
 # --------------------------------------------------------------------------
 def test_pacing_constants_match_patch_v48_bands() -> None:
-    """跨幕 1150ms / 大转折 950ms / 换气 480ms：档位是成片节奏的硬契约。"""
+    """跨幕 1150ms / 大转折 950ms / 换气 480ms / 切分镜 400ms：档位是成片节奏的硬契约。"""
     assert PACE_SCENE_END_MS == 1150
     assert PACE_TURN_MS == 950
     assert PACE_BREATH_MS == 480
+    # Patch v4.9：规则 D 底线刻意低于既有换气口 / 长停顿阈值。
+    assert PACE_PANEL_SWITCH_MS == 400
+    assert PACE_PANEL_SWITCH_MS < PACE_EXISTING_LONG_MS
+    assert PACE_PANEL_SWITCH_MS < PACE_LONG_PAUSE_MS
 
 
 # --------------------------------------------------------------------------
@@ -166,13 +173,33 @@ def test_scene_boundary_pause_uses_scene_end_ms() -> None:
     assert out[2]["pause_after_ms"] == PACE_SCENE_END_MS
     assert out[5]["pause_after_ms"] == PACE_SCENE_END_MS
     assert report.scene_end_count == 2
-    assert set(report.changed_beat_ids) == {"b3", "b6"}
+    # Patch v4.9：b1/b2/b4/b5 虽然同在各自幕内，但每条都换了一张分镜图
+    # （p1→p2→p3 / p4→p5→p6），因此命中规则 D 底线留白 400ms。
+    assert out[0]["pause_after_ms"] == PACE_PANEL_SWITCH_MS
+    assert out[1]["pause_after_ms"] == PACE_PANEL_SWITCH_MS
+    assert out[3]["pause_after_ms"] == PACE_PANEL_SWITCH_MS
+    assert out[4]["pause_after_ms"] == PACE_PANEL_SWITCH_MS
+    assert report.panel_switch_count == 4
+    assert set(report.changed_beat_ids) == {"b1", "b2", "b3", "b4", "b5", "b6"}
 
     # 只抬高不压低：原本更大的停顿保持原值（1200 > 1150）。
     beats[2]["pause_after_ms"] = 1200
     out2, report2 = apply_narrative_pacing(beats, scenes=_two_scenes())
     assert out2[2]["pause_after_ms"] == 1200
     assert "b3" not in report2.changed_beat_ids
+
+    # 关掉规则 D（panel_switch_ms=0）：只剩跨幕 / 收尾两条留白。
+    clean = [
+        _beat(f"b{i}", f"短句{i}号。", panels=[f"p{i}"])
+        for i in range(1, 7)
+    ]
+    out3, report3 = apply_narrative_pacing(
+        clean, scenes=_two_scenes(), panel_switch_ms=0
+    )
+    assert set(report3.changed_beat_ids) == {"b3", "b6"}
+    assert report3.panel_switch_count == 0
+    assert out3[0]["pause_after_ms"] == 150
+    assert out3[1]["pause_after_ms"] == 150
 
 
 def test_disabled_scene_is_ignored() -> None:
@@ -185,6 +212,8 @@ def test_disabled_scene_is_ignored() -> None:
     _, report = apply_narrative_pacing(beats, scenes=scenes)
     # 只剩一个启用幕：无跨幕边界，末条也不满足「启用幕>=2」。
     assert report.scene_end_count == 0
+    # Patch v4.9：规则 D 与幕无关，仍按分镜图切换生效（b1~b5 换图，b6 是末条）。
+    assert report.panel_switch_count == 5
 
 
 # --------------------------------------------------------------------------
@@ -256,6 +285,88 @@ def test_long_streak_inserts_breath_pause() -> None:
     assert report2.breath_count == 1
     assert report2.changed_beat_ids == ["b2"]
     assert out2[1]["pause_after_ms"] == PACE_BREATH_MS
+
+
+# --------------------------------------------------------------------------
+# 4.5 规则 D：跨分镜切换底线留白 400ms（Patch v4.9）
+# --------------------------------------------------------------------------
+def test_panel_switch_raises_only_when_picture_changes() -> None:
+    # 同一张分镜图内连续拆句 → 保持 150ms；切到下一张新分镜图 → 抬到 400ms。
+    beats = [
+        _beat("b1", "第一句。", panels=["p1"]),
+        _beat("b2", "第二句。", panels=["p1"]),
+        _beat("b3", "第三句。", panels=["p2"]),
+    ]
+    out, report = apply_narrative_pacing(beats)
+    assert out[0]["pause_after_ms"] == 150
+    assert out[1]["pause_after_ms"] == PACE_PANEL_SWITCH_MS
+    assert out[2]["pause_after_ms"] == 150
+    assert report.panel_switch_count == 1
+    assert report.changed_beat_ids == ["b2"]
+
+    # 一条 beat 绑定多张分镜时，取「最后一张」与下一条「第一张」比较：
+    # b1 结束在 p2、b2 从 p2 起 → 同图不触发；b2 结束在 p2、b3 从 p3 起 → 触发。
+    multi = [
+        _beat("b1", "第一句。", panels=["p1", "p2"]),
+        _beat("b2", "第二句。", panels=["p2"]),
+        _beat("b3", "第三句。", panels=["p3"]),
+    ]
+    out2, report2 = apply_narrative_pacing(multi)
+    assert out2[0]["pause_after_ms"] == 150
+    assert out2[1]["pause_after_ms"] == PACE_PANEL_SWITCH_MS
+    assert report2.panel_switch_count == 1
+
+
+def test_panel_switch_never_touches_lead_in_pause() -> None:
+    # 引号引导句即使跨分镜图，也必须保持 60ms（规则 0 优先）。
+    beats = [
+        _beat("b1", "他轻声说道：", pause=60, panels=["p1"]),
+        _beat("b2", "“别动。”", pause=150, role="ethan", panels=["p2"]),
+    ]
+    out, report = apply_narrative_pacing(beats)
+    assert out[0]["pause_after_ms"] == 60
+    assert "b1" not in report.changed_beat_ids
+    assert report.panel_switch_count == 0
+
+
+def test_panel_switch_does_not_reset_streak_or_block_next_rules() -> None:
+    long_text = "这是一句足够长的叙述句子用来累积连续语音时长直到超过十一秒的阈值。"
+
+    # ① 规则 D 不重置连说累计：b1 切分镜抬到 400ms 后，b2 仍能累计破 11s 触发换气口。
+    beats = [
+        _beat("b1", long_text, panels=["p1"]),
+        _beat("b2", long_text, panels=["p2"]),
+        _beat("b3", long_text, panels=["p2"]),
+    ]
+    out, report = apply_narrative_pacing(beats)
+    assert out[0]["pause_after_ms"] == PACE_PANEL_SWITCH_MS
+    assert out[1]["pause_after_ms"] == PACE_BREATH_MS
+    assert report.panel_switch_count == 1
+    assert report.breath_count == 1
+
+    # ② 规则 D 不更新长停顿间隔基准：紧邻的转折仍能命中 950ms。
+    turns = [
+        _beat("b1", "普通的一句叙述。", panels=["p1"]),
+        _beat("b2", "然而真相远比想象可怕。", panels=["p2"]),
+        _beat("b3", "继续往下说。", panels=["p2"]),
+    ]
+    out2, report2 = apply_narrative_pacing(turns)
+    assert out2[0]["pause_after_ms"] == PACE_PANEL_SWITCH_MS
+    assert out2[1]["pause_after_ms"] == PACE_TURN_MS
+    assert report2.turn_count == 1
+    assert report2.panel_switch_count == 1
+
+
+def test_panel_switch_never_lowers_existing_pause() -> None:
+    # 已有 500ms 的停顿保持原值，不被规则 D 压到 400ms。
+    beats = [
+        _beat("b1", "第一句。", pause=500, panels=["p1"]),
+        _beat("b2", "第二句。", panels=["p2"]),
+    ]
+    out, report = apply_narrative_pacing(beats)
+    assert out[0]["pause_after_ms"] == 500
+    assert "b1" not in report.changed_beat_ids
+    assert report.panel_switch_count == 0
 
 
 def test_pacing_is_pure_and_keeps_other_fields() -> None:
@@ -530,8 +641,11 @@ async def test_run_stage4_six_beat_script_applies_pacing(tmp_path: Path) -> None
     assert len(script.beats) == 6
     by_id = {beat.beat_id: beat for beat in script.beats}
     assert by_id["b4"].pause_after_ms == PACE_TURN_MS
-    # 其它拍保持模型原值 200（短句不触发送气、无幕不触发跨幕）。
-    assert by_id["b1"].pause_after_ms == 200
+    # Patch v4.9：b1 的画面从 panel_001 切到 panel_002 → 规则 D 底线留白 400ms。
+    assert by_id["b1"].pause_after_ms == PACE_PANEL_SWITCH_MS
+    # 其余拍保持模型原值 200（未换图、短句不触发送气、无幕不触发跨幕）。
+    for beat_id in ("b2", "b3", "b5", "b6"):
+        assert by_id[beat_id].pause_after_ms == 200
 
 
 # --------------------------------------------------------------------------
@@ -666,6 +780,7 @@ def test_auto_pacing_endpoint_writes_script_and_manifest(
         "scene_end_count",
         "turn_count",
         "breath_count",
+        "panel_switch_count",
         "changed_beat_ids",
         "audio_manifest_synced",
     }
@@ -673,6 +788,8 @@ def test_auto_pacing_endpoint_writes_script_and_manifest(
     assert "b4" in summary["changed_beat_ids"]
     assert summary["updated_count"] == len(summary["changed_beat_ids"])
     assert summary["audio_manifest_synced"] >= 1
+    # Patch v4.9：切分镜计数随接口一并回显。
+    assert summary["panel_switch_count"] >= 0
 
     # script.json 与 audio_manifest.json 同时落盘且停顿一致。
     script = load_model(NarrationScript, episode_dir / "04_script" / "script.json")

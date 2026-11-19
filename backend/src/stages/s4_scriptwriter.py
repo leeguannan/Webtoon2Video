@@ -612,6 +612,10 @@ PACE_SCENE_END_MS = 1150
 PACE_TURN_MS = 950
 #: 规则 C：长连说换气口留白。
 PACE_BREATH_MS = 480
+#: 规则 D：跨分镜切换底线留白（Patch v4.9：400ms）。
+#: 画面切到新分镜图时给一句缓冲，但刻意低于 ``PACE_EXISTING_LONG_MS``（420）
+#: 与 ``PACE_LONG_PAUSE_MS``（450），因此不会把这次切换误判成换气口 / 长停顿。
+PACE_PANEL_SWITCH_MS = 400
 #: 连续语音累计达到该时长即考虑插换气口。
 PACE_STREAK_TRIGGER_MS = 11000
 #: 两次长停顿之间至少隔开的 beat 数，避免连续重停顿打断节奏。
@@ -648,6 +652,8 @@ class PacingReport:
     scene_end_count: int = 0
     turn_count: int = 0
     breath_count: int = 0
+    #: Patch v4.9：规则 D（跨分镜切换底线留白）命中次数。
+    panel_switch_count: int = 0
     changed_beat_ids: list[str] = field(default_factory=list)
 
 
@@ -722,6 +728,24 @@ def _beat_scene_ordinal(
     return None
 
 
+def _beat_last_panel_id(beat: dict[str, Any]) -> str | None:
+    """该 beat 最后一个非空分镜 id（画面停留到的分镜图）。"""
+    for panel_id in reversed(list(beat.get("target_panel_ids") or [])):
+        text = str(panel_id or "").strip()
+        if text:
+            return text
+    return None
+
+
+def _beat_first_panel_id(beat: dict[str, Any]) -> str | None:
+    """该 beat 第一个非空分镜 id（画面切入的分镜图）。"""
+    for panel_id in beat.get("target_panel_ids") or []:
+        text = str(panel_id or "").strip()
+        if text:
+            return text
+    return None
+
+
 def apply_narrative_pacing(
     beats: Sequence[dict[str, Any]],
     *,
@@ -729,15 +753,20 @@ def apply_narrative_pacing(
     audio_durations_ms: Mapping[str, int] | None = None,
     min_long_gap_beats: int = PACE_MIN_BEAT_GAP,
     streak_trigger_ms: int = PACE_STREAK_TRIGGER_MS,
+    panel_switch_ms: int = PACE_PANEL_SWITCH_MS,
 ) -> tuple[list[dict[str, Any]], PacingReport]:
     """对解说句的 ``pause_after_ms`` 做叙事节奏留白（纯函数，不改入参）。
 
     规则优先级：规则 0（引号引导句保护）> 规则 A（跨幕结尾 1150ms）>
-    规则 B（转折 / 悬念 / 高潮 950ms）> 规则 C（长连说换气 480ms）。
+    规则 B（转折 / 悬念 / 高潮 950ms）> 规则 C（长连说换气 480ms）>
+    规则 D（跨分镜切换底线 400ms，Patch v4.9）。
     每条 beat 最多命中一个规则；只抬高、不压低停顿，结果统一夹逼到
     ``[0, 2000]``。返回 ``(新 beat 列表, PacingReport)``，入参原对象与
     ``narration_text`` / ``tts_text`` / ``speaker_role`` /
     ``target_panel_ids`` / ``beat_id`` 顺序均不被修改。
+
+    规则 D 命中时**不**重置连说累计（``streak_ms``）也不更新长停顿间隔基准
+    （``last_long_idx``），因此它不会连带影响后续规则 B / C 的触发。
     """
     paced = [dict(beat) for beat in beats]
     report = PacingReport()
@@ -855,19 +884,43 @@ def apply_narrative_pacing(
                     new_pause = raised
                     rule_hit = "breath"
 
+        # ---- 规则 D：跨分镜切换底线留白 400ms（Patch v4.9）----
+        # 画面从当前 beat 的最后一张分镜图切到下一条 beat 的第一张分镜图时，
+        # 给一句缓冲；刻意低于 420/450，不参与换气口与长停顿的判定。
+        if rule_hit is None and panel_switch_ms > 0 and i + 1 < total:
+            current_panel = _beat_last_panel_id(beat)
+            next_panel = _beat_first_panel_id(next_beat) if next_beat else None
+            if (
+                current_panel is not None
+                and next_panel is not None
+                and current_panel != next_panel
+            ):
+                raised = max(original, panel_switch_ms)
+                if raised > original:
+                    new_pause = raised
+                    rule_hit = "panel_switch"
+
         if rule_hit is not None:
             beat["pause_after_ms"] = max(
                 PACE_PAUSE_MIN_MS, min(PACE_PAUSE_MAX_MS, new_pause)
             )
             report.changed_beat_ids.append(beat_id)
-            streak_ms = 0
-            last_long_idx = i
             if rule_hit == "scene_end":
                 report.scene_end_count += 1
+                streak_ms = 0
+                last_long_idx = i
             elif rule_hit == "turn":
                 report.turn_count += 1
-            else:
+                streak_ms = 0
+                last_long_idx = i
+            elif rule_hit == "breath":
                 report.breath_count += 1
+                streak_ms = 0
+                last_long_idx = i
+            else:
+                # 规则 D：只抬高停顿，不重置连说累计与长停顿间隔基准，
+                # 避免 400ms 切分镜被误当成换气口从而抑制后续规则 B / C。
+                report.panel_switch_count += 1
 
     # 统一夹逼（含未被规则触达的 beat，防御非法历史值），不改任何其它字段。
     for beat in paced:
@@ -2829,7 +2882,8 @@ async def write_episode_script(
                 f"共调整 {pacing_report.updated_count} 处停顿"
                 f"（跨幕 {pacing_report.scene_end_count} / "
                 f"转折 {pacing_report.turn_count} / "
-                f"换气 {pacing_report.breath_count}），"
+                f"换气 {pacing_report.breath_count} / "
+                f"切分镜 {pacing_report.panel_switch_count}），"
                 f"beat={pacing_report.changed_beat_ids}",
                 file=sys.stderr,
             )

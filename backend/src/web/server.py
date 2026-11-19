@@ -1737,6 +1737,7 @@ def create_app(
                 "scene_end_count": report.scene_end_count,
                 "turn_count": report.turn_count,
                 "breath_count": report.breath_count,
+                "panel_switch_count": report.panel_switch_count,
                 "changed_beat_ids": report.changed_beat_ids,
                 "audio_manifest_synced": synced,
             },
