@@ -104,8 +104,9 @@ def normalize_minimax_pause_tags(text: str) -> str:
     2. **钳位**：合并后或单个标签的秒数钳到 ``[0.01, 99.99]``；
     3. **贴首 / 贴尾剔除**：整句最开头或最末尾的孤立停顿标签直接删掉
        （停顿只能放在句中两段可发音文字之间）；
-    4. **清理越界写法**：形如停顿标签但不合规的写法（``<#1.234#>`` / ``<#abc#>``）
-       一律删除，避免模型端解析报错。
+    4. **清理越界写法**：形如停顿标签但不合规的写法（``<#abc#>``）一律删除，
+       避免模型端解析报错；数字型但小数位超限的写法（``<#1.234#>``）四舍五入
+       到两位小数后保留（``<#1.23#>``）。
 
     参数
     ----
@@ -120,15 +121,16 @@ def normalize_minimax_pause_tags(text: str) -> str:
     if not text or "<#" not in text:
         return text
 
-    # 1) 先清理不合规的停顿写法（保持其余文本不动）：不合规写法会让模型端解析报错。
-    #    数字型但小数位超限的四舍五入保留（<#1.234#> → <#1.23#>），
-    #    完全不是数字的写法直接删除（<#abc#>）。
+    # 1) 先规范化不合规的停顿写法（保持其余文本不动）：不合规写法会让模型端解析报错。
+    #    顺序要紧：先把「数字型但小数位超限」的写法四舍五入到两位小数保留
+    #    （<#1.234#> → <#1.23#>），再把剩余的形似标签但不合规的写法删除
+    #    （<#abc#>）。若顺序颠倒，<#1.234#> 会在四舍五入之前就被整段删掉。
+    merged = _LOOSE_NUMERIC_PAUSE_TAG_PATTERN.sub(
+        lambda m: _format_pause_tag(round(float(m.group(1)), 2)), text
+    )
     merged = _LOOSE_PAUSE_TAG_PATTERN.sub(
         lambda m: m.group(0) if MINIMAX_PAUSE_TAG_PATTERN.fullmatch(m.group(0)) else "",
-        text,
-    )
-    merged = _LOOSE_NUMERIC_PAUSE_TAG_PATTERN.sub(
-        lambda m: _format_pause_tag(round(float(m.group(1)), 2)), merged
+        merged,
     )
 
     # 2) 合并相邻 / 仅隔空白的多个停顿标签（秒数相加）。

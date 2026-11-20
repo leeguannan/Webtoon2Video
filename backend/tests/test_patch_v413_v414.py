@@ -418,6 +418,8 @@ def test_normalize_pause_tags_fixes_out_of_range() -> None:
     assert normalize_minimax_pause_tags("<#abc#>你好") == "你好"
     assert normalize_minimax_pause_tags("你好<#0#>世界") == "你好<#0.01#>世界"
     assert normalize_minimax_pause_tags("你好<#120#>世界") == "你好<#99.99#>世界"
+    # 小数位超限的写法先四舍五入再保留（顺序颠倒就会被整段删掉）。
+    assert normalize_minimax_pause_tags("你好<#1.234#>世界") == "你好<#1.23#>世界"
 
 
 def test_strip_minimax_tts_tags_removes_all() -> None:

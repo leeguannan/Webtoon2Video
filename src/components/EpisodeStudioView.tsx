@@ -169,6 +169,29 @@ const hasDraftChanges = (
   return false;
 };
 
+/**
+ * Patch v4.14：句中可插停顿标签的标点（取第一个「前后都有文字」的标点）。
+ *
+ * 停顿标签必须夹在两段可发音文字之间，所以只能落在句中标点之后；
+ * 句首 / 句尾的标点不算（前面或后面没有文字）。
+ */
+const PAUSE_INSERT_MARKS = ['，', '、', '；', '……', '——'] as const;
+
+const findSentenceMark = (
+  text: string
+): { index: number; text: string } | null => {
+  let best: { index: number; text: string } | null = null;
+  for (const mark of PAUSE_INSERT_MARKS) {
+    const index = text.indexOf(mark);
+    if (index < 0) continue;
+    if (!best || index < best.index) best = { index, text: mark };
+  }
+  if (!best) return null;
+  if (best.index <= 0) return null;
+  if (best.index + best.text.length >= text.length) return null;
+  return best;
+};
+
 const MOTION_LABELS: Record<CameraMotion, string> = {
   zoom_in: 'ZOOM_IN 缓推',
   zoom_out: 'ZOOM_OUT 缓拉',
@@ -390,6 +413,8 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   );
   const [showFocusOverlay, setShowFocusOverlay] = useState(true);
   const [draftBeats, setDraftBeats] = useState<ScriptBeat[]>(episode.beats);
+  /** Patch v4.13：本话的镜头组（幕），供「归属幕」下拉选择。 */
+  const storyboardScenes = sceneStoryboard?.scenes ?? [];
   /** Patch v4.7：解说句按 storyboard 启用幕归组，未命中分镜进末尾兜底组。 */
   const beatSceneGroups = useMemo(() => {
     const scenes = (sceneStoryboard?.scenes ?? []).filter(
@@ -924,8 +949,11 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
    * Patch v4.14：把选中的语气词 / 停顿标签写进这句的送音文本。
    *
    * 规则（与后端 tts_tags.py 对齐）：
-   * - 送音文本为空 → 用字幕原文铺底；语气词插句首（`{tag} {narration_text}`），
-   *   停顿标签没有「两段文字之间」可放，只给温和提示不插入；
+   * - 送音文本为空 → 用字幕原文铺底；
+   *   · 语气词插句首（`{tag} {narration_text}`），光标停在标签之后；
+   *   · 停顿标签：字幕原文里有「前后都有文字」的句中标点时，插在该标点之后
+   *     （如「别怕，<#0.5#>有我在。」）；没有句中标点时先把字幕原文铺底、
+   *     光标停到句中，提示用户确认位置后再点一次插入（绝不空手返回）；
    * - 送音文本非空 → 按最近选区替换（无选区则按光标处插入）；
    * - 相邻已有停顿标签 → 替换掉旧的那个，避免连用（后端也会合并，这里先一步收敛）。
    */
@@ -934,20 +962,35 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     const current = beat.tts_text ?? '';
     const trimmed = current.trim();
     if (trimmed === '') {
-      if (isPauseTag) {
-        setSaveHint(
-          '停顿标签只能放在句中两段文字之间：先写好送音文本，或在中间位置插入。'
-        );
-        return;
-      }
       const base = (beat.narration_text ?? '').trim();
       if (!base) {
         setSaveHint('这句还没有字幕原文，无法铺底插入标签。');
         return;
       }
-      const next = `${snippet} ${base}`;
-      updateBeatField(beat.beat_id, 'tts_text', next);
-      focusAfterTag(beat.beat_id, next.length, 0);
+      if (!isPauseTag) {
+        const next = `${snippet} ${base}`;
+        updateBeatField(beat.beat_id, 'tts_text', next);
+        focusAfterTag(beat.beat_id, snippet.length + 1, 0);
+        return;
+      }
+      // 停顿标签：插在句中标点之后（停顿必须夹在两段文字之间）。
+      const mark = findSentenceMark(base);
+      if (mark) {
+        const insertAt = mark.index + mark.text.length;
+        const next = `${base.slice(0, insertAt)}${snippet}${base.slice(insertAt)}`;
+        updateBeatField(beat.beat_id, 'tts_text', next);
+        focusAfterTag(beat.beat_id, insertAt + snippet.length, 0);
+        setSaveHint(`已把停顿标签插在「${mark.text}」后面，可继续微调位置。`);
+        return;
+      }
+      // 没有句中标点：先把字幕原文铺底，光标停在句中，等用户确认位置后再点一次插入。
+      const mid = Math.floor(base.length / 2);
+      updateBeatField(beat.beat_id, 'tts_text', base);
+      ttsSelections.current[beat.beat_id] = { start: mid, end: mid };
+      focusAfterTag(beat.beat_id, mid, 0);
+      setSaveHint(
+        '已把字幕原文铺底为送音文本，光标放在句中；确认位置后再点一次「插入停顿」。'
+      );
       return;
     }
 
@@ -958,9 +1001,9 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     let head = current.slice(0, start);
     let tail = current.slice(end);
     if (isPauseTag) {
-      // 相邻停顿标签：把紧邻的旧标签摘掉，避免写成 <#0.5#><#0.8#>。
-      head = head.replace(/<#[\d.]+#>$/, '');
-      tail = tail.replace(/^<#[\d.]+#>/, '');
+      // 相邻停顿标签：把紧邻的旧标签摘掉，避免写成 <#0.5#><#0.8#>（允许中间有空白）。
+      head = head.replace(/<#\s*[\d.]+\s*#>\s*$/, '');
+      tail = tail.replace(/^\s*<#\s*[\d.]+\s*#>/, '');
     }
     const next = `${head}${snippet}${tail}`;
     updateBeatField(beat.beat_id, 'tts_text', next);
@@ -2580,6 +2623,29 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                                   </option>
                                 ))}
                               </select>
+                              {/* Patch v4.13：归属幕与分镜解耦，这里单独指定这一句讲哪一幕。 */}
+                              {storyboardScenes.length > 0 && (
+                                <select
+                                  value={beat.scene_id ?? ''}
+                                  onChange={(e) =>
+                                    updateBeatField(
+                                      beat.beat_id,
+                                      'scene_id',
+                                      e.target.value === '' ? null : e.target.value
+                                    )
+                                  }
+                                  title="这一句归属哪一幕（留空＝按分镜自动回退）"
+                                  aria-label={`${beat.beat_id} 归属幕`}
+                                  className="w-16 px-1 py-0.5 text-[11px] bg-white border border-slate-200 rounded"
+                                >
+                                  <option value="">自动</option>
+                                  {storyboardScenes.map((scene) => (
+                                    <option key={scene.scene_id} value={scene.scene_id}>
+                                      {scene.scene_index}. {scene.title || scene.scene_id}
+                                    </option>
+                                  ))}
+                                </select>
+                              )}
                             </div>
                           </td>
 
