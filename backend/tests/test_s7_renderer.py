@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 from PIL import Image, ImageDraw
 
+from core.config import AppConfig, RenderConfig
 from core.schemas import (
     AudioClipMeta,
     CameraMotion,
@@ -48,6 +49,13 @@ pytestmark = pytest.mark.skipif(
     shutil.which(FFMPEG_BIN) is None,
     reason="本机没有 ffmpeg，跳过 Stage 7 的真实渲染测试",
 )
+
+#: 真渲染用例统一用 ultrafast 预设跑（断言强度不变，只是不在测试里浪费时间）。
+#: 生产链路仍走 RenderConfig.video_preset（默认 medium）。
+TEST_VIDEO_PRESET = "ultrafast"
+
+#: 真渲染时用的轻量 AppConfig：只把 x264 预设换成 ultrafast，其余与默认一致。
+FAST_RENDER_CONFIG = AppConfig(render=RenderConfig(video_preset=TEST_VIDEO_PRESET))
 
 
 # --------------------------------------------------------------------------
@@ -161,6 +169,7 @@ def rendered(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, RenderTime
         out_path=out_path,
         ffmpeg_bin=FFMPEG_BIN,
         work_dir=root / "work",
+        video_preset=TEST_VIDEO_PRESET,
     )
     return out_path, timeline, root
 
@@ -234,6 +243,7 @@ def test_run_ffmpeg_raises_with_stderr_tail() -> None:
 # --------------------------------------------------------------------------
 # 2. 成片产物与时长
 # --------------------------------------------------------------------------
+@pytest.mark.slow
 def test_render_timeline_writes_mp4(rendered: tuple[Path, RenderTimeline, Path]) -> None:
     """产出 mp4，文件存在且大小 > 0。"""
     out_path, _timeline, _root = rendered
@@ -241,6 +251,7 @@ def test_render_timeline_writes_mp4(rendered: tuple[Path, RenderTimeline, Path])
     assert out_path.stat().st_size > 0
 
 
+@pytest.mark.slow
 def test_render_timeline_duration_matches_timeline(rendered: tuple[Path, RenderTimeline, Path]) -> None:
     """成片时长与 ``total_duration_ms`` 的误差在容差内。
 
@@ -255,6 +266,7 @@ def test_render_timeline_duration_matches_timeline(rendered: tuple[Path, RenderT
 # --------------------------------------------------------------------------
 # 3. 画幅与编码
 # --------------------------------------------------------------------------
+@pytest.mark.slow
 def test_output_is_1080x1920_h264_aac(rendered: tuple[Path, RenderTimeline, Path]) -> None:
     """输出必须是 1080×1920 的 h264 视频流 + aac 音频流。"""
     out_path, _timeline, _root = rendered
@@ -269,6 +281,7 @@ def test_output_is_1080x1920_h264_aac(rendered: tuple[Path, RenderTimeline, Path
 # --------------------------------------------------------------------------
 # 4. 字幕烧录
 # --------------------------------------------------------------------------
+@pytest.mark.slow
 def test_subtitle_png_is_burned_into_frame(rendered: tuple[Path, RenderTimeline, Path]) -> None:
     """字幕 PNG 里的红色块必须出现在成片对应时间窗的帧上。"""
     out_path, _timeline, root = rendered
@@ -277,6 +290,7 @@ def test_subtitle_png_is_burned_into_frame(rendered: tuple[Path, RenderTimeline,
     assert red > 200 and green < 60 and blue < 60, f"字幕像素应为红色，实际 {(red, green, blue)}"
 
 
+@pytest.mark.slow
 def test_subtitle_only_shows_inside_its_time_window(rendered: tuple[Path, RenderTimeline, Path]) -> None:
     """字幕只在 ``[start_ms, end_ms]`` 窗口内出现（enable=between 生效）。"""
     out_path, _timeline, root = rendered
@@ -288,6 +302,7 @@ def test_subtitle_only_shows_inside_its_time_window(rendered: tuple[Path, Render
 # --------------------------------------------------------------------------
 # 5. render_episode 双份落盘
 # --------------------------------------------------------------------------
+@pytest.mark.slow
 def test_render_episode_writes_both_copies(tmp_path: Path) -> None:
     """``07_out/{episode_id}.mp4`` 与 ``exports/EP{话次:03d}_{title}.mp4`` 都要有。
 
@@ -295,7 +310,13 @@ def test_render_episode_writes_both_copies(tmp_path: Path) -> None:
     且渲染结束后 ``07_out/_work`` 工作目录被清理干净。
     """
     episode_dir, _timeline = _make_workspace(tmp_path)
-    out_path = render_episode(tmp_path, 1, ffmpeg_bin=FFMPEG_BIN, title="测试标题")
+    out_path = render_episode(
+        tmp_path,
+        1,
+        ffmpeg_bin=FFMPEG_BIN,
+        title="测试标题",
+        config=FAST_RENDER_CONFIG,
+    )
 
     expected = out_dir_for(tmp_path, 1) / "ep_001.mp4"
     assert out_path == expected
@@ -415,6 +436,7 @@ def test_render_episode_without_timeline_raises(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------
 # 7. 带 BGM 也能渲染
 # --------------------------------------------------------------------------
+@pytest.mark.slow
 def test_render_with_bgm(tmp_path: Path) -> None:
     """有 BGM 时正常渲染，且成片仍带 aac 音轨。"""
     episode_dir, timeline = _make_workspace(tmp_path)
@@ -428,6 +450,7 @@ def test_render_with_bgm(tmp_path: Path) -> None:
         bgm_path=bgm,
         ffmpeg_bin=FFMPEG_BIN,
         work_dir=tmp_path / "work",
+        video_preset=TEST_VIDEO_PRESET,
     )
     assert out_path.is_file() and out_path.stat().st_size > 0
     streams = _probe_streams(out_path)
@@ -584,6 +607,7 @@ def _make_long_workspace(root: Path, *, scene_count: int = 20) -> tuple[Path, Re
     return episode_dir, timeline
 
 
+@pytest.mark.slow
 def test_long_timeline_is_rendered_in_segments(tmp_path: Path) -> None:
     """长话按分段渲染，段产物再拼接成完整成片。"""
     episode_dir, timeline = _make_long_workspace(tmp_path, scene_count=20)
@@ -596,6 +620,7 @@ def test_long_timeline_is_rendered_in_segments(tmp_path: Path) -> None:
         out_path=out_path,
         ffmpeg_bin=FFMPEG_BIN,
         work_dir=work_dir,
+        video_preset=TEST_VIDEO_PRESET,
     )
 
     assert out_path.is_file()

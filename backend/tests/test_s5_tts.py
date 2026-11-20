@@ -278,6 +278,7 @@ async def test_voice_override_only_when_explicit(tmp_path) -> None:
 # ----------------------------------------------------------------------
 # 静音裁剪（真实 ffmpeg）
 # ----------------------------------------------------------------------
+@pytest.mark.slow
 @pytest.mark.anyio
 async def test_ffmpeg_trims_leading_and_trailing_silence(tmp_path) -> None:
     """真实 ffmpeg 裁剪：首字节不再是静音，且时长明显短于原始音频。"""

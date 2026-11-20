@@ -22,7 +22,7 @@ backend/
 ```bash
 cd backend
 source .venv/bin/activate          # 激活虚拟环境
-python -m pip install -e ".[dev]"  # 安装依赖（开发依赖含 pytest / respx）
+python -m pip install -e ".[dev]"  # 安装依赖（开发依赖含 pytest / respx / pytest-xdist）
 pytest                             # 运行测试
 ```
 
@@ -37,6 +37,67 @@ from core.schemas import NarrationScript
 ```bash
 backend/.venv/bin/python -m pytest backend/tests
 ```
+
+## 测试跑法（分级）
+
+后端共 **808** 条用例。默认 `pytest` 行为保持兼容（串行跑全部，含重型 ffmpeg），
+但开发期建议按下表分档执行：
+
+| 档位 | 命令 | 用例数 | 用途 |
+| :--- | :--- | :--- | :--- |
+| 快速回归 | `pytest -n auto -m "not slow"` | 786 | 日常小改动：纯单测 + API，跳过重型 ffmpeg |
+| 定向验证 | `pytest tests/test_patch_v412_single_beat_tts.py` | 18 | 单句重配 TTS 等指定模块的精确验证 |
+| 全量兜底 | `pytest -n auto --dist loadfile` | 808 | 改动 s5/s6/s7 媒体链路，或准备提交前必跑 |
+
+> `-n auto` 依赖 `pytest-xdist`（已列入 `[project.optional-dependencies].dev`）。
+> 全量档建议加 `--dist loadfile`：同一文件的用例固定在同一个 worker，
+> module 级 fixture 不会在不同 worker 重复执行（46s → 30s）。
+
+### `slow` 标记
+
+`pyproject.toml` 的 `[tool.pytest.ini_options].markers` 注册了：
+
+```toml
+markers = [
+    "slow: 真正拉起 ffmpeg/ffprobe 做视频编码、长链路渲染或完整 E2E 的耗时测试（轻量音频滤镜裁剪不在此列）",
+]
+```
+
+只有真正 spawn 外部媒体进程做**视频编码 / 长链路渲染 / 完整 E2E** 的用例才标 `slow`；
+纯 mock、纯 Python、纯 `TestClient` 的用例一律不标，因此快速回归档的覆盖率与全量一致。
+
+当前 **22** 条 `slow` 用例分布：
+
+| 文件 | 条数 | 用例 |
+| :--- | :--- | :--- |
+| `tests/test_s7_renderer.py` | 8 | 真渲染 MP4、ffprobe 抽帧、20 场景分段渲染 |
+| `tests/test_pipeline_e2e.py` | 3 | 全链路 E2E（模块级 `pytestmark` 整模块标记） |
+| `tests/test_patch_v45_branding.py` | 3 | 封面/片尾/品牌真渲染 |
+| `tests/test_patch_v47_scene_bgm.py` | 3 | 真合成 BGM 混音 |
+| `tests/test_patch_v34_audio_hygiene.py` | 2 | 真 ffmpeg 静音裁剪与响度归一 |
+| `tests/test_patch_v32_audio_mix.py` | 1 | 真 ffmpeg 音效合成 |
+| `tests/test_patch_v32_tts_settings.py` | 1 | 真 ffmpeg 语速裁剪 |
+| `tests/test_s5_tts.py` | 1 | 真 ffmpeg 静音裁剪 |
+
+`tests/test_patch_v412_single_beat_tts.py`（单句重配）**不标** `slow`：它用假合成器、
+不走网络，单条重配只调一次 TTS，整文件 2.5 秒内跑完，是日常最该常跑的一档。
+
+> **快档仍会调用 ffmpeg（这是有意的）**：用 PATH 探针实测 `-m "not slow"` 档共拉起
+> ffmpeg 166 次，其中 **164 次是轻量音频滤镜**（`silenceremove` / `loudnorm` 裁剪，
+> 每条几十毫秒），**视频编码 `libx264` 为 0 次**。这些调用来自
+> `test_patch_v412_single_beat_tts.py`、`test_patch_v33_voices_and_models.py` 等
+> 走 `_trim_silence` / 音色样例生成的用例——它们测的正是「音频裁剪后的真实时长」，
+> 砍掉会丢断言，所以保留在快档；快档省掉的是**视频编码**与**长链路 E2E** 这类真开销。
+
+### 耗时对比（Apple M3 / 8 核）
+
+| 场景 | 耗时 | 说明 |
+| :--- | :--- | :--- |
+| 优化前全量串行 | **5m59s** | 旧的默认 `pytest`，含一处限流冷却真等待 270s |
+| 优化后全量串行 | **58s** | 同一命令 `pytest`，限流等待已改为可注入的 sleep |
+| 快速回归 `-n auto -m "not slow"` | **12s** | 日常小改动档 |
+| 全量并发 `-n auto` | **46s** | 默认 load 分布 |
+| 全量并发 `-n auto --dist loadfile` | **30s** | 同文件聚到同一 worker，module fixture 不重复执行 |
 
 ### 启动控制台（前端 + 后端）
 

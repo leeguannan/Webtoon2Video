@@ -278,6 +278,7 @@ async def test_trim_silence_skips_atempo_at_unit_speed(monkeypatch: pytest.Monke
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="本机没有 ffmpeg，跳过端到端变速时长校验")
+@pytest.mark.slow
 @pytest.mark.anyio
 async def test_trim_silence_actually_shortens_duration(tmp_path: Path) -> None:
     """真实 ffmpeg：2s 音频按 1.5x 变速后时长约缩短到 1/1.5。"""

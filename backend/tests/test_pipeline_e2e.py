@@ -30,13 +30,16 @@ from pathlib import Path
 import pytest
 
 from cli import run_series
-from core.config import AppConfig, WorkspaceConfig
+from core.config import AppConfig, RenderConfig, WorkspaceConfig
 from providers.llm_base import ChatResponse
 from providers.tts_base import TTSResult
 
-pytestmark = pytest.mark.skipif(
-    shutil.which("ffmpeg") is None, reason="本机没有 ffmpeg，跳过端到端渲染测试"
-)
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.skipif(
+        shutil.which("ffmpeg") is None, reason="本机没有 ffmpeg，跳过端到端渲染测试"
+    ),
+]
 
 
 def _write_png(path: Path, width: int = 700, height: int = 1100) -> None:
@@ -254,6 +257,8 @@ def _e2e_run_result(tmp_path_factory: pytest.TempPathFactory) -> _E2ERunResult:
     config = AppConfig(
         workspace=WorkspaceConfig(root=workspace),
         pronunciation_overrides={"银行": "yín háng"},
+        # 真渲染统一用 ultrafast 预设（断言强度不变，只是不在测试里浪费时间）。
+        render=RenderConfig(video_preset="ultrafast"),
     )
 
     result = asyncio.run(

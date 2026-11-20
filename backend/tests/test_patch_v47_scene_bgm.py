@@ -431,6 +431,7 @@ def test_build_scene_bgm_spans_silent_scene_kept(tmp_path: Path) -> None:
 # 组 4：真 FFmpeg 多轨合成
 # ---------------------------------------------------------------------------
 @needs_ffmpeg
+@pytest.mark.slow
 def test_synthesize_multi_bgm_wav_timeline(tmp_path: Path) -> None:
     track_a = _write_sine_wav(tmp_path / "a.wav", frequency=440.0)
     track_b = _write_sine_wav(tmp_path / "b.wav", frequency=880.0)
@@ -458,6 +459,7 @@ def test_synthesize_multi_bgm_wav_timeline(tmp_path: Path) -> None:
 
 
 @needs_ffmpeg
+@pytest.mark.slow
 def test_synthesize_returns_none_when_all_silent(tmp_path: Path) -> None:
     spans = [s7_renderer.BgmSpan(0, 2000, None, -8.0)]
     result = s7_renderer.synthesize_multi_bgm_wav(
@@ -484,6 +486,7 @@ def _mean_dbfs(wav_path: Path) -> float:
 
 
 @needs_ffmpeg
+@pytest.mark.slow
 def test_synthesize_multi_bgm_wav_keeps_scene_gain(tmp_path: Path) -> None:
     """各幕降增益必须原样生效，不能被总线 loudnorm 拉回 -16 LUFS。
 

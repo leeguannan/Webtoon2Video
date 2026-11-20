@@ -45,6 +45,7 @@ from core.branding_render import (
 from core.config import (
     AppConfig,
     CoverTextSpec,
+    RenderConfig,
     SeriesBrandingConfig,
     SeriesConfig,
     WorkspaceConfig,
@@ -69,6 +70,12 @@ needs_ffmpeg = pytest.mark.skipif(
     shutil.which(FFMPEG_BIN) is None,
     reason="本机没有 ffmpeg，跳过 Patch v4.5 的真实渲染测试",
 )
+
+#: 真渲染用例统一用 ultrafast 预设跑（断言强度不变，只是不在测试里浪费时间）。
+TEST_VIDEO_PRESET = "ultrafast"
+
+#: 真渲染时用的轻量 AppConfig：只把 x264 预设换成 ultrafast，其余与默认一致。
+FAST_RENDER_CONFIG = AppConfig(render=RenderConfig(video_preset=TEST_VIDEO_PRESET))
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +436,7 @@ def test_resolve_effective_branding_modes(tmp_path: Path) -> None:
 # 4. 真 FFmpeg：封页 + 结尾 + BGM 的时长数学
 # ---------------------------------------------------------------------------
 @needs_ffmpeg
+@pytest.mark.slow
 def test_render_timeline_with_cover_outro_and_bgm(tmp_path: Path) -> None:
     episode_dir, timeline = _make_timeline_workspace(tmp_path)
     branding_dir = tmp_path / "assets" / "branding"
@@ -464,6 +472,7 @@ def test_render_timeline_with_cover_outro_and_bgm(tmp_path: Path) -> None:
         outro_fade_out_ms=600,
         bgm_fade_in_ms=350,
         bgm_fade_out_ms=600,
+        video_preset=TEST_VIDEO_PRESET,
     )
     assert branded_out.is_file() and branded_out.stat().st_size > 0
 
@@ -484,12 +493,14 @@ def test_render_timeline_with_cover_outro_and_bgm(tmp_path: Path) -> None:
         bgm_path=bgm_path,
         work_dir=tmp_path / "work_base",
         ffmpeg_bin=FFMPEG_BIN,
+        video_preset=TEST_VIDEO_PRESET,
     )
     baseline_duration = probe_duration_ms(baseline_out, ffmpeg_bin=FFMPEG_BIN)
     assert abs(baseline_duration - 2000) <= 150, baseline_duration
 
 
 @needs_ffmpeg
+@pytest.mark.slow
 def test_render_episode_branding_end_to_end(tmp_path: Path) -> None:
     episode_dir, _timeline = _make_timeline_workspace(tmp_path)
     branding_dir = tmp_path / "assets" / "branding"
@@ -518,7 +529,7 @@ def test_render_episode_branding_end_to_end(tmp_path: Path) -> None:
     )
 
     # 默认：封面 + 待续结尾 → 4600ms。
-    out_path = render_episode(tmp_path, 1, ffmpeg_bin=FFMPEG_BIN)
+    out_path = render_episode(tmp_path, 1, ffmpeg_bin=FFMPEG_BIN, config=FAST_RENDER_CONFIG)
     assert out_path.is_file()
     assert abs(probe_duration_ms(out_path, ffmpeg_bin=FFMPEG_BIN) - 4600) <= 150
     # work_dir 已在渲染后清理，不留中间产物。
@@ -528,7 +539,7 @@ def test_render_episode_branding_end_to_end(tmp_path: Path) -> None:
     save_episode_render_options(
         episode_dir, EpisodeRenderOptions(outro_mode="none")
     )
-    out_no_outro = render_episode(tmp_path, 1, ffmpeg_bin=FFMPEG_BIN)
+    out_no_outro = render_episode(tmp_path, 1, ffmpeg_bin=FFMPEG_BIN, config=FAST_RENDER_CONFIG)
     assert abs(probe_duration_ms(out_no_outro, ffmpeg_bin=FFMPEG_BIN) - 3200) <= 150
 
     # 再跳过封面 → 纯正文 2000ms。
@@ -536,11 +547,12 @@ def test_render_episode_branding_end_to_end(tmp_path: Path) -> None:
         episode_dir,
         EpisodeRenderOptions(outro_mode="none", cover_enabled=False),
     )
-    out_plain = render_episode(tmp_path, 1, ffmpeg_bin=FFMPEG_BIN)
+    out_plain = render_episode(tmp_path, 1, ffmpeg_bin=FFMPEG_BIN, config=FAST_RENDER_CONFIG)
     assert abs(probe_duration_ms(out_plain, ffmpeg_bin=FFMPEG_BIN) - 2000) <= 150
 
 
 @needs_ffmpeg
+@pytest.mark.slow
 def test_render_episode_skips_missing_branding_image(tmp_path: Path) -> None:
     episode_dir, _timeline = _make_timeline_workspace(tmp_path)
     # 配置指向不存在的底图：只打印警告并优雅降级，绝不中断流水线。
@@ -554,7 +566,7 @@ def test_render_episode_skips_missing_branding_image(tmp_path: Path) -> None:
         yaml.safe_dump(config.model_dump(), allow_unicode=True, sort_keys=False),
         encoding="utf-8",
     )
-    out_path = render_episode(tmp_path, 1, ffmpeg_bin=FFMPEG_BIN)
+    out_path = render_episode(tmp_path, 1, ffmpeg_bin=FFMPEG_BIN, config=FAST_RENDER_CONFIG)
     assert out_path.is_file()
     assert abs(probe_duration_ms(out_path, ffmpeg_bin=FFMPEG_BIN) - 2000) <= 150
 

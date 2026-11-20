@@ -28,6 +28,7 @@ w2v = "cli:main"
 [project.optional-dependencies]
 dev = [
     "pytest>=8.2",
+    "pytest-xdist>=3.6",
     "respx>=0.21",
 ]
 
@@ -43,3 +44,6 @@ where = ["src"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-q"
+markers = [
+    "slow: 真正拉起 ffmpeg/ffprobe 做视频编码、长链路渲染或完整 E2E 的耗时测试（轻量音频滤镜裁剪不在此列）",
+]

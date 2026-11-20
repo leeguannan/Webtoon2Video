@@ -194,6 +194,7 @@ async def test_trim_silence_loudnorm_runs_after_atempo(
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="本机没有 ffmpeg，跳过端到端响度校验")
+@pytest.mark.slow
 @pytest.mark.anyio
 async def test_trim_silence_real_ffmpeg_outputs_24k(tmp_path: Path) -> None:
     """真实 ffmpeg：归一后仍是 24kHz 单声道 WAV（loudnorm 的 192kHz 被拉回来）。"""
@@ -210,6 +211,7 @@ async def test_trim_silence_real_ffmpeg_outputs_24k(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="本机没有 ffmpeg，跳过端到端响度校验")
+@pytest.mark.slow
 @pytest.mark.anyio
 async def test_trim_silence_real_ffmpeg_trims_loudnorm_ringing(tmp_path: Path) -> None:
     """归一后的升采样振铃会被二次裁剪清掉：裁完第一个采样就是人声。"""

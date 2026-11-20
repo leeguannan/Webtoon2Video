@@ -215,9 +215,13 @@ async def test_fetch_series_catalog_sends_referer(respx_mock) -> None:
 async def test_fetch_series_catalog_raises_on_http_error(respx_mock) -> None:
     respx_mock.get(LIST_URL).mock(return_value=httpx.Response(500, text="boom"))
 
+    async def _no_sleep(_seconds: float) -> None:
+        """跳过重试退避（断言不变，只是不真等）。"""
+        return None
+
     async with build_client() as client:
         with pytest.raises(CatalogError):
-            await fetch_series_catalog(client, LIST_URL)
+            await fetch_series_catalog(client, LIST_URL, sleep=_no_sleep)
 
 
 @pytest.mark.anyio

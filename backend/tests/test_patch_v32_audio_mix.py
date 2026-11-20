@@ -268,6 +268,7 @@ def test_mix_log_prints_bgm_name_and_sfx_count(
 # 3. 真实 ffmpeg 端到端：音效轨非静音
 # --------------------------------------------------------------------------
 @pytest.mark.skipif(FFMPEG_BIN is None, reason="本机没有 ffmpeg，跳过真实混音用例")
+@pytest.mark.slow
 def test_prepare_audio_real_ffmpeg_produces_non_silent_sfx(tmp_path: Path) -> None:
     """整条备音链跑通：sfx.wav 真实存在且 RMS>0（dynaudnorm 不会把音效压成静音）。"""
     episode_dir, timeline = _make_timeline(

@@ -475,6 +475,7 @@ class _RateLimiter:
         *,
         min_rpm: int = 2,
         cooldown_s: float = 30.0,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._rpm = max(0, int(rpm))
         self._min_rpm = max(1, int(min_rpm))
@@ -486,6 +487,8 @@ class _RateLimiter:
         self._cooldown_until = 0.0
         self._success_streak = 0
         self._lock: asyncio.Lock | None = None
+        #: 等待用的 sleep（可注入，测试可传空实现避免真等；生产默认 asyncio.sleep）。
+        self._sleep = sleep
 
     @property
     def rpm(self) -> int:
@@ -509,7 +512,7 @@ class _RateLimiter:
             self._next_allowed = max(now, self._next_allowed) + self._interval
             wait = base - now
         if wait > 0:
-            await asyncio.sleep(wait)
+            await self._sleep(wait)
 
     def penalize(self) -> None:
         """撞到限流：全局冷却 + 速率减半。"""
@@ -581,10 +584,13 @@ class MiniMaxTTS:
         self._http_client = http_client
         self._sleep = sleep
         # Patch v4.3：MiniMax 有 RPM 限流，这里加进程内节流闸门。
+        # 闸门的节流/冷却等待与重试退避共用同一个 sleep，
+        # 测试注入空 sleep 即可避免真等（生产默认仍是 asyncio.sleep）。
         self._limiter = _RateLimiter(
             rate_limit_rpm,
             min_rpm=rate_limit_min_rpm,
             cooldown_s=rate_limit_cooldown_s,
+            sleep=sleep,
         )
         # Patch v4.3：同一 client 的在途请求上限（默认串行）。
         self._max_concurrency = max(1, int(max_concurrency))

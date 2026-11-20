@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs, urljoin, urlparse
@@ -496,8 +496,12 @@ async def _fetch_catalog_page(
     *,
     retries: int = 2,
     backoff_s: float = 1.0,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> str | None:
-    """抓取一个目录页；返回 HTML，404 视为越界返回 ``None``。"""
+    """抓取一个目录页；返回 HTML，404 视为越界返回 ``None``。
+
+    ``sleep`` 可注入（测试传空实现即可跳过重试退避），默认仍是 ``asyncio.sleep``。
+    """
     last_error: Exception | None = None
     for attempt in range(retries + 1):
         try:
@@ -505,7 +509,7 @@ async def _fetch_catalog_page(
         except httpx.HTTPError as exc:
             last_error = exc
             if attempt < retries:
-                await asyncio.sleep(backoff_s * (2**attempt))
+                await sleep(backoff_s * (2**attempt))
                 continue
             raise CatalogError(
                 f"目录页抓取失败：{url}（{type(exc).__name__}: {exc or '无详细信息'}）"
@@ -517,7 +521,7 @@ async def _fetch_catalog_page(
                 f"HTTP {response.status_code}", request=response.request, response=response
             )
             if attempt < retries:
-                await asyncio.sleep(backoff_s * (2**attempt))
+                await sleep(backoff_s * (2**attempt))
                 continue
             raise CatalogError(
                 f"目录页抓取失败：{url}（HTTP {response.status_code}）"
@@ -536,11 +540,14 @@ async def fetch_series_catalog(
     series_title: str | None = None,
     max_pages: int = MAX_PAGES,
     concurrency: int = 8,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> SeriesCatalog:
     """翻页抓取目录页并合并成 ``SeriesCatalog``。
 
     抓到的条目按发布顺序（站点内部 ``episode_no`` 升序）重编号为「作品内第 N 话」
     （1 起），站点内部 ID 仍保留在 ``viewer_url`` 里可回溯。
+
+    ``sleep`` 可注入（测试传空实现即可跳过重试退避），默认仍是 ``asyncio.sleep``。
     """
     resolved_id = series_id or series_id_from_url(list_url)
     resolved_title = series_title or series_title_from_url(list_url)
@@ -557,7 +564,7 @@ async def fetch_series_catalog(
         visited.update(batch)
         pages += len(batch)
         htmls = await asyncio.gather(
-            *(_fetch_catalog_page(client, url) for url in batch)
+            *(_fetch_catalog_page(client, url, sleep=sleep) for url in batch)
         )
         for url, html in zip(batch, htmls):
             if html is None:
