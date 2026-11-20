@@ -74,7 +74,13 @@ from core.config import (
     resolve_voice_for_tts_model,
 )
 from core.subtitle_render import FONT_CANDIDATES
-from core.manifest import ManifestManager, infer_stage_artifacts, infer_stage_status
+from core.manifest import (
+    ARCHIVE_INTERMEDIATE_DIRS,
+    ManifestManager,
+    dir_size,
+    infer_stage_artifacts,
+    infer_stage_status,
+)
 from core.panel_ids import panel_sort_key
 from core.schemas import (
     ArcSummary,
@@ -741,6 +747,18 @@ class WorkspaceView:
         panels = self.panels(series_id, episode_no)
         beats = self.beats(series_id, episode_no)
         status = self.episode_status(stages, state)
+        manager = ManifestManager(
+            self.registry.series_dir(series_id), series_id=series_id
+        )
+        manifest = manager.load(episode_no)
+        archived = bool(manifest.archived)
+        # Patch v4.11：归档后过程目录已清空，infer 会把 S1~S6 判成 pending；
+        # 只要成片还在，话次状态就保持 done，试看/导出入口不退化成 idle。
+        if archived and self._episode_video_path(series_id, episode_no, episode_dir):
+            status = "done"
+        disk_bytes, reclaimable_bytes = self.episode_disk_metrics(
+            series_id, episode_no
+        )
         current_stage = state.current_stage if state and state.current_stage else ""
         if not current_stage:
             for item in stages:
@@ -761,7 +779,12 @@ class WorkspaceView:
             "selected": False,
             "current_stage": current_stage or "s0_catalog",
             "status": status,
-            "video_duration_ms": self.video_duration_ms(episode_dir),
+            "archived": archived,
+            "disk_bytes": disk_bytes,
+            "reclaimable_bytes": 0 if archived else reclaimable_bytes,
+            "video_duration_ms": self.video_duration_ms(
+                series_id, episode_no, episode_dir
+            ),
             "stages": stages,
             "panels": panels,
             "beats": beats,
@@ -849,15 +872,94 @@ class WorkspaceView:
             return "done"
         return "idle"
 
-    def video_duration_ms(self, episode_dir: Path) -> int:
+    def _episode_video_path(
+        self, series_id: str, episode_no: int, episode_dir: Path | None = None
+    ) -> Path | None:
+        """定位本话规范成片：优先 ``07_out`` 下非空 mp4，其次 exports 导出。"""
+        base = episode_dir or self.episode_dir(series_id, episode_no)
+        out_dir = base / "07_out"
+        candidates = (
+            sorted(
+                p
+                for p in out_dir.glob("*.mp4")
+                if p.is_file() and p.stat().st_size > 0
+            )
+            if out_dir.is_dir()
+            else []
+        )
+        if candidates:
+            return candidates[0]
+        exports_dir = self.registry.series_dir(series_id) / "exports"
+        if exports_dir.is_dir():
+            exports = sorted(
+                p
+                for p in exports_dir.glob(f"EP{episode_no:03d}_*.mp4")
+                if p.is_file() and p.stat().st_size > 0
+            )
+            if exports:
+                return exports[0]
+        return None
+
+    def episode_disk_metrics(
+        self, series_id: str, episode_no: int
+    ) -> tuple[int, int]:
+        """返回（当前占用字节、可回收字节）。
+
+        可回收口径与 ``ManifestManager.archive_episode_keep_video`` 的删除
+        范围严格一致：过程目录（含 ``03b_scenes``）、``07_out/_work``、
+        本话 bible 快照；成片与 ``manifest.json`` 不算可回收。
+        """
+        episode_dir = self.episode_dir(series_id, episode_no)
+        disk_bytes = dir_size(episode_dir)
+        reclaimable = 0
+        for dirname in ARCHIVE_INTERMEDIATE_DIRS:
+            reclaimable += dir_size(episode_dir / dirname)
+        reclaimable += dir_size(episode_dir / "07_out" / "_work")
+        snapshot = (
+            self.registry.series_dir(series_id)
+            / "bible_snapshots"
+            / f"ep_{episode_no:03d}.json"
+        )
+        if snapshot.is_file():
+            try:
+                reclaimable += snapshot.stat().st_size
+            except OSError:  # pragma: no cover - 竞态删除不应阻断列表加载
+                pass
+        return disk_bytes, reclaimable
+
+    def video_duration_ms(
+        self, series_id: str, episode_no: int, episode_dir: Path
+    ) -> int:
+        """成片时长（毫秒），三级兜底。
+
+        1. ``06_plan/timeline.json`` 的 ``total_duration_ms``（正常链路）；
+        2. 归档后 timeline 已清，读 manifest 的 ``archived_duration_ms``；
+        3. 都没有时直接 ffprobe 成片真实时长。
+        """
         timeline_path = episode_dir / "06_plan" / "timeline.json"
-        if not timeline_path.is_file():
-            return 0
-        try:
-            data = json.loads(timeline_path.read_text(encoding="utf-8"))
-        except Exception:  # noqa: BLE001 - 时间轴损坏时按 0 处理
-            return 0
-        return int(data.get("total_duration_ms") or 0)
+        if timeline_path.is_file():
+            try:
+                data = json.loads(timeline_path.read_text(encoding="utf-8"))
+                duration = int(data.get("total_duration_ms") or 0)
+                if duration > 0:
+                    return duration
+            except Exception:  # noqa: BLE001 - 时间轴损坏时走下级兜底
+                pass
+        manager = ManifestManager(
+            self.registry.series_dir(series_id), series_id=series_id
+        )
+        manifest = manager.load(episode_no)
+        if int(manifest.archived_duration_ms or 0) > 0:
+            return int(manifest.archived_duration_ms)
+        video_path = self._episode_video_path(series_id, episode_no, episode_dir)
+        if video_path is not None:
+            try:
+                return s7_renderer.probe_duration_ms(
+                    video_path, ffmpeg_bin=self.config.render.ffmpeg_bin
+                )
+            except Exception:  # noqa: BLE001 - 探测失败按 0 处理，不阻断列表加载
+                return 0
+        return 0
 
     # ---- 面板 ----
     def panels(self, series_id: str, episode_no: int) -> list[dict[str, Any]]:
@@ -1640,6 +1742,72 @@ def create_app(
             ),
             "stages": view.stage_progress(series_id, episode_no, state),
             "logs": list(state.logs),
+        }
+
+    @app.post("/api/episodes/{episode_id}/cleanup-intermediates")
+    async def cleanup_episode_intermediates(episode_id: str) -> dict[str, Any]:
+        """一键清理本话过程文件，只保留最终成片（Patch v4.11）。"""
+        located = view.find_episode(episode_id)
+        if located is None:
+            raise HTTPException(status_code=404, detail=f"找不到话次：{episode_id}")
+        series_id, episode_no = located
+        state = job_runner.state_of(series_id, episode_no)
+        if state.status in {"queued", "running"}:
+            raise HTTPException(
+                status_code=409, detail="该话正在后台执行任务，请等待完成后再清理"
+            )
+        series_dir = view.registry.series_dir(series_id)
+        manager = ManifestManager(series_dir, series_id=series_id)
+        if manager.load(episode_no).archived:
+            raise HTTPException(
+                status_code=400, detail="该话已清理过过程文件（仅留成片）"
+            )
+        try:
+            summary = manager.archive_episode_keep_video(episode_no)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "episode_id": episode_id,
+            "freed_bytes": summary["freed_bytes"],
+            "kept_bytes": summary["kept_bytes"],
+            "archived": True,
+            "episode": view.episode_item(series_id, episode_no),
+        }
+
+    @app.post("/api/series/{series_id}/cleanup-intermediates")
+    async def cleanup_series_intermediates(series_id: str) -> dict[str, Any]:
+        """批量清理作品下所有已出片话次的过程文件（Patch v4.11）。"""
+        if series_id not in view.series_ids():
+            raise HTTPException(status_code=404, detail=f"作品未登记：{series_id}")
+        catalog = view.catalog(series_id)
+        if catalog is None:
+            raise HTTPException(status_code=404, detail=f"作品未登记：{series_id}")
+        series_dir = view.registry.series_dir(series_id)
+        manager = ManifestManager(series_dir, series_id=series_id)
+        cleaned_count = 0
+        freed_bytes = 0
+        skipped_episode_ids: list[str] = []
+        for episode in catalog.episodes:
+            episode_id = f"{series_id}_ep_{episode.episode_no:03d}"
+            state = job_runner.state_of(series_id, episode.episode_no)
+            if state.status in {"queued", "running"}:
+                skipped_episode_ids.append(episode_id)
+                continue
+            if manager.load(episode.episode_no).archived:
+                skipped_episode_ids.append(episode_id)
+                continue
+            try:
+                summary = manager.archive_episode_keep_video(episode.episode_no)
+            except ValueError:
+                # 没有成片的话次直接跳过，不阻断整批清理。
+                skipped_episode_ids.append(episode_id)
+                continue
+            cleaned_count += 1
+            freed_bytes += int(summary["freed_bytes"])
+        return {
+            "cleaned_count": cleaned_count,
+            "freed_bytes": freed_bytes,
+            "skipped_episode_ids": skipped_episode_ids,
         }
 
     @app.put("/api/episodes/{episode_id}/script")

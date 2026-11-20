@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Archive,
   Bell,
   BellOff,
   BookOpen,
   Brain,
   CheckCircle2,
   Download,
+  HardDrive,
   Library,
   Play,
   Plus,
@@ -19,6 +21,7 @@ import type {
   ArcSummary,
   AutoPacingResponse,
   CharacterProfile,
+  EpisodeCleanupResponse,
   EpisodeDigest,
   EpisodeItem,
   EpisodeRenderOptions,
@@ -27,6 +30,7 @@ import type {
   PronunciationRule,
   RunMode,
   ScriptBeat,
+  SeriesCleanupResponse,
   SeriesItem,
   StageId,
   StageStatus,
@@ -48,6 +52,7 @@ import {
   showDesktopNotification,
   type RenderNotifyPrefs,
 } from './utils/notifications';
+import { formatBytes } from './utils/format';
 
 type NavView = 'catalog' | 'studio' | 'memory' | 'config';
 
@@ -116,6 +121,9 @@ type RawEpisode = {
   panels?: EpisodeItem['panels'];
   beats?: EpisodeItem['beats'];
   logs?: string[];
+  archived?: boolean;
+  disk_bytes?: number;
+  reclaimable_bytes?: number;
 };
 
 type RawSeries = {
@@ -263,6 +271,9 @@ function toSeriesItem(raw: RawSeries, prev?: SeriesItem): SeriesItem {
       panels: item.panels ?? [],
       beats: item.beats ?? [],
       logs: item.logs ?? [],
+      archived: item.archived ?? false,
+      disk_bytes: item.disk_bytes ?? 0,
+      reclaimable_bytes: item.reclaimable_bytes ?? 0,
     };
     const old = prevEpisodes.find((ep) => ep.episode_id === next.episode_id);
     if (!old) return next;
@@ -942,6 +953,60 @@ export default function App() {
     }
   };
 
+  /** Patch v4.11：一键清理本话过程文件，只保留最终成片。 */
+  const handleCleanupIntermediates = async (
+    episodeId: string
+  ): Promise<boolean> => {
+    try {
+      const result = await apiFetch<EpisodeCleanupResponse>(
+        `/episodes/${encodeURIComponent(episodeId)}/cleanup-intermediates`,
+        { method: 'POST' }
+      );
+      // 乐观更新：完整数据由随后的 refreshSeries 重新映射覆盖。
+      patchEpisode(episodeId, (ep) => ({
+        ...ep,
+        archived: true,
+        reclaimable_bytes: 0,
+        disk_bytes: result.kept_bytes,
+        status: 'done',
+      }));
+      showToast(
+        `已清理过程文件，释放约 ${formatBytes(result.freed_bytes)}，仅保留成片`
+      );
+      void refreshSeries(seriesIdOf(episodeId));
+      return true;
+    } catch (err) {
+      reportError('清理过程文件失败', err);
+      return false;
+    }
+  };
+
+  /** Patch v4.11：作品级批量清理所有已出片话次的过程文件。 */
+  const handleCleanupSeriesIntermediates = async (
+    seriesId: string
+  ): Promise<boolean> => {
+    try {
+      const result = await apiFetch<SeriesCleanupResponse>(
+        `/series/${encodeURIComponent(seriesId)}/cleanup-intermediates`,
+        { method: 'POST' }
+      );
+      if (result.cleaned_count === 0) {
+        showToast('没有可清理的已出片话次');
+      } else {
+        showToast(
+          `已清理 ${result.cleaned_count} 话过程文件，释放约 ${formatBytes(
+            result.freed_bytes
+          )}`
+        );
+      }
+      void refreshSeries(seriesId);
+      return result.cleaned_count > 0;
+    } catch (err) {
+      reportError('批量清理过程文件失败', err);
+      return false;
+    }
+  };
+
   const handleTogglePanelBlank = async (episodeId: string, panelId: string) => {
     const episode = seriesRef.current
       .flatMap((s) => s.episodes)
@@ -1419,8 +1484,16 @@ export default function App() {
                     EP.{String(ep.episode_no).padStart(3, '0')}{' '}
                     {ep.title.replace(/^第 \d+ 话：/, '')}
                   </span>
-                  <span className="text-[11px] font-mono-tabular text-slate-400 shrink-0">
-                    {ep.stages.filter((s) => s.status === 'done').length}/8
+                  <span className="flex items-center gap-1 shrink-0">
+                    {ep.archived && (
+                      <Archive
+                        className="w-3.5 h-3.5 text-emerald-600"
+                        aria-label="已归档（仅留成片）"
+                      />
+                    )}
+                    <span className="text-[11px] font-mono-tabular text-slate-400">
+                      {ep.stages.filter((s) => s.status === 'done').length}/8
+                    </span>
                   </span>
                 </button>
               );
@@ -1449,6 +1522,23 @@ export default function App() {
                 ? '阿里云百炼模型与多音字词典'
                 : activeEpisode?.title ?? '未选择话次'}
             </span>
+            {navView === 'studio' && activeEpisode?.archived && (
+              <span
+                className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700 whitespace-nowrap shrink-0"
+                title="过程文件已清理，仅保留最终成片"
+              >
+                <Archive className="w-3 h-3" />
+                已归档（仅留成片）
+              </span>
+            )}
+            {navView === 'studio' &&
+              activeEpisode &&
+              (activeEpisode.disk_bytes ?? 0) > 0 && (
+                <span className="hidden md:inline-flex items-center gap-1 text-[11px] font-mono-tabular text-slate-400 whitespace-nowrap shrink-0">
+                  <HardDrive className="w-3 h-3" />
+                  {formatBytes(activeEpisode.disk_bytes)}
+                </span>
+              )}
           </div>
 
           <div className="flex items-center gap-3 shrink-0">
@@ -1585,6 +1675,7 @@ export default function App() {
               onExportEpisode={handleExportEpisode}
               onExportSeriesZip={handleExportSeriesZip}
               onUpdateEpisodeRenderOptions={handleUpdateEpisodeRenderOptions}
+              onCleanupSeriesIntermediates={handleCleanupSeriesIntermediates}
             />
           )}
 
@@ -1603,6 +1694,7 @@ export default function App() {
               onAutoPacing={handleAutoPacing}
               onUpdateEpisodeRenderOptions={handleUpdateEpisodeRenderOptions}
               onExportEpisode={handleExportEpisode}
+              onCleanupIntermediates={handleCleanupIntermediates}
             />
           )}
 

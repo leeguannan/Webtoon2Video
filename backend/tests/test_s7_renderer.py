@@ -31,6 +31,7 @@ from stages.s7_renderer import (
     _MAX_SCENES_PER_SEGMENT,
     RenderError,
     build_scene_filter,
+    dedupe_series_export_links,
     exports_dir_for,
     out_dir_for,
     probe_duration_ms,
@@ -288,7 +289,11 @@ def test_subtitle_only_shows_inside_its_time_window(rendered: tuple[Path, Render
 # 5. render_episode 双份落盘
 # --------------------------------------------------------------------------
 def test_render_episode_writes_both_copies(tmp_path: Path) -> None:
-    """``07_out/{episode_id}.mp4`` 与 ``exports/EP{话次:03d}_{title}.mp4`` 都要有。"""
+    """``07_out/{episode_id}.mp4`` 与 ``exports/EP{话次:03d}_{title}.mp4`` 都要有。
+
+    Patch v4.11：两份成片必须是**硬链接**（同 inode），同盘只占一份体积，
+    且渲染结束后 ``07_out/_work`` 工作目录被清理干净。
+    """
     episode_dir, _timeline = _make_workspace(tmp_path)
     out_path = render_episode(tmp_path, 1, ffmpeg_bin=FFMPEG_BIN, title="测试标题")
 
@@ -300,6 +305,101 @@ def test_render_episode_writes_both_copies(tmp_path: Path) -> None:
     assert export.is_file()
     assert export.stat().st_size > 0
     assert export.stat().st_size == out_path.stat().st_size
+    # 硬链接：同一 inode / 设备，链接计数为 2，不产生第二份磁盘占用。
+    assert os.path.samefile(out_path, export)
+    assert out_path.stat().st_ino == export.stat().st_ino
+    assert out_path.stat().st_dev == export.stat().st_dev
+    assert out_path.stat().st_nlink == 2
+    # 工作目录在成功路径上也必须被清掉。
+    assert not (out_dir_for(tmp_path, 1) / "_work").exists()
+
+
+def test_render_episode_clears_work_dir_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Patch v4.11：渲染中途异常时 ``finally`` 仍要清掉 ``07_out/_work``。
+
+    同时验证开跑前会先清掉上轮崩溃残留的工作目录（残留文件不会混进本次渲染）。
+    """
+    from stages import s7_renderer
+
+    episode_dir, _timeline = _make_workspace(tmp_path)
+    work_dir = out_dir_for(tmp_path, 1) / "_work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    stale_segment = work_dir / "seg_0000.mp4"
+    stale_segment.write_bytes(b"stale-crash-leftover")
+
+    def _boom(*args, **kwargs):
+        # 模拟分段渲染阶段崩溃：此时 work_dir 已被重新创建。
+        assert work_dir.is_dir()
+        raise RenderError("模拟渲染中途失败")
+
+    monkeypatch.setattr(s7_renderer, "render_timeline", _boom)
+
+    with pytest.raises(RenderError):
+        render_episode(tmp_path, 1, ffmpeg_bin=FFMPEG_BIN, title="测试标题")
+
+    # finally 必须清理整个工作目录，残留分段也不能留下。
+    assert not work_dir.exists()
+    assert not stale_segment.exists()
+
+
+def test_dedupe_series_export_links_merges_duplicate_copies(tmp_path: Path) -> None:
+    """Patch v4.11：既有的双份独立 MP4 在 dedupe 后合并为硬链接，只占一份体积。"""
+    series_dir = tmp_path / "wt_dedupe"
+    episode_dir = series_dir / "episodes" / "ep_001"
+    out_dir = episode_dir / "07_out"
+    exports_dir = series_dir / "exports"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    exports_dir.mkdir(parents=True, exist_ok=True)
+
+    out_path = out_dir / "wt_dedupe_ep_001.mp4"
+    export_path = exports_dir / "EP001_final.mp4"
+    payload = b"\x00" * 4096 + b"fake-mp4-payload"
+    out_path.write_bytes(payload)
+    # 先造成「两份独立副本、内容相同但 inode 不同」的历史状态。
+    shutil.copy2(out_path, export_path)
+    assert not os.path.samefile(out_path, export_path)
+    inode_before = out_path.stat().st_ino
+    disk_before = out_path.stat().st_size + export_path.stat().st_size
+
+    resolved = dedupe_series_export_links(series_dir, 1, episode_id="wt_dedupe_ep_001")
+
+    assert resolved == out_path
+    assert os.path.samefile(out_path, export_path)
+    assert export_path.stat().st_ino == inode_before  # 保留 07_out 原 inode，只重建 export
+    assert out_path.stat().st_nlink == 2
+    # 合并后两份路径逻辑大小之和仍是两份，但物理上只占一份。
+    assert out_path.stat().st_size + export_path.stat().st_size == disk_before
+
+
+def test_dedupe_series_export_links_restores_missing_out_copy(tmp_path: Path) -> None:
+    """Patch v4.11：07_out 成片丢失但 exports 还在时，反向硬链接恢复，不丢片。"""
+    series_dir = tmp_path / "wt_restore"
+    episode_dir = series_dir / "episodes" / "ep_001"
+    out_dir = episode_dir / "07_out"
+    exports_dir = series_dir / "exports"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    exports_dir.mkdir(parents=True, exist_ok=True)
+
+    export_path = exports_dir / "EP001_final.mp4"
+    export_path.write_bytes(b"fake-mp4" * 256)
+
+    resolved = dedupe_series_export_links(series_dir, 1, episode_id="wt_restore_ep_001")
+
+    out_path = out_dir / "wt_restore_ep_001.mp4"
+    assert resolved == out_path
+    assert out_path.is_file()
+    assert os.path.samefile(out_path, export_path)
+
+
+def test_dedupe_series_export_links_without_any_video(tmp_path: Path) -> None:
+    """Patch v4.11：07_out 与 exports 都没有成片时返回 None，不凭空造文件。"""
+    series_dir = tmp_path / "wt_empty"
+    (series_dir / "episodes" / "ep_001" / "07_out").mkdir(parents=True, exist_ok=True)
+    (series_dir / "exports").mkdir(parents=True, exist_ok=True)
+
+    assert dedupe_series_export_links(series_dir, 1, episode_id="wt_empty_ep_001") is None
 
 
 # --------------------------------------------------------------------------

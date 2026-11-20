@@ -217,6 +217,12 @@ export interface EpisodeItem {
   /** Patch v4.5：单话封页/结尾片包选项（后端缺省返回全默认值）。 */
   render_options?: EpisodeRenderOptions;
   logs: string[];
+  /** Patch v4.11：是否已清理过程文件（仅留成片）。 */
+  archived?: boolean;
+  /** Patch v4.11：话次目录当前占用字节。 */
+  disk_bytes?: number;
+  /** Patch v4.11：一键清理可回收字节（已归档话次为 0）。 */
+  reclaimable_bytes?: number;
 }
 
 export interface CharacterProfile {
@@ -368,6 +374,22 @@ export interface EpisodeResetResponse {
   preserved_human_storyboard: boolean;
   stages: StageProgress[];
   logs?: string[];
+}
+
+/** POST /api/episodes/{id}/cleanup-intermediates 的响应（Patch v4.11）。 */
+export interface EpisodeCleanupResponse {
+  episode_id: string;
+  freed_bytes: number;
+  kept_bytes: number;
+  archived: boolean;
+  episode: EpisodeItem;
+}
+
+/** POST /api/series/{id}/cleanup-intermediates 的批量响应（Patch v4.11）。 */
+export interface SeriesCleanupResponse {
+  cleaned_count: number;
+  freed_bytes: number;
+  skipped_episode_ids: string[];
 }
 
 // ---------------------------------------------------------------------------

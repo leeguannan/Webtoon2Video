@@ -31,6 +31,7 @@ label**——一旦两边都是图内 label，ffmpeg 会把 label 当成 *stream
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -190,6 +191,67 @@ def _safe_filename(name: str) -> str:
     """把标题清洗成可安全用作文件名的字符串。"""
     cleaned = _UNSAFE_NAME_CHARS.sub("_", str(name or "").strip())
     return cleaned.strip(". ") or "untitled"
+
+
+def _link_or_copy(src: str | Path, dst: str | Path) -> Path:
+    """把 ``src`` 落到 ``dst``：优先硬链接（同盘零额外占用），失败再复制。
+
+    Patch v4.11：``07_out`` 与 ``exports`` 双份成片改用硬链接，两个目录项
+    指向同一个 inode，只占一份体积。目标已存在时先移除，避免 ``os.link``
+    触发 ``FileExistsError``；硬链接抛 OSError（典型为跨文件系统 EXDEV 或
+    文件系统不支持）时回退 :func:`shutil.copy2`，保留复制元数据的旧行为。
+    """
+    src_path = Path(src)
+    dst_path = Path(dst)
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    if dst_path.exists() or dst_path.is_symlink():
+        dst_path.unlink()
+    try:
+        os.link(src_path, dst_path)
+    except OSError:
+        shutil.copy2(src_path, dst_path)
+    return dst_path
+
+
+def dedupe_series_export_links(
+    series_dir: str | Path,
+    episode_no: int,
+    *,
+    episode_id: str | None = None,
+) -> Path | None:
+    """合并本话 ``07_out`` 成片与 ``exports/EP{no}_*.mp4`` 为同一硬链接。
+
+    历史版本用复制双份落盘，同盘占两份体积。本函数以 ``07_out`` 成片为规范源，
+    把作品级导出重建为指向它的硬链接；若 ``07_out`` 成片缺失而 exports 仍在，
+    则反向恢复一份到 ``07_out``，保证清理过程文件后试看/导出入口不断。
+
+    返回规范成片路径；两侧都没有成片时返回 ``None``。
+    """
+    series_dir = Path(series_dir)
+    resolved_id = str(episode_id or f"ep_{int(episode_no):03d}")
+    out_dir = out_dir_for(series_dir, episode_no)
+    out_path = out_dir / f"{resolved_id}.mp4"
+    exports_dir = exports_dir_for(series_dir)
+    export_paths = sorted(exports_dir.glob(f"EP{int(episode_no):03d}_*.mp4"))
+
+    out_ready = out_path.is_file() and out_path.stat().st_size > 0
+    if not out_ready:
+        candidates = [p for p in export_paths if p.is_file() and p.stat().st_size > 0]
+        if not candidates:
+            return None
+        # 07_out 成片丢失：从 exports 反向恢复（优先硬链接，跨盘回退复制）。
+        _link_or_copy(candidates[0], out_path)
+
+    for export_path in export_paths:
+        if not export_path.is_file() or export_path.stat().st_size <= 0:
+            continue
+        try:
+            if os.path.samefile(out_path, export_path):
+                continue
+        except OSError:
+            pass
+        _link_or_copy(out_path, export_path)
+    return out_path
 
 
 # --------------------------------------------------------------------------
@@ -1969,145 +2031,148 @@ def render_episode(
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{resolved_episode_id}.mp4"
     work_dir = out_dir / "_work"
-
-    # ---- Patch v4.5：作品级封页写字 + 双结尾图片包（底图缺失只跳过、不中断）----
-    series_config = load_series_config(series_dir)
-    episode_options = load_episode_render_options(episode_dir)
-    effective = resolve_effective_branding(series_config, episode_options, series_dir)
-
-    cover_composed: Path | None = None
-    if effective.cover_enabled and effective.cover_image_path is not None:
-        try:
-            cover_composed = work_dir / "cover_composed.png"
-            render_cover_image(
-                effective.cover_image_path,
-                cover_composed,
-                episode_no=int(episode_no),
-                cover_text=effective.cover_text,
-                override_text=effective.cover_text_override,
-                width=settings.video.width,
-                height=settings.video.height,
-            )
-        except Exception as exc:  # noqa: BLE001 - 片包是增强项，失败只降级不阻断
-            print(f"[s7] 警告：封页渲染失败，本话跳过片头：{exc}")
-            cover_composed = None
-
-    outro_composed: Path | None = None
-    if effective.outro_mode != "none" and effective.outro_image_path is not None:
-        try:
-            outro_composed = work_dir / "outro_composed.png"
-            render_outro_image(
-                effective.outro_image_path,
-                outro_composed,
-                width=settings.video.width,
-                height=settings.video.height,
-            )
-        except Exception as exc:  # noqa: BLE001 - 片包是增强项，失败只降级不阻断
-            print(f"[s7] 警告：结尾图渲染失败，本话跳过片尾：{exc}")
-            outro_composed = None
-
-    # ---- Patch v4.7：按幕 BGM 多轨平滑混音（失败只降级，绝不阻断出片）----
-    # 与 render_timeline 内部夹取口径保持一致：片包实际生效时长。
-    eff_cover_ms = max(200, int(effective.cover_duration_ms)) if cover_composed else 0
-    eff_outro_ms = max(200, int(effective.outro_duration_ms)) if outro_composed else 0
-    bgm_pre_mixed = False
-    mixed_bgm_path: Path | None = None
-    mixed_bgm_gain = settings.render.bgm_gain_db
-    try:
-        if bgm_path:
-            # 显式传入 bgm_path 时以用户指定为准，不进入按幕多轨逻辑。
-            storyboard = None
-        else:
-            storyboard = load_storyboard(storyboard_path_for(episode_dir))
-        if storyboard is not None:
-            spans = build_scene_bgm_spans(
-                storyboard,
-                timeline,
-                series_dir=series_dir,
-                series_config=series_config,
-                settings=settings,
-                cover_duration_ms=eff_cover_ms,
-                outro_duration_ms=eff_outro_ms,
-            )
-            if spans:
-                distinct_keys = {
-                    (span.bgm_path, round(span.gain_db, 1)) for span in spans
-                }
-                has_silent = any(span.bgm_path is None for span in spans)
-                if len(distinct_keys) >= 2 or has_silent:
-                    extended_total_s = (
-                        int(timeline.total_duration_ms or 0)
-                        + eff_cover_ms
-                        + eff_outro_ms
-                    ) / 1000.0
-                    mixed_bgm_path = work_dir / "multi_bgm.wav"
-                    synthesized = synthesize_multi_bgm_wav(
-                        spans,
-                        total_s=extended_total_s,
-                        out_path=mixed_bgm_path,
-                        ffmpeg_bin=resolved_ffmpeg,
-                    )
-                    if synthesized is not None:
-                        # 预合成轨已含各幕响度归一/增益/淡化，下游不再重复施加。
-                        resolved_bgm = synthesized
-                        mixed_bgm_gain = 0.0
-                        bgm_pre_mixed = True
-                        print(
-                            f"[s7] 按幕 BGM 预合成：{len(spans)} 段、"
-                            f"{len(distinct_keys)} 种曲目/增益，静音幕 "
-                            f"{sum(1 for span in spans if span.bgm_path is None)}"
-                        )
-                    else:
-                        # 全部幕都显式静音：本话不铺 BGM。
-                        resolved_bgm = None
-                else:
-                    # 单一曲目单一增益：直接复用单曲链路，零额外合成开销。
-                    only = spans[0]
-                    resolved_bgm = only.bgm_path
-                    mixed_bgm_gain = only.gain_db
-    except Exception as exc:  # noqa: BLE001 - 按幕配乐是增强项，失败回退单曲逻辑
-        print(f"[s7] 警告：按幕 BGM 处理失败，回退单曲配乐：{exc}")
-        bgm_pre_mixed = False
-
-    render_timeline(
-        timeline,
-        episode_dir=episode_dir,
-        out_path=out_path,
-        bgm_path=resolved_bgm,
-        ffmpeg_bin=resolved_ffmpeg,
-        background_blur=settings.render.background_blur,
-        background_darken=settings.render.background_darken,
-        bgm_gain_db=mixed_bgm_gain,
-        work_dir=work_dir,
-        enable_sfx=settings.render.enable_sfx,
-        sfx_gain_db=settings.render.sfx_gain_db,
-        video_preset=settings.render.video_preset,
-        video_crf=settings.render.video_crf,
-        video_bitrate=settings.render.video_bitrate,
-        video_maxrate=settings.render.video_maxrate,
-        video_bufsize=settings.render.video_bufsize,
-        cover_png=cover_composed,
-        cover_duration_ms=effective.cover_duration_ms,
-        cover_fade_in_ms=effective.cover_fade_in_ms,
-        cover_fade_out_ms=effective.cover_fade_out_ms,
-        outro_png=outro_composed,
-        outro_duration_ms=effective.outro_duration_ms,
-        outro_fade_in_ms=effective.outro_fade_in_ms,
-        outro_fade_out_ms=effective.outro_fade_out_ms,
-        bgm_fade_in_ms=effective.cover_fade_in_ms if cover_composed is not None else 0,
-        bgm_fade_out_ms=effective.outro_fade_out_ms if outro_composed is not None else 0,
-        bgm_pre_mixed=bgm_pre_mixed,
-    )
-
-    # 清理中间音频，避免污染 07_out。
+    # Patch v4.11：开跑前先清上轮崩溃残留的工作目录，避免旧分段/临时音轨混入本次渲染。
     shutil.rmtree(work_dir, ignore_errors=True)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        # ---- Patch v4.5：作品级封页写字 + 双结尾图片包（底图缺失只跳过、不中断）----
+        series_config = load_series_config(series_dir)
+        episode_options = load_episode_render_options(episode_dir)
+        effective = resolve_effective_branding(series_config, episode_options, series_dir)
 
-    # ---- 双份落盘：07_out/ + exports/（Patch v2.5-3：EP{话次:03d}_{安全标题}.mp4） ----
-    resolved_title = title or _series_title(series_dir) or resolved_episode_id
-    exports_dir = exports_dir_for(series_dir)
-    exports_dir.mkdir(parents=True, exist_ok=True)
-    export_path = exports_dir / f"EP{int(episode_no):03d}_{_safe_filename(resolved_title)}.mp4"
-    shutil.copy2(out_path, export_path)
+        cover_composed: Path | None = None
+        if effective.cover_enabled and effective.cover_image_path is not None:
+            try:
+                cover_composed = work_dir / "cover_composed.png"
+                render_cover_image(
+                    effective.cover_image_path,
+                    cover_composed,
+                    episode_no=int(episode_no),
+                    cover_text=effective.cover_text,
+                    override_text=effective.cover_text_override,
+                    width=settings.video.width,
+                    height=settings.video.height,
+                )
+            except Exception as exc:  # noqa: BLE001 - 片包是增强项，失败只降级不阻断
+                print(f"[s7] 警告：封页渲染失败，本话跳过片头：{exc}")
+                cover_composed = None
+
+        outro_composed: Path | None = None
+        if effective.outro_mode != "none" and effective.outro_image_path is not None:
+            try:
+                outro_composed = work_dir / "outro_composed.png"
+                render_outro_image(
+                    effective.outro_image_path,
+                    outro_composed,
+                    width=settings.video.width,
+                    height=settings.video.height,
+                )
+            except Exception as exc:  # noqa: BLE001 - 片包是增强项，失败只降级不阻断
+                print(f"[s7] 警告：结尾图渲染失败，本话跳过片尾：{exc}")
+                outro_composed = None
+
+        # ---- Patch v4.7：按幕 BGM 多轨平滑混音（失败只降级，绝不阻断出片）----
+        # 与 render_timeline 内部夹取口径保持一致：片包实际生效时长。
+        eff_cover_ms = max(200, int(effective.cover_duration_ms)) if cover_composed else 0
+        eff_outro_ms = max(200, int(effective.outro_duration_ms)) if outro_composed else 0
+        bgm_pre_mixed = False
+        mixed_bgm_path: Path | None = None
+        mixed_bgm_gain = settings.render.bgm_gain_db
+        try:
+            if bgm_path:
+                # 显式传入 bgm_path 时以用户指定为准，不进入按幕多轨逻辑。
+                storyboard = None
+            else:
+                storyboard = load_storyboard(storyboard_path_for(episode_dir))
+            if storyboard is not None:
+                spans = build_scene_bgm_spans(
+                    storyboard,
+                    timeline,
+                    series_dir=series_dir,
+                    series_config=series_config,
+                    settings=settings,
+                    cover_duration_ms=eff_cover_ms,
+                    outro_duration_ms=eff_outro_ms,
+                )
+                if spans:
+                    distinct_keys = {
+                        (span.bgm_path, round(span.gain_db, 1)) for span in spans
+                    }
+                    has_silent = any(span.bgm_path is None for span in spans)
+                    if len(distinct_keys) >= 2 or has_silent:
+                        extended_total_s = (
+                            int(timeline.total_duration_ms or 0)
+                            + eff_cover_ms
+                            + eff_outro_ms
+                        ) / 1000.0
+                        mixed_bgm_path = work_dir / "multi_bgm.wav"
+                        synthesized = synthesize_multi_bgm_wav(
+                            spans,
+                            total_s=extended_total_s,
+                            out_path=mixed_bgm_path,
+                            ffmpeg_bin=resolved_ffmpeg,
+                        )
+                        if synthesized is not None:
+                            # 预合成轨已含各幕响度归一/增益/淡化，下游不再重复施加。
+                            resolved_bgm = synthesized
+                            mixed_bgm_gain = 0.0
+                            bgm_pre_mixed = True
+                            print(
+                                f"[s7] 按幕 BGM 预合成：{len(spans)} 段、"
+                                f"{len(distinct_keys)} 种曲目/增益，静音幕 "
+                                f"{sum(1 for span in spans if span.bgm_path is None)}"
+                            )
+                        else:
+                            # 全部幕都显式静音：本话不铺 BGM。
+                            resolved_bgm = None
+                    else:
+                        # 单一曲目单一增益：直接复用单曲链路，零额外合成开销。
+                        only = spans[0]
+                        resolved_bgm = only.bgm_path
+                        mixed_bgm_gain = only.gain_db
+        except Exception as exc:  # noqa: BLE001 - 按幕配乐是增强项，失败回退单曲逻辑
+            print(f"[s7] 警告：按幕 BGM 处理失败，回退单曲配乐：{exc}")
+            bgm_pre_mixed = False
+
+        render_timeline(
+            timeline,
+            episode_dir=episode_dir,
+            out_path=out_path,
+            bgm_path=resolved_bgm,
+            ffmpeg_bin=resolved_ffmpeg,
+            background_blur=settings.render.background_blur,
+            background_darken=settings.render.background_darken,
+            bgm_gain_db=mixed_bgm_gain,
+            work_dir=work_dir,
+            enable_sfx=settings.render.enable_sfx,
+            sfx_gain_db=settings.render.sfx_gain_db,
+            video_preset=settings.render.video_preset,
+            video_crf=settings.render.video_crf,
+            video_bitrate=settings.render.video_bitrate,
+            video_maxrate=settings.render.video_maxrate,
+            video_bufsize=settings.render.video_bufsize,
+            cover_png=cover_composed,
+            cover_duration_ms=effective.cover_duration_ms,
+            cover_fade_in_ms=effective.cover_fade_in_ms,
+            cover_fade_out_ms=effective.cover_fade_out_ms,
+            outro_png=outro_composed,
+            outro_duration_ms=effective.outro_duration_ms,
+            outro_fade_in_ms=effective.outro_fade_in_ms,
+            outro_fade_out_ms=effective.outro_fade_out_ms,
+            bgm_fade_in_ms=effective.cover_fade_in_ms if cover_composed is not None else 0,
+            bgm_fade_out_ms=effective.outro_fade_out_ms if outro_composed is not None else 0,
+            bgm_pre_mixed=bgm_pre_mixed,
+        )
+
+        # ---- 双份落盘：07_out/ + exports/（Patch v2.5-3：EP{话次:03d}_{安全标题}.mp4） ----
+        resolved_title = title or _series_title(series_dir) or resolved_episode_id
+        exports_dir = exports_dir_for(series_dir)
+        exports_dir.mkdir(parents=True, exist_ok=True)
+        export_path = exports_dir / f"EP{int(episode_no):03d}_{_safe_filename(resolved_title)}.mp4"
+        _link_or_copy(out_path, export_path)
+    finally:
+        # Patch v4.11：成功或异常都清 07_out/_work，杜绝工作目录残留占盘。
+        shutil.rmtree(work_dir, ignore_errors=True)
     return out_path
 
 
@@ -2132,6 +2197,7 @@ __all__ = [
     "RenderError",
     "build_scene_bgm_spans",
     "build_scene_filter",
+    "dedupe_series_export_links",
     "exports_dir_for",
     "list_bgm_library",
     "out_dir_for",

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,6 +61,48 @@ STAGE_ARTIFACT_RULES: dict[str, tuple[str, str, str]] = {
 
 _IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"})
 
+#: 一键归档（只留成片）时要清空的话次级过程目录；目录本身保留，仅清内部内容。
+#: 其中 ``03b_scenes`` 是 Patch v4.0 后的分镜产物，不属于 STAGE_DIR_NAMES 七段映射，
+#: 故在此按字面量维护。
+ARCHIVE_INTERMEDIATE_DIRS: tuple[str, ...] = (
+    "01_raw",
+    "02_panels",
+    "03_vision",
+    "03b_scenes",
+    "04_script",
+    "05_audio",
+    "06_plan",
+)
+
+
+def dir_size(path: Path) -> int:
+    """递归统计目录内全部文件的逻辑字节数（不跟随符号链接）。"""
+    if not path.is_dir():
+        return 0
+    total = 0
+    for child in path.rglob("*"):
+        if child.is_file() and not child.is_symlink():
+            try:
+                total += child.stat().st_size
+            except OSError:  # pragma: no cover - 权限/竞态不应阻断统计
+                continue
+    return total
+
+
+def _hardlink_or_copy(src: Path, dst: Path) -> None:
+    """把 ``src`` 落到 ``dst``：优先硬链接（同盘零额外占用），失败再复制。
+
+    与 ``stages.s7_renderer._link_or_copy`` 同构；core 层不反向依赖 stages，
+    故在此保留一份等价实现。
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists() or dst.is_symlink():
+        dst.unlink()
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
 
 def utc_now() -> str:
     """当前 UTC 时间（ISO-8601，秒精度）。"""
@@ -89,6 +132,11 @@ class EpisodeManifest(BaseModel):
     stages: dict[str, ManifestEntry] = Field(default_factory=dict)
     created_at: str = ""
     updated_at: str = ""
+    # Patch v4.11：一键清理过程文件（只留成片）后的归档标记。
+    # 旧 manifest 没有这三个键，靠默认值向后兼容，extra="forbid" 不受影响。
+    archived: bool = False
+    archived_at: str | None = None
+    archived_duration_ms: int = 0
 
 
 class ManifestManager:
@@ -289,6 +337,10 @@ class ManifestManager:
         manifest = self.load(episode_no)
         for stage in affected:
             manifest.stages.pop(stage, None)
+        # Patch v4.11：任何阶段重跑都会重建过程产物，归档标记自动失效。
+        manifest.archived = False
+        manifest.archived_at = None
+        manifest.archived_duration_ms = 0
         self.save(manifest)
 
         return {
@@ -298,6 +350,147 @@ class ManifestManager:
             "cleared_stages": list(affected),
             "removed_count": removed,
             "preserved_human_storyboard": preserved_human_storyboard,
+        }
+
+    # ------------------------------------------------------------------
+    # 一键归档：清理过程文件、只留成片（Patch v4.11）
+    # ------------------------------------------------------------------
+    def archive_episode_keep_video(
+        self,
+        episode_no: int,
+        *,
+        duration_ms: int = 0,
+    ) -> dict[str, Any]:
+        """清理本话全部过程文件，只保留最终成片，并把 manifest 标为已归档。
+
+        前置条件（防误删）：
+
+        * ``07_out/{episode_id}.mp4`` 或作品级 ``exports/EP{no:03d}_*.mp4``
+          至少有一份真实存在且非空，两者皆无直接抛 :class:`ValueError`；
+        * 只有 exports 有成片时，先反向恢复一份到 ``07_out``，保证试看入口不断。
+
+        清理范围（目录本身保留，仅清内部内容）：
+
+        * ``01_raw`` / ``02_panels`` / ``03_vision`` / ``03b_scenes`` /
+          ``04_script`` / ``05_audio`` / ``06_plan``；
+        * ``07_out/_work`` 渲染工作目录；
+        * ``bible_snapshots/ep_{no:03d}.json`` 本话快照。
+
+        明确不碰：``07_out/*.mp4`` 成片、本话 ``manifest.json``、
+        作品级 ``story_bible.json``（后续话次的剧情记忆）。
+
+        清理后把 ``07_out`` 与 ``exports`` 两份成片合并为同一硬链接，
+        同盘只占一份体积。返回释放/保留字节数与归档时长。
+        """
+        episode_dir = self.episode_dir(episode_no)
+        out_dir = episode_dir / STAGE_DIR_NAMES["s7_renderer"]
+        exports_dir = self.series_dir / "exports"
+        export_prefix = f"EP{episode_no:03d}_"
+
+        manifest = self.load(episode_no)
+        resolved_id = manifest.episode_id or self.episode_id(episode_no)
+        out_path = out_dir / f"{resolved_id}.mp4"
+        export_paths = (
+            sorted(
+                p
+                for p in exports_dir.glob(f"{export_prefix}*.mp4")
+                if p.is_file() and p.stat().st_size > 0
+            )
+            if exports_dir.is_dir()
+            else []
+        )
+        out_ready = out_path.is_file() and out_path.stat().st_size > 0
+        if not out_ready:
+            # 兼容历史异名成片：07_out 下任意非空 mp4 都视为规范成片。
+            out_candidates = sorted(
+                p
+                for p in out_dir.glob("*.mp4")
+                if p.is_file() and p.stat().st_size > 0
+            )
+            if out_candidates:
+                out_path = out_candidates[0]
+                out_ready = True
+
+        if not out_ready and not export_paths:
+            raise ValueError(
+                f"ep_{episode_no:03d} 没有可用成片（07_out 与 exports 均缺失或为空），"
+                "拒绝清理过程文件"
+            )
+
+        # 先提时长：传入值优先，其次读即将被清掉的 06_plan/timeline.json。
+        effective_duration = int(duration_ms or 0)
+        if effective_duration <= 0:
+            timeline_path = (
+                episode_dir / STAGE_DIR_NAMES["s6_timeline"] / "timeline.json"
+            )
+            if timeline_path.is_file():
+                try:
+                    payload = json.loads(timeline_path.read_text(encoding="utf-8"))
+                    effective_duration = int(payload.get("total_duration_ms") or 0)
+                except (OSError, ValueError):
+                    effective_duration = 0
+
+        bytes_before = dir_size(episode_dir)
+
+        # 07_out 成片丢失而 exports 还在：反向恢复，保证两个入口都可用。
+        if not out_ready:
+            _hardlink_or_copy(export_paths[0], out_path)
+
+        # 清理过程目录内容（保留空目录）。
+        for dirname in ARCHIVE_INTERMEDIATE_DIRS:
+            target = episode_dir / dirname
+            if not target.is_dir():
+                continue
+            for child in sorted(target.iterdir()):
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    try:
+                        child.unlink()
+                    except OSError:  # pragma: no cover - 权限异常不阻断整体清理
+                        pass
+
+        # 渲染工作目录（07_out/_work）与本话剧情快照；成片与 manifest 不动。
+        shutil.rmtree(out_dir / "_work", ignore_errors=True)
+        snapshot = (
+            self.series_dir / "bible_snapshots" / f"ep_{episode_no:03d}.json"
+        )
+        if snapshot.is_file():
+            try:
+                snapshot.unlink()
+            except OSError:  # pragma: no cover
+                pass
+
+        # 双份成片合并为硬链接：非同一 inode 时以 07_out 为规范源重建。
+        for export_path in export_paths:
+            try:
+                if os.path.samefile(out_path, export_path):
+                    continue
+            except OSError:
+                pass
+            _hardlink_or_copy(out_path, export_path)
+
+        bytes_after = dir_size(episode_dir)
+        freed_bytes = max(0, bytes_before - bytes_after)
+        kept_bytes = sum(
+            p.stat().st_size
+            for p in out_dir.glob("*.mp4")
+            if p.is_file() and not p.is_symlink()
+        )
+
+        manifest.archived = True
+        manifest.archived_at = utc_now()
+        manifest.archived_duration_ms = effective_duration
+        self.save(manifest)
+
+        return {
+            "episode_id": self.episode_id(episode_no),
+            "episode_no": episode_no,
+            "archived": True,
+            "archived_at": manifest.archived_at,
+            "archived_duration_ms": effective_duration,
+            "freed_bytes": freed_bytes,
+            "kept_bytes": kept_bytes,
         }
 
 

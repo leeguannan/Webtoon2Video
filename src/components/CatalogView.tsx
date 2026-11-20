@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import {
+  Archive,
   CheckCircle2,
   Clock,
   Download,
@@ -19,6 +20,7 @@ import type {
   SeriesItem,
 } from '../types/studio';
 import { formatMs, parseEpisodeRangeExpression } from '../utils/pronunciation';
+import { formatBytes } from '../utils/format';
 import { SeriesBrandingPanel } from './SeriesBrandingPanel';
 import { SeriesTtsPanel } from './SeriesTtsPanel';
 
@@ -34,6 +36,8 @@ interface CatalogViewProps {
   onExportEpisode: (episodeId: string, format: 'mp4' | 'ass' | 'script') => void;
   onExportSeriesZip: (seriesId: string) => void;
   onUpdateEpisodeRenderOptions: (episodeId: string, options: EpisodeRenderOptions) => void;
+  /** Patch v4.11：作品级批量清理已出片话次的过程文件，返回是否实际清理了话次。 */
+  onCleanupSeriesIntermediates?: (seriesId: string) => Promise<boolean>;
 }
 
 const OUTRO_MODE_OPTIONS: Array<{ value: OutroMode; label: string }> = [
@@ -57,10 +61,14 @@ export const CatalogView: React.FC<CatalogViewProps> = ({
   onExportEpisode,
   onExportSeriesZip,
   onUpdateEpisodeRenderOptions,
+  onCleanupSeriesIntermediates,
 }) => {
   const [urlInput, setUrlInput] = useState(series.list_url);
   const [rangeInput, setRangeInput] = useState('1-3');
   const [filter, setFilter] = useState<StatusFilter>('all');
+  /** Patch v4.11：批量清理的内联二次确认条与忙碌态。 */
+  const [cleanupConfirm, setCleanupConfirm] = useState(false);
+  const [cleanupBusy, setCleanupBusy] = useState(false);
 
   const filteredEpisodes = series.episodes.filter((ep) => {
     if (filter === 'done') return ep.status === 'done' && !ep.is_locked;
@@ -74,6 +82,30 @@ export const CatalogView: React.FC<CatalogViewProps> = ({
   const renderedCount = series.episodes.filter(
     (e) => e.stages.find((s) => s.id === 's7_renderer')?.status === 'done'
   ).length;
+
+  // Patch v4.11：可一键清理的话次 = 已出片、未归档、非运行中；汇总可回收空间。
+  const cleanableEpisodes = series.episodes.filter(
+    (e) =>
+      e.stages.find((s) => s.id === 's7_renderer')?.status === 'done' &&
+      !e.archived &&
+      e.status !== 'running' &&
+      e.status !== 'queued'
+  );
+  const reclaimableTotal = cleanableEpisodes.reduce(
+    (sum, ep) => sum + (ep.reclaimable_bytes ?? 0),
+    0
+  );
+
+  const handleConfirmSeriesCleanup = async () => {
+    if (!onCleanupSeriesIntermediates) return;
+    setCleanupBusy(true);
+    try {
+      const ok = await onCleanupSeriesIntermediates(series.series_id);
+      if (ok) setCleanupConfirm(false);
+    } finally {
+      setCleanupBusy(false);
+    }
+  };
 
   const handleApplyRange = (e: React.FormEvent) => {
     e.preventDefault();
@@ -301,8 +333,65 @@ export const CatalogView: React.FC<CatalogViewProps> = ({
               <Download className="w-3.5 h-3.5" />
               打包导出成片 ({renderedCount})
             </button>
+
+            <button
+              type="button"
+              disabled={cleanableEpisodes.length === 0 || cleanupBusy || !onCleanupSeriesIntermediates}
+              onClick={() => setCleanupConfirm(true)}
+              title="清理已出片话次的过程文件，只保留最终成片"
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:border-amber-400 hover:text-amber-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <Archive className="w-3.5 h-3.5" />
+              一键清理已出片过程文件 ({cleanableEpisodes.length})
+            </button>
           </div>
         </div>
+
+        {/* Patch v4.11：作品级批量清理的内联二次确认（不用 window.confirm） */}
+        {cleanupConfirm && (
+          <div className="mx-5 mb-4 p-3.5 rounded-lg border border-amber-200 bg-amber-50/70 text-xs text-amber-900">
+            <div className="flex items-start gap-2">
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600" />
+              <div className="flex-1 space-y-2">
+                <p className="font-medium">
+                  确认批量清理 {cleanableEpisodes.length} 话的过程文件、只保留最终成片？
+                  {reclaimableTotal > 0 && (
+                    <>
+                      预计共释放约{' '}
+                      <span className="font-mono-tabular">{formatBytes(reclaimableTotal)}</span>
+                      。
+                    </>
+                  )}
+                </p>
+                <ul className="list-disc pl-4 space-y-0.5 text-amber-800/90">
+                  <li>删除各话原始截图、切图、识图、分镜、剧本、配音与时间轴等过程目录，9:16 成片完整保留，试看与导出不受影响。</li>
+                  <li>作品级剧情记忆（story_bible.json）保留，不影响后续集数的记忆连贯。</li>
+                  <li>运行中与已归档的话次自动跳过；07_out 与 exports 两份成片合并为硬链接，同盘只占一份体积。</li>
+                  <li>日后需要修改某一话时，得从 Stage 1 重新跑完整流水线。</li>
+                </ul>
+                <div className="flex items-center gap-2 pt-0.5">
+                  <button
+                    type="button"
+                    disabled={cleanupBusy}
+                    onClick={() => void handleConfirmSeriesCleanup()}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-amber-600 rounded hover:bg-amber-700 transition-colors cursor-pointer disabled:opacity-50"
+                  >
+                    {cleanupBusy && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                    确认清理 {cleanableEpisodes.length} 话
+                  </button>
+                  <button
+                    type="button"
+                    disabled={cleanupBusy}
+                    onClick={() => setCleanupConfirm(false)}
+                    className="px-3 py-1.5 text-xs font-medium text-slate-600 bg-white border border-slate-200 rounded hover:bg-slate-50 transition-colors cursor-pointer disabled:opacity-50"
+                  >
+                    取消
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Scheduling Topology Hint */}
         <div className="px-5 py-2.5 bg-slate-50 border-b border-slate-200 text-xs text-slate-600 flex flex-wrap items-center justify-between gap-2">

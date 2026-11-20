@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Archive,
   CheckCircle2,
   Clock,
   Download,
@@ -7,6 +8,7 @@ import {
   FileText,
   Film,
   FolderOutput,
+  HardDrive,
   Loader2,
   Pause,
   Play,
@@ -38,6 +40,7 @@ import type {
   VoiceOption,
 } from '../types/studio';
 import { formatMs, playPreviewTone, resolveSpokenText } from '../utils/pronunciation';
+import { formatBytes } from '../utils/format';
 import { PanelZoomModal, type RoleOption, type SaveStatus } from './PanelZoomModal';
 import { StoryboardEditor } from './StoryboardEditor';
 import BgmLibraryDrawer from './BgmLibraryDrawer';
@@ -74,6 +77,8 @@ interface EpisodeStudioViewProps {
     options: EpisodeRenderOptions
   ) => Promise<void> | void;
   onExportEpisode: (episodeId: string, format: 'mp4' | 'ass' | 'script') => void;
+  /** Patch v4.11：一键清理过程文件（只留成片），返回是否成功。 */
+  onCleanupIntermediates?: (episodeId: string) => Promise<boolean>;
 }
 
 const DEFAULT_RENDER_OPTIONS: EpisodeRenderOptions = {
@@ -124,6 +129,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   onAutoPacing,
   onUpdateEpisodeRenderOptions,
   onExportEpisode,
+  onCleanupIntermediates,
 }) => {
   const [activeTab, setActiveTab] = useState<StudioTab>('script');
 
@@ -365,6 +371,9 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   const [resetTarget, setResetTarget] = useState<StageId | null>(null);
   const [resetIncludeHuman, setResetIncludeHuman] = useState(false);
   const [resetBusy, setResetBusy] = useState(false);
+  /** Patch v4.11：一键清理过程文件的内联二次确认条与忙碌态。 */
+  const [cleanupConfirm, setCleanupConfirm] = useState(false);
+  const [cleanupBusy, setCleanupBusy] = useState(false);
 
   // ---- Patch v4.8：重跑前草稿防残留保护 ----
   /** 句间停顿被改动过：必须先重建时间轴（S6）再出片，跳过 S6 会吃到旧停顿。 */
@@ -1272,6 +1281,18 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     }
   }, [episode.episode_id, onResetFromStage, resetIncludeHuman, resetTarget]);
 
+  /** Patch v4.11：确认清理过程文件（只留成片）。 */
+  const handleConfirmCleanup = useCallback(async () => {
+    if (!onCleanupIntermediates) return;
+    setCleanupBusy(true);
+    try {
+      const ok = await onCleanupIntermediates(episode.episode_id);
+      if (ok) setCleanupConfirm(false);
+    } finally {
+      setCleanupBusy(false);
+    }
+  }, [episode.episode_id, onCleanupIntermediates]);
+
   return (
     <div className="space-y-6">
       {/* 8-Step Interactive Pipeline Stepper */}
@@ -1418,6 +1439,99 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                       setResetTarget(null);
                       setResetIncludeHuman(false);
                     }}
+                    className="px-3 py-1.5 text-xs font-medium text-slate-600 bg-white border border-slate-200 rounded hover:bg-slate-50 transition-colors cursor-pointer disabled:opacity-50"
+                  >
+                    取消
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Patch v4.11：磁盘占用与一键清理过程文件（只留成片） */}
+        <div className="mt-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 rounded-lg border border-slate-200 bg-slate-50/60 px-3.5 py-3">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-600">
+            <HardDrive className="w-4 h-4 text-slate-400 shrink-0" />
+            <span>
+              磁盘占用{' '}
+              <span className="font-mono-tabular font-semibold text-slate-800">
+                {formatBytes(episode.disk_bytes)}
+              </span>
+            </span>
+            {episode.archived ? (
+              <span className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700">
+                <Archive className="w-3 h-3" />
+                已归档（仅留成片）
+              </span>
+            ) : (
+              (episode.reclaimable_bytes ?? 0) > 0 && (
+                <span>
+                  · 清理可释放约{' '}
+                  <span className="font-mono-tabular font-semibold text-amber-700">
+                    {formatBytes(episode.reclaimable_bytes)}
+                  </span>
+                </span>
+              )
+            )}
+          </div>
+          {!episode.archived && (
+            <button
+              type="button"
+              disabled={
+                !isVideoReady ||
+                episode.status === 'running' ||
+                episode.status === 'queued' ||
+                cleanupBusy ||
+                !onCleanupIntermediates
+              }
+              onClick={() => setCleanupConfirm(true)}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded hover:border-amber-400 hover:text-amber-700 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <Archive className="w-3.5 h-3.5" />
+              清理过程文件（只留成片）
+            </button>
+          )}
+        </div>
+
+        {/* Patch v4.11：清理过程文件的内联二次确认（不用 window.confirm） */}
+        {cleanupConfirm && (
+          <div className="mt-3 p-3.5 rounded-lg border border-amber-200 bg-amber-50/70 text-xs text-amber-900">
+            <div className="flex items-start gap-2">
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600" />
+              <div className="flex-1 space-y-2">
+                <p className="font-medium">
+                  确认清理本话过程文件、只保留最终成片？
+                  {(episode.reclaimable_bytes ?? 0) > 0 && (
+                    <>
+                      预计释放约{' '}
+                      <span className="font-mono-tabular">
+                        {formatBytes(episode.reclaimable_bytes)}
+                      </span>
+                      。
+                    </>
+                  )}
+                </p>
+                <ul className="list-disc pl-4 space-y-0.5 text-amber-800/90">
+                  <li>删除原始截图、切图、识图、分镜、剧本、配音与时间轴等过程目录，9:16 成片完整保留，试看与导出不受影响。</li>
+                  <li>作品级剧情记忆（story_bible.json）保留，不影响后续集数的记忆连贯。</li>
+                  <li>07_out 与 exports 两份成片会合并为硬链接，同盘只占一份体积。</li>
+                  <li>日后需要修改本集时，得从 Stage 1 重新跑完整流水线。</li>
+                </ul>
+                <div className="flex items-center gap-2 pt-0.5">
+                  <button
+                    type="button"
+                    disabled={cleanupBusy}
+                    onClick={() => void handleConfirmCleanup()}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-amber-600 rounded hover:bg-amber-700 transition-colors cursor-pointer disabled:opacity-50"
+                  >
+                    {cleanupBusy && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                    确认清理
+                  </button>
+                  <button
+                    type="button"
+                    disabled={cleanupBusy}
+                    onClick={() => setCleanupConfirm(false)}
                     className="px-3 py-1.5 text-xs font-medium text-slate-600 bg-white border border-slate-200 rounded hover:bg-slate-50 transition-colors cursor-pointer disabled:opacity-50"
                   >
                     取消
