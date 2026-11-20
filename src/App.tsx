@@ -20,6 +20,7 @@ import {
 import type {
   ArcSummary,
   AutoPacingResponse,
+  BeatRegenerateTTSResponse,
   CharacterProfile,
   EpisodeCleanupResponse,
   EpisodeDigest,
@@ -981,6 +982,49 @@ export default function App() {
     }
   };
 
+  /** Patch v4.12：单句重配 TTS（可选顺带从 S6 重新出片），返回后端响应，失败返回 null。 */
+  const handleRegenerateBeatTts = useCallback(
+    async (
+      episodeId: string,
+      beatId: string,
+      beat: ScriptBeat,
+      rerunFromS6: boolean
+    ): Promise<BeatRegenerateTTSResponse | null> => {
+      try {
+        const result = await apiFetch<BeatRegenerateTTSResponse>(
+          `/episodes/${encodeURIComponent(episodeId)}/beats/${encodeURIComponent(
+            beatId
+          )}/regenerate-tts`,
+          {
+            method: 'POST',
+            body: JSON.stringify({ beat, rerun_from_s6: rerunFromS6 }),
+          }
+        );
+        // Patch v4.12：只刷新该句的基准状态（含新的 audio_duration_ms），
+        // 其余句子保持原样，避免冲掉用户在其它句子上的未保存草稿。
+        patchEpisode(episodeId, (ep) => ({
+          ...ep,
+          beats: ep.beats.map((beat) => {
+            if (beat.beat_id !== beatId) return beat;
+            const updated = result.beats.find((b) => b.beat_id === beatId);
+            return updated ? { ...beat, ...updated } : beat;
+          }),
+        }));
+        if (result.job) {
+          showToast(`已重配 ${beatId}，并提交从 Stage 6 重新出片任务`);
+        } else {
+          showToast(`已重配 ${beatId} 的配音，可试听后从 Stage 6 重跑出新成片`);
+        }
+        void refreshSeries(seriesIdOf(episodeId));
+        return result;
+      } catch (err) {
+        reportError('单句重配失败', err);
+        return null;
+      }
+    },
+    [patchEpisode]
+  );
+
   /** Patch v4.11：作品级批量清理所有已出片话次的过程文件。 */
   const handleCleanupSeriesIntermediates = async (
     seriesId: string
@@ -1695,6 +1739,7 @@ export default function App() {
               onUpdateEpisodeRenderOptions={handleUpdateEpisodeRenderOptions}
               onExportEpisode={handleExportEpisode}
               onCleanupIntermediates={handleCleanupIntermediates}
+              onRegenerateBeatTts={handleRegenerateBeatTts}
             />
           )}
 

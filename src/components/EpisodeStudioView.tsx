@@ -25,6 +25,7 @@ import {
 import type {
   AutoPacingResponse,
   AutoPacingSummary,
+  BeatRegenerateTTSResponse,
   BgmLibraryResponse,
   CameraMotion,
   EpisodeItem,
@@ -79,6 +80,13 @@ interface EpisodeStudioViewProps {
   onExportEpisode: (episodeId: string, format: 'mp4' | 'ass' | 'script') => void;
   /** Patch v4.11：一键清理过程文件（只留成片），返回是否成功。 */
   onCleanupIntermediates?: (episodeId: string) => Promise<boolean>;
+  /** Patch v4.12：单句重配 TTS，rerunFromS6=true 时顺带从 S6 提交出片任务。 */
+  onRegenerateBeatTts?: (
+    episodeId: string,
+    beatId: string,
+    beat: ScriptBeat,
+    rerunFromS6: boolean
+  ) => Promise<BeatRegenerateTTSResponse | null>;
 }
 
 const DEFAULT_RENDER_OPTIONS: EpisodeRenderOptions = {
@@ -107,6 +115,57 @@ const STAGE_SEQUENCE: StageId[] = [
   's7_renderer',
 ];
 
+/**
+ * Patch v4.12：用户在审核台可以改的字段。
+ *
+ * 判定「草稿是否还有未落盘改动」时只看这些字段；`audio_duration_ms`、
+ * `resolved_voice` 都是后端派生的，不算用户改动。
+ */
+const DRAFT_EDITABLE_FIELDS: Array<keyof ScriptBeat> = [
+  'narration_text',
+  'tts_text',
+  'emotion_instruction',
+  'speaker_role',
+  'speaker_gender',
+  'voice_override',
+  'speed_override',
+  'pause_after_ms',
+  'target_panel_ids',
+  'motion',
+  'focus_hint',
+  'sfx_cue',
+];
+
+/** 把字段值归一化成可比字符串（null/undefined 视作空，数组按 JSON 比）。 */
+const normDraftField = (value: unknown): string => {
+  if (value === null || value === undefined) return '';
+  if (Array.isArray(value)) return JSON.stringify(value);
+  return String(value);
+};
+
+/**
+ * Patch v4.12：草稿与已落盘剧本之间是否还有差异。
+ *
+ * `skipBeatId` 用于单句重配：那一句的改动已经随请求落盘，不该再算作未保存改动。
+ */
+const hasDraftChanges = (
+  draft: ScriptBeat[],
+  saved: ScriptBeat[],
+  skipBeatId?: string
+): boolean => {
+  if (draft.length !== saved.length) return true;
+  const savedMap = new Map(saved.map((beat) => [beat.beat_id, beat]));
+  for (const beat of draft) {
+    if (skipBeatId && beat.beat_id === skipBeatId) continue;
+    const other = savedMap.get(beat.beat_id);
+    if (!other) return true;
+    for (const field of DRAFT_EDITABLE_FIELDS) {
+      if (normDraftField(beat[field]) !== normDraftField(other[field])) return true;
+    }
+  }
+  return false;
+};
+
 const MOTION_LABELS: Record<CameraMotion, string> = {
   zoom_in: 'ZOOM_IN 缓推',
   zoom_out: 'ZOOM_OUT 缓拉',
@@ -130,6 +189,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   onUpdateEpisodeRenderOptions,
   onExportEpisode,
   onCleanupIntermediates,
+  onRegenerateBeatTts,
 }) => {
   const [activeTab, setActiveTab] = useState<StudioTab>('script');
 
@@ -374,6 +434,15 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   /** Patch v4.11：一键清理过程文件的内联二次确认条与忙碌态。 */
   const [cleanupConfirm, setCleanupConfirm] = useState(false);
   const [cleanupBusy, setCleanupBusy] = useState(false);
+
+  // ---- Patch v4.12：单句重配 TTS + 真实试听 ----
+  /** 重配确认条当前指向的 beat_id；非空时显示内联确认条（禁用 window.confirm）。 */
+  const [regenerateTarget, setRegenerateTarget] = useState<string | null>(null);
+  const [regenerateBusy, setRegenerateBusy] = useState(false);
+  /** 音频 URL 的防缓存版本号：每次重配成功后自增，强制 <audio> 拉新文件。 */
+  const [audioRevision, setAudioRevision] = useState(0);
+  /** 全局只保留一个正在播放的 audio 元素，便于停止 / 切换。 */
+  const audioElRef = useRef<HTMLAudioElement | null>(null);
 
   // ---- Patch v4.8：重跑前草稿防残留保护 ----
   /** 句间停顿被改动过：必须先重建时间轴（S6）再出片，跳过 S6 会吃到旧停顿。 */
@@ -1206,7 +1275,88 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     return () => window.removeEventListener('beforeunload', handler);
   }, [tableDirty]);
 
+  /** Patch v4.12：本话是否已有真实配音（S5 完成即可按 beat_id 回源 WAV）。 */
+  const isTtsReady =
+    episode.stages.find((stage) => stage.id === 's5_tts')?.status === 'done';
+
+  /** 停止当前真实音频播放并清空 audio 元素。 */
+  const stopPreviewAudio = useCallback(() => {
+    const el = audioElRef.current;
+    if (el) {
+      el.pause();
+      el.src = '';
+      audioElRef.current = null;
+    }
+    setPlayingBeatId(null);
+  }, []);
+
+  // 组件卸载 / 切换话次时确保音频停止，避免离开页面后仍在播放。
+  useEffect(() => {
+    return () => {
+      const el = audioElRef.current;
+      if (el) {
+        el.pause();
+        el.src = '';
+        audioElRef.current = null;
+      }
+    };
+  }, [episode.episode_id]);
+
   const handlePreviewAudio = (beatId: string) => {
+    // Patch v4.12：只要这一句在清单里有真实时长，就优先播放后端 WAV；
+    // 否则退回提示音（S5 未跑或该句尚未合成）。
+    const beatAudioMs =
+      draftBeatsRef.current.find((b) => b.beat_id === beatId)?.audio_duration_ms ??
+      episode.beats.find((b) => b.beat_id === beatId)?.audio_duration_ms ??
+      0;
+    const hasRealAudio = isTtsReady || beatAudioMs > 0;
+    // 已有真实配音：播放后端 WAV。再次点击同一句=停止；点别的句=切换音源。
+    if (hasRealAudio) {
+      const current = audioElRef.current;
+      if (current && playingBeatId === beatId) {
+        stopPreviewAudio();
+        return;
+      }
+      if (current) {
+        current.pause();
+        current.src = '';
+      }
+      const audio = new Audio(
+        `/api/episodes/${encodeURIComponent(episode.episode_id)}/audio/${encodeURIComponent(
+          beatId
+        )}?t=${audioRevision}`
+      );
+      audioElRef.current = audio;
+      setPlayingBeatId(beatId);
+      audio.onended = () => {
+        if (audioElRef.current === audio) {
+          audioElRef.current = null;
+          setPlayingBeatId((cur) => (cur === beatId ? null : cur));
+        }
+      };
+      audio.onerror = () => {
+        if (audioElRef.current === audio) {
+          audioElRef.current = null;
+          setPlayingBeatId((cur) => (cur === beatId ? null : cur));
+          // 该句的 WAV 取不到（清单有记录但文件缺失）：退回提示音，避免完全无声。
+          setSaveHint(`「${beatId}」的配音文件取不到，已退回提示音；请确认 Stage 5 已完成`);
+          playPreviewTone();
+        }
+      };
+      void audio.play().catch(() => {
+        // 浏览器拦截自动播放时退回本地提示音，保证按钮仍有反馈。
+        if (audioElRef.current === audio) {
+          audioElRef.current = null;
+        }
+        playPreviewTone();
+      });
+      return;
+    }
+    // 尚未生成配音：保留原有提示音降级路径。
+    if (playingBeatId === beatId) {
+      setPlayingBeatId(null);
+      return;
+    }
     playPreviewTone();
     setPlayingBeatId(beatId);
     setTimeout(() => {
@@ -1292,6 +1442,80 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
       setCleanupBusy(false);
     }
   }, [episode.episode_id, onCleanupIntermediates]);
+
+  /** Patch v4.12：「重配此句」按钮的可用条件——S5 已完成、未归档、非运行中且回调就绪。 */
+  const regenerateEnabled =
+    isTtsReady &&
+    !episode.archived &&
+    episode.status !== 'running' &&
+    episode.status !== 'queued' &&
+    !!onRegenerateBeatTts;
+
+  /** Patch v4.12：确认单句重配；rerunFromS6=true 时后端顺带提交从 S6 出片的任务。 */
+  const handleConfirmRegenerate = useCallback(
+    async (rerunFromS6: boolean) => {
+      if (!regenerateTarget || !onRegenerateBeatTts) return;
+      const draft = draftBeatsRef.current.find((b) => b.beat_id === regenerateTarget);
+      if (!draft) {
+        setSaveHint(`找不到「${regenerateTarget}」的草稿，无法重配`);
+        return;
+      }
+      if ((draft.narration_text ?? '').trim().length < 2) {
+        setSaveHint(`「${regenerateTarget}」的字幕原文为空或不足 2 字，请先补齐再重配`);
+        return;
+      }
+      setSaveHint('');
+      setRegenerateBusy(true);
+      try {
+        const result = await onRegenerateBeatTts(
+          episode.episode_id,
+          regenerateTarget,
+          draft,
+          rerunFromS6
+        );
+        if (!result) return; // 错误提示已在 App 层 reportError 弹出
+        // Patch v4.12：只把这一句换成后端最新状态（含新的 audio_duration_ms），
+        // 其余句子保留用户本地草稿，避免冲掉别的句子上尚未保存的改动。
+        const serverBeat = result.beats.find((b) => b.beat_id === regenerateTarget);
+        const mergedDraft = draftBeatsRef.current.map((b) =>
+          b.beat_id === regenerateTarget && serverBeat ? { ...b, ...serverBeat } : b
+        );
+        draftBeatsRef.current = mergedDraft;
+        setDraftBeats(mergedDraft);
+        // 后端返回的 beats 即最新已落盘基准：若除本句外仍有差异，说明别的句子还有
+        // 未保存改动，必须保持 dirty，否则后台回填会把那些改动覆盖掉。
+        const otherPending = hasDraftChanges(mergedDraft, result.beats, regenerateTarget);
+        if (otherPending) {
+          tableDirtyRef.current = true;
+          tableDirtyEpisodeRef.current = episode.episode_id;
+          setTableDirty(true);
+        } else {
+          tableDirtyRef.current = false;
+          tableDirtyEpisodeRef.current = '';
+          setTableDirty(false);
+          pendingRef.current = null;
+        }
+        setAudioRevision((v) => v + 1);
+        setRegenerateTarget(null);
+        stopPreviewAudio();
+        if (!rerunFromS6) {
+          // 音频时长已变，旧时间轴失效：标记需要从 S6 重建（点 S7 时会自动升级到 S6）。
+          setNeedsTimelineRebuild(true);
+          setRerunNotice(
+            `「${regenerateTarget}」音频已更新，可直接从 Stage 6 重跑出新成片`
+          );
+        }
+      } finally {
+        setRegenerateBusy(false);
+      }
+    },
+    [
+      episode.episode_id,
+      onRegenerateBeatTts,
+      regenerateTarget,
+      stopPreviewAudio,
+    ]
+  );
 
   return (
     <div className="space-y-6">
@@ -2019,6 +2243,54 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
             {/* TAB 2: Script & Polyphone Editor */}
             {activeTab === 'script' && (
               <div className="space-y-5">
+                {/* Patch v4.12：单句重配 TTS 的内联二次确认条（禁用 window.confirm） */}
+                {regenerateTarget && (
+                  <div className="p-3.5 rounded-lg border border-amber-200 bg-amber-50/70 text-xs text-amber-900">
+                    <div className="flex items-start gap-2">
+                      <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600" />
+                      <div className="flex-1 space-y-2">
+                        <p className="font-medium">
+                          确认只重配「
+                          <span className="font-mono-tabular">{regenerateTarget}</span>
+                          」这一句的配音？
+                        </p>
+                        <ul className="list-disc pl-4 space-y-0.5 text-amber-800/90">
+                          <li>按当前草稿（字幕 / 送音文本 / 情绪 / 角色 / 音色 / 语速 / 停顿）重新合成，只调用 1 次 TTS。</li>
+                          <li>其它句子的音频与顺序完全不动，本句旧音频被新文件原位覆盖。</li>
+                          <li>重配后需从 Stage 6 重建时间轴，新音频才会进入成片；也可以直接让后端顺带提交出片任务。</li>
+                        </ul>
+                        <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                          <button
+                            type="button"
+                            disabled={regenerateBusy}
+                            onClick={() => void handleConfirmRegenerate(false)}
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-amber-600 rounded hover:bg-amber-700 transition-colors cursor-pointer disabled:opacity-50"
+                          >
+                            {regenerateBusy && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                            只重配此句
+                          </button>
+                          <button
+                            type="button"
+                            disabled={regenerateBusy}
+                            onClick={() => void handleConfirmRegenerate(true)}
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-blue-600 rounded hover:bg-blue-700 transition-colors cursor-pointer disabled:opacity-50"
+                          >
+                            {regenerateBusy && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                            重配并从 S6 重新出片
+                          </button>
+                          <button
+                            type="button"
+                            disabled={regenerateBusy}
+                            onClick={() => setRegenerateTarget(null)}
+                            className="px-3 py-1.5 text-xs font-medium text-slate-600 bg-white border border-slate-200 rounded hover:bg-slate-50 transition-colors cursor-pointer disabled:opacity-50"
+                          >
+                            取消
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
                 {beatSceneGroups.map((group) => {
                   const scene = group.scene;
                   const sceneDurationMs = group.beats.reduce(
@@ -2374,6 +2646,20 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                                 <Volume2 className="w-3.5 h-3.5" />
                                 {playingBeatId === beat.beat_id ? '试听中' : '试听'}
                               </button>
+                              {regenerateEnabled && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    stopPreviewAudio();
+                                    setRegenerateTarget(beat.beat_id);
+                                  }}
+                                  title="只重新合成这一句的配音，其它句子不受影响"
+                                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border text-[11px] font-medium whitespace-nowrap shrink-0 cursor-pointer transition-colors border-slate-200 bg-white text-slate-700 hover:bg-amber-50 hover:border-amber-300 hover:text-amber-700"
+                                >
+                                  <RotateCcw className="w-3.5 h-3.5" />
+                                  重配
+                                </button>
+                              )}
                               <button
                                 type="button"
                                 onClick={() => handleInsertBeat(beat.beat_id)}

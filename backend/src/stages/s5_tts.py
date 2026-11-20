@@ -66,6 +66,7 @@ __all__ = [
     "resolve_beat_voice",
     "resolve_beat_voice_assignment",
     "resolve_beat_voice_spec",
+    "resynthesize_single_beat",
     "run_stage5",
     "synthesize_episode",
 ]
@@ -1171,6 +1172,146 @@ async def synthesize_episode(
 
     _write_issues(target_dir, issues)
     return final_metas
+
+
+async def resynthesize_single_beat(
+    client: Any,
+    series_dir: str | Path,
+    episode_no: int,
+    beat_id: str,
+    *,
+    overrides: Mapping[str, str] | None = None,
+    voice: str | None = None,
+    default_voice: str | None = None,
+    voice_cast: Mapping[str, str] | None = None,
+    series_tts: SeriesTTSConfig | None = None,
+    characters: Sequence[CharacterProfile] | None = None,
+    ffmpeg_bin: str = "ffmpeg",
+    trim_silence: bool = True,
+    tts_model: str | None = None,
+) -> AudioClipMeta:
+    """只重新合成一个 beat（Patch v4.12），其余 beat 的 WAV 与清单顺序保持不变。
+
+    与整话 :func:`synthesize_episode` 的关键差异：
+
+    * **绝不调用** :func:`clean_stale_audio`，不删除任何其它 beat 的音频文件；
+    * 读现有 ``audio_manifest.json``，原位替换目标 beat 的条目；清单里原本缺该句时，
+      按 ``script.beats`` 的顺序插回正确位置；
+    * ``audio_issues.json`` 里该 beat 的旧问题记录被移除，没有剩余问题时整文件删除；
+    * 静音裁剪 / 响度归一 / 尾端保留 / 时长探测与主链路完全一致（同一个
+      :func:`_synthesize_beat`），包括连续对白说话人继承。
+    """
+    series_root = Path(series_dir)
+    episode_dir = series_root / "episodes" / f"ep_{episode_no:03d}"
+    script_path = episode_dir / "04_script" / "script.json"
+    if not script_path.is_file():
+        raise TTSStageError(f"缺少 Stage 4 剧本文件：{script_path}")
+    try:
+        script = load_model(NarrationScript, script_path)
+    except Exception as exc:
+        raise TTSStageError(f"剧本文件解析失败：{script_path}：{exc}") from exc
+
+    target = next((beat for beat in script.beats if beat.beat_id == beat_id), None)
+    if target is None:
+        raise TTSStageError(f"剧本里找不到 beat：{beat_id}")
+
+    audio_dir = audio_dir_for(series_root, episode_no)
+    manifest_path = audio_dir / AUDIO_MANIFEST_FILENAME
+    if not manifest_path.is_file():
+        raise TTSStageError(
+            f"该话还没跑过 Stage 5，缺少音频清单：{manifest_path}，请先运行 Stage 5 配音"
+        )
+    metas = load_audio_manifest(audio_dir)
+    audio_dir.mkdir(parents=True, exist_ok=True)
+
+    # 连续对白说话人继承按整话剧本重算，单句重配也能继承前句角色声线。
+    inheritance = resolve_dialogue_speaker_inheritance(
+        [beat.model_dump() for beat in script.beats]
+    )
+
+    old_index = next(
+        (index for index, item in enumerate(metas) if item.beat_id == beat_id), None
+    )
+    old_audio_name = metas[old_index].audio_path if old_index is not None else None
+
+    meta, new_issues = await _synthesize_beat(
+        client,
+        target,
+        audio_dir=audio_dir,
+        overrides=overrides,
+        voice=voice,
+        default_voice=default_voice,
+        voice_cast=voice_cast,
+        series_tts=series_tts,
+        characters=characters,
+        ffmpeg_bin=ffmpeg_bin,
+        trim_silence=trim_silence,
+        tts_model=tts_model,
+        inheritance=inheritance,
+    )
+    if meta is None:
+        detail = "；".join(item.message for item in new_issues) or "未知原因"
+        raise TTSStageError(f"单句重配失败（{beat_id}）：{detail}")
+
+    # 新合成换了后缀（如旧 mp3 → 新 wav）时，只清理该 beat 自己的旧文件，
+    # 其它 beat 的文件一个都不碰。
+    if old_audio_name and old_audio_name != meta.audio_path:
+        stale_path = audio_dir / Path(old_audio_name).name
+        try:
+            if stale_path.is_file():
+                stale_path.unlink()
+        except OSError as exc:  # 清理失败不阻断：新音频与清单已经可用
+            logger.warning("[s5_tts] 单句重配清理旧音频失败（%s）：%s", stale_path, exc)
+
+    if old_index is not None:
+        metas[old_index] = meta
+    else:
+        # 清单原本缺该句：按 script.beats 顺序插回正确位置。
+        script_order = {beat.beat_id: index for index, beat in enumerate(script.beats)}
+        target_order = script_order.get(beat_id, len(script.beats))
+        insert_at = len(metas)
+        for index, item in enumerate(metas):
+            if script_order.get(item.beat_id, len(script.beats) + 1) > target_order:
+                insert_at = index
+                break
+        metas.insert(insert_at, meta)
+
+    manifest_path.write_text(
+        json.dumps(
+            [item.model_dump(mode="json") for item in metas],
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    # 问题记录：移除该 beat 的旧条目，追加本次新问题；没有剩余问题就删文件。
+    issues_path = audio_dir / AUDIO_ISSUES_FILENAME
+    remaining: list[dict[str, str]] = []
+    if issues_path.is_file():
+        try:
+            raw_issues = json.loads(issues_path.read_text(encoding="utf-8"))
+            if isinstance(raw_issues, list):
+                remaining = [
+                    item
+                    for item in raw_issues
+                    if isinstance(item, dict) and item.get("beat_id") != beat_id
+                ]
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("[s5_tts] 读取旧问题记录失败（%s）：%s", issues_path, exc)
+            remaining = []
+    remaining.extend(item.as_dict() for item in new_issues)
+    try:
+        if remaining:
+            issues_path.write_text(
+                json.dumps(remaining, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        elif issues_path.is_file():
+            issues_path.unlink()
+    except OSError as exc:  # pragma: no cover - 问题记录落盘失败不影响主结果
+        logger.warning("[s5_tts] 问题记录写回失败（%s）：%s", issues_path, exc)
+
+    return meta
 
 
 def _write_silence_placeholder(

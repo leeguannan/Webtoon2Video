@@ -424,7 +424,7 @@ class JobRunner:
                 self._log(state, f"[清理重置] 跳过（{exc}）")
             llm_client = (self.client_factory or (lambda: _default_llm(self.config)))()
             if end_index >= STAGE_IDS.index("s5_tts"):
-                tts_client = self._make_tts_client()
+                tts_client = self.make_tts_client()
             for index in range(start_index, end_index + 1):
                 stage = STAGE_IDS[index]
                 if stage == "s0_catalog":
@@ -701,7 +701,8 @@ class JobRunner:
     # ------------------------------------------------------------------
     # 事件
     # ------------------------------------------------------------------
-    def _make_tts_client(self) -> Any:
+    def make_tts_client(self) -> Any:
+        """构造 TTS 客户端；测试可经 ``tts_factory`` 注入假合成器（Patch v4.12 复用）。"""
         if self.tts_factory is not None:
             return self.tts_factory()
         # Patch v3.4 Patch 16：按 ``config.models.tts`` 路由到 MiniMax / 百炼 / Edge，

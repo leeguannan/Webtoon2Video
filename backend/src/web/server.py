@@ -69,7 +69,9 @@ from core.config import (
     load_config,
     load_env_file,
     load_series_config,
+    merge_pronunciation_overrides,
     merge_series_tts,
+    merge_voice_cast,
     recommended_voice_for_tts_model,
     resolve_voice_for_tts_model,
 )
@@ -350,6 +352,15 @@ class EpisodeResetRequest(BaseModel):
 
     from_stage: str
     include_human_storyboard: bool = False
+
+
+class BeatRegenerateTTSRequest(BaseModel):
+    """``POST /api/episodes/{eid}/beats/{bid}/regenerate-tts`` 请求体（Patch v4.12）。"""
+
+    #: 当前编辑的单条 beat（可选）：给出时先按 PUT /script 同款合并策略落盘再重配。
+    beat: dict[str, Any] | None = None
+    #: 重配成功后是否顺带从 S6 提交整条重跑出片任务。
+    rerun_from_s6: bool = False
 
 
 class ScriptUpdateRequest(BaseModel):
@@ -1909,6 +1920,181 @@ def create_app(
                 "changed_beat_ids": report.changed_beat_ids,
                 "audio_manifest_synced": synced,
             },
+        }
+
+    # ------------------------------------------------------------------
+    # 单句重配 TTS（Patch v4.12）
+    # ------------------------------------------------------------------
+    @app.get("/api/episodes/{episode_id}/audio/{beat_id}")
+    async def get_episode_beat_audio(episode_id: str, beat_id: str) -> FileResponse:
+        """流式回源单句配音 WAV（真实试听）；找不到返回 404，响应不进浏览器缓存。"""
+        located = view.find_episode(episode_id)
+        if located is None:
+            raise HTTPException(status_code=404, detail=f"找不到话次：{episode_id}")
+        series_id, episode_no = located
+        audio_dir = view.episode_dir(series_id, episode_no) / "05_audio"
+
+        # 优先按音频清单里记录的实际文件名回源（兼容历史后缀 / 安全化文件名）。
+        audio_path: Path | None = None
+        manifest_path = audio_dir / s5_tts.AUDIO_MANIFEST_FILENAME
+        if manifest_path.is_file():
+            try:
+                for item in s5_tts.load_audio_manifest(audio_dir):
+                    if item.beat_id == beat_id:
+                        candidate = audio_dir / Path(item.audio_path).name
+                        if candidate.is_file():
+                            audio_path = candidate
+                        break
+            except s5_tts.TTSStageError:
+                audio_path = None
+        if audio_path is None:
+            fallback = audio_dir / f"beat_{s5_tts.safe_beat_id(beat_id)}.wav"
+            if fallback.is_file():
+                audio_path = fallback
+        if audio_path is None:
+            raise HTTPException(
+                status_code=404, detail=f"找不到该句配音：{beat_id}（请先运行 Stage 5）"
+            )
+
+        suffix = audio_path.suffix.lower()
+        media_type = {".wav": "audio/wav", ".mp3": "audio/mpeg"}.get(
+            suffix, "application/octet-stream"
+        )
+        return FileResponse(
+            audio_path,
+            media_type=media_type,
+            filename=audio_path.name,
+            content_disposition_type="inline",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/api/episodes/{episode_id}/beats/{beat_id}/regenerate-tts")
+    async def regenerate_beat_tts(
+        episode_id: str, beat_id: str, payload: BeatRegenerateTTSRequest
+    ) -> dict[str, Any]:
+        """只重配一个 beat 的 TTS（Patch v4.12），不重跑整话 Stage 5。"""
+        located = view.find_episode(episode_id)
+        if located is None:
+            raise HTTPException(status_code=404, detail=f"找不到话次：{episode_id}")
+        series_id, episode_no = located
+        state = job_runner.state_of(series_id, episode_no)
+        if state.status in {"queued", "running"}:
+            raise HTTPException(
+                status_code=409, detail="该话正在后台执行任务，请等待完成后再重配"
+            )
+        episode_dir = view.episode_dir(series_id, episode_no)
+        series_dir = view.registry.series_dir(series_id)
+        manager = ManifestManager(series_dir, series_id=series_id)
+        if manager.load(episode_no).archived:
+            raise HTTPException(
+                status_code=400,
+                detail="该话已清理过程文件（仅留成片），无法单句重配，请先从 Stage 1 重跑",
+            )
+        script_dir = episode_dir / "04_script"
+        script_path = script_dir / "script.json"
+        if not script_path.is_file():
+            raise HTTPException(status_code=400, detail="该话还没有 Stage 4 剧本，请先运行撰稿")
+        audio_manifest_path = episode_dir / "05_audio" / s5_tts.AUDIO_MANIFEST_FILENAME
+        if not audio_manifest_path.is_file():
+            raise HTTPException(
+                status_code=400,
+                detail="该话还没跑过 Stage 5 配音，请先运行 Stage 5 后再使用单句重配",
+            )
+
+        # 可选：先把该句的表单草稿按 PUT /script 同款合并策略落盘并刷新可读稿。
+        if payload.beat is not None:
+            incoming = payload.beat
+            if str(incoming.get("beat_id") or "") != beat_id:
+                raise HTTPException(
+                    status_code=400, detail="请求体 beat.beat_id 与路径 beat_id 不一致"
+                )
+            narration_text = str(incoming.get("narration_text") or "").strip()
+            if len(narration_text) < 2:
+                raise HTTPException(status_code=400, detail="字幕原文去空白后至少需要 2 个字")
+            script = load_model(NarrationScript, script_path)
+            old_beat = next((beat for beat in script.beats if beat.beat_id == beat_id), None)
+            if old_beat is None:
+                raise HTTPException(
+                    status_code=404, detail=f"剧本里找不到该句：{beat_id}"
+                )
+            # 单句请求只带部分字段：用旧 beat 的完整快照打底，再让提交值覆盖，
+            # 避免 target_panel_ids 等必填键缺失导致 _merge_script_beats 校验失败。
+            # 注意 _merge_script_beats 是全量语义（输出跟随 incoming），这里只对
+            # 单条合并，再原位替换，其余 beat 与顺序一个不动。
+            merged_input = {**old_beat.model_dump(mode="json"), **incoming}
+            replacement = _merge_script_beats([old_beat], [merged_input])[0]
+            merged_beats = [
+                replacement if beat.beat_id == beat_id else beat for beat in script.beats
+            ]
+            script = script.model_copy(update={"beats": merged_beats})
+            save_model(script, script_path)
+            readable_path = script_dir / "script_readable.md"
+            if readable_path.is_file():
+                from stages.s4_scriptwriter import render_readable_script
+
+                readable_path.write_text(
+                    render_readable_script(script), encoding="utf-8"
+                )
+            # 停顿改动同步进音频清单（与 PUT /script 同口径），S6 重建即生效。
+            _sync_pause_to_audio_manifest(episode_dir, script.beats)
+
+        # 与 JobRunner._stage_tts 完全相同的配置加载，保证单句重配与整话合成同源。
+        series_config = load_series_config(series_dir)
+        overrides = merge_pronunciation_overrides(
+            dict(view.config.pronunciation_overrides),
+            dict(series_config.pronunciation_overrides),
+        )
+        voice_cast = merge_voice_cast(
+            view.config.tts.voice_cast, series_config.voice_cast
+        )
+        series_tts = merge_series_tts(view.config.tts, series_config.tts)
+        characters = s5_tts.load_bible_characters(series_dir)
+
+        client = job_runner.make_tts_client()
+        try:
+            try:
+                clip = await s5_tts.resynthesize_single_beat(
+                    client,
+                    series_dir,
+                    episode_no,
+                    beat_id,
+                    overrides=overrides,
+                    default_voice=view.config.tts.default_voice,
+                    voice_cast=voice_cast,
+                    series_tts=series_tts,
+                    characters=characters,
+                    ffmpeg_bin=view.config.render.ffmpeg_bin,
+                    tts_model=view.config.models.tts,
+                )
+            except s5_tts.TTSStageError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        finally:
+            close = getattr(client, "aclose", None)
+            if close is not None:
+                try:
+                    await close()
+                except Exception:  # noqa: BLE001 - 关闭失败不影响重配结果
+                    pass
+
+        job = None
+        if payload.rerun_from_s6:
+            try:
+                job = await job_runner.submit_episode(
+                    series_id,
+                    episode_no,
+                    from_stage="s6_timeline",
+                    mode="full_video",
+                )
+            except JobError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return {
+            "episode_id": episode_id,
+            "beat_id": beat_id,
+            "clip": clip.model_dump(mode="json"),
+            "duration_ms": clip.duration_ms,
+            "beats": view.beats(series_id, episode_no),
+            "job": job,
         }
 
     # ------------------------------------------------------------------

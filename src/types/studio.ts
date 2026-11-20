@@ -392,6 +392,33 @@ export interface SeriesCleanupResponse {
   skipped_episode_ids: string[];
 }
 
+/** 单句配音清单项（对应后端 AudioClipMeta，Patch v4.12）。 */
+export interface AudioClipMetaItem {
+  beat_id: string;
+  audio_path: string;
+  duration_ms: number;
+  pause_after_ms: number;
+  word_timestamps: unknown[];
+}
+
+/** POST /api/episodes/{id}/beats/{bid}/regenerate-tts 的响应（Patch v4.12）。 */
+export interface BeatRegenerateTTSResponse {
+  episode_id: string;
+  beat_id: string;
+  clip: AudioClipMetaItem;
+  duration_ms: number;
+  /** 重配后最新的整话 beats（含新的 audio_duration_ms），直接替换本地基准。 */
+  beats: ScriptBeat[];
+  /** rerun_from_s6=true 时返回的后台任务，否则为 null。 */
+  job: {
+    job_id: string;
+    episode_id: string;
+    series_id: string;
+    episode_no: number;
+    status: string;
+  } | null;
+}
+
 // ---------------------------------------------------------------------------
 // Patch v4.6：叙事节奏自动留白（auto-pacing）
 // ---------------------------------------------------------------------------
