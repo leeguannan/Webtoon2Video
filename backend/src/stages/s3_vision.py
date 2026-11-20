@@ -21,7 +21,7 @@ from typing import Any
 
 from PIL import Image, ImageOps
 
-from core.normalize import coerce_str, normalize_panel_payload
+from core.normalize import coerce_str, normalize_panel_payload, to_simplified_chinese
 from core.schemas import PanelVisionInfo, VisionWindowOutput, save_model
 from providers.image_utils import encode_image_data_url, encode_pil_data_url
 from providers.llm_base import ChatMessage, ContentPart, LLMClient, parse_json_response
@@ -374,23 +374,28 @@ def _merge_tile_payloads(
     valid_text_card_flags: list[bool] = []
 
     for tile, payload in tile_payloads:
-        summary = str(payload.get("scene_summary") or "").strip()
+        # Patch v4.13：视觉抽取结果落盘前统一简体——模型偶尔会照抄画格里的
+        # 繁体字，后续字幕 / 送音若繁简混排会破坏检索与对白匹配。
+        summary = to_simplified_chinese(str(payload.get("scene_summary") or "").strip())
         if summary and (not summaries or summaries[-1] != summary):
             summaries.append(summary)
         for item in payload.get("dialogues") or []:
             if not isinstance(item, dict):
                 continue
-            text = str(item.get("text") or "").strip()
+            text = to_simplified_chinese(str(item.get("text") or "").strip())
             if not text:
                 continue
-            speaker = str(item.get("speaker_guess") or "").strip()
+            speaker = to_simplified_chinese(str(item.get("speaker_guess") or "").strip())
             key = (speaker, text)
             if key in seen_dialogues:
                 continue
             seen_dialogues.add(key)
-            dialogues.append(dict(item))
+            entry = dict(item)
+            entry["text"] = text
+            entry["speaker_guess"] = speaker
+            dialogues.append(entry)
         for value in payload.get("sfx_list") or []:
-            text = str(value).strip()
+            text = to_simplified_chinese(str(value).strip())
             if text and text not in seen_sfx:
                 seen_sfx.add(text)
                 sfx_list.append(text)

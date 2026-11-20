@@ -93,6 +93,8 @@ export interface ScriptBeat {
   voice_override?: string;
   /** Patch v4.4：单句语速微调（null / 缺省 = 跟随角色默认语速）。 */
   speed_override?: number | null;
+  /** Patch v4.13：这条解说归属的镜头组（幕）scene_id；缺省表示尚未归属。 */
+  scene_id?: string | null;
 }
 
 /** 百炼官方音色的一条配音规格（Patch v3.2 Patch 13）。 */

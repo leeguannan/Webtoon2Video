@@ -20,9 +20,12 @@ from pathlib import Path
 from typing import Any
 
 from core.normalize import (
+    MAX_SPEED_OVERRIDE,
     MIN_NARRATION_CHARS,
     MIN_DIALOGUE_CHARS,
+    MIN_SPEED_OVERRIDE,
     apply_dialogue_speaker_inheritance,
+    coerce_float,
     coerce_str,
     coerce_str_list,
     deduplicate_adjacent_beats,
@@ -52,6 +55,11 @@ from providers.llm_base import (
     LLMError,
     LLMTruncatedError,
     parse_json_response,
+)
+from utils.tts_tags import (
+    MINIMAX_TAG_SPLIT_PATTERN,
+    mask_minimax_tts_tags,
+    strip_minimax_tts_tags,
 )
 
 logger = logging.getLogger(__name__)
@@ -191,6 +199,11 @@ TTS_ALLOWED_WORDS = frozenset(
         "id",
     }
 )
+#: Patch v4.14：MiniMax 语气词标签与停顿标签的**完整匹配**模式
+#: （统一由 ``utils.tts_tags`` 提供，避免各处正则漂移）。
+#:
+#: 拼音校验与剥除都按标签边界切段处理：标签本身不是拼音，必须原样保留；
+#: 而标签里的拉丁字母（``(coughs)``）又绝不能被当成拼音误杀。
 #: 从顺位校验错误文本里提取 panel id（兼容 ``p_005`` 与旧写法 ``panel_005``）。
 _ERROR_PANEL_ID_RE = re.compile(r"p(?:anel)?_\d{3}")
 #: 全话解说句条数规格（与 prompts/script_narrate.md 铁律一保持一致）。
@@ -547,6 +560,38 @@ def _pair_chapters_with_scenes(
         for index in range(min(len(chapters), len(scenes))):
             pairs[index] = index
     return pairs
+
+
+def _assign_scene_id(beats: list[dict[str, Any]], scene: StoryboardScene | None) -> None:
+    """给某幕产出的解说句打上 ``scene_id``（Patch v4.13）。
+
+    幕编排与分句画面解耦后，「这句话属于哪一幕」必须显式记录，不能再靠
+    ``target_panel_ids`` 反推——同一格漫画可以被多句解说复用，反推会串幕。
+    逐幕拍摄时天然知道当前幕，直接写死即可；非逐幕模式（scene 为 None）
+    保持为空，由上层按分镜回退。
+    """
+    if scene is None or not scene.scene_id:
+        return
+    for beat in beats:
+        beat["scene_id"] = scene.scene_id
+
+
+def _clamp_beat_speed_overrides(beats: list[dict[str, Any]]) -> None:
+    """把模型给的单句语速收敛到合法区间（Patch v4.13）。
+
+    模型可能写 ``"1.3"``（字符串）、``3``（越界）、``0``（非法）或干脆不写。
+    这里统一成「``None`` = 跟随角色默认语速」或落在 ``[0.5, 2.0]`` 的浮点数，
+    避免非法值一路带到 Stage 5 合成时才炸。
+    """
+    for beat in beats:
+        raw = beat.get("speed_override")
+        value = coerce_float(raw)
+        if value is None:
+            beat["speed_override"] = None
+            continue
+        beat["speed_override"] = min(
+            MAX_SPEED_OVERRIDE, max(MIN_SPEED_OVERRIDE, value)
+        )
 
 
 def _splice_scene_beats(
@@ -1172,6 +1217,10 @@ def validate_tts_text_no_pinyin(beats: Sequence[object]) -> list[str]:
     多音字读音的正确来源是 Stage 5 的发音词典（``pronunciation_overrides``），
     它在合成时注入，与模型产出的 ``tts_text`` 是两条互不干扰的通道。
 
+    Patch v4.14：MiniMax 的语气词标签（``(coughs)`` / ``(clear-throat)`` …）
+    全是拉丁字母，扫描前先把这些**完整标签**遮蔽成等长非字母占位符；
+    裸单词（例如漏了括号的 ``coughs``）仍然会被拦下。
+
     返回错误列表，空列表表示通过。
     """
     errors: list[str] = []
@@ -1182,7 +1231,7 @@ def validate_tts_text_no_pinyin(beats: Sequence[object]) -> list[str]:
             raw = getattr(beat, "tts_text", None)
         if not isinstance(raw, str) or not raw.strip():
             continue
-        for match in TTS_PINYIN_PATTERN.finditer(raw):
+        for match in TTS_PINYIN_PATTERN.finditer(mask_minimax_tts_tags(raw)):
             token = match.group(0)
             if token.lower() in TTS_ALLOWED_WORDS:
                 continue
@@ -1194,21 +1243,37 @@ def validate_tts_text_no_pinyin(beats: Sequence[object]) -> list[str]:
     return errors
 
 
-def strip_pinyin(text: str) -> str:
-    """把 ``tts_text`` 里的拼音片段剥掉（兜底用）。
-
-    白名单专有名词（``WEBTOON`` / ``BGM`` 等）不在剥除范围内。
-    剥完若只剩空白，说明这句的配音文本全靠拼音承载 → 返回空串，
-    调用方应把 ``tts_text`` 置 ``None``（字幕 ``narration_text`` 绝不受影响）。
-    """
-    cleaned = TTS_PINYIN_PATTERN.sub(
+def _strip_pinyin_plain(text: str) -> str:
+    """剥掉一段**不含 MiniMax 标签**的文本里的拼音片段。"""
+    return TTS_PINYIN_PATTERN.sub(
         lambda match: match.group(0)
         if match.group(0).lower() in TTS_ALLOWED_WORDS
         else "",
         text,
     )
-    cleaned = re.sub(r"\s{2,}", " ", cleaned)
-    return cleaned.strip()
+
+
+def strip_pinyin(text: str) -> str:
+    """把 ``tts_text`` 里的拼音片段剥掉（兜底用）。
+
+    白名单专有名词（``WEBTOON`` / ``BGM`` 等）不在剥除范围内。
+    Patch v4.14：MiniMax 语气词标签与停顿标签**原样保留**（它们不是拼音），
+    只剥除标签之外的拉丁字母片段。
+    剥完若只剩空白或只剩标签，说明这句的配音文本全靠拼音承载 → 返回空串，
+    调用方应把 ``tts_text`` 置 ``None``（字幕 ``narration_text`` 绝不受影响）。
+    """
+    out: list[str] = []
+    cursor = 0
+    for match in MINIMAX_TAG_SPLIT_PATTERN.finditer(text):
+        out.append(_strip_pinyin_plain(text[cursor : match.start()]))
+        out.append(match.group(0))
+        cursor = match.end()
+    out.append(_strip_pinyin_plain(text[cursor:]))
+    cleaned = re.sub(r"\s{2,}", " ", "".join(out)).strip()
+    if cleaned and not strip_minimax_tts_tags(cleaned):
+        # 只剩语气词 / 停顿标签，没有任何可发音文字 → 等同于空文本。
+        return ""
+    return cleaned
 
 
 def render_story_markdown(draft: EpisodeStoryDraft, *, episode_no: int = 0) -> str:
@@ -2749,6 +2814,10 @@ async def write_episode_script(
                     f"第 {chapter.chapter_index} 章"
                     f"（{chapter.chapter_title or '未命名'}）没有产出解说句"
                 )
+            # Patch v4.13：逐幕拍摄时显式记录归属幕。
+            _assign_scene_id(raw_beats, scene)
+            # Patch v4.13：单句语速收敛到合法区间。
+            _clamp_beat_speed_overrides(raw_beats)
             merged_beats.extend(raw_beats)
             previous_tail = _tail_narration(raw_beats)
 
@@ -2874,6 +2943,9 @@ async def write_episode_script(
                 )
                 if not new_beats:
                     continue
+                # Patch v4.13：补写的解说句同样归属本幕。
+                _assign_scene_id(new_beats, scene)
+                _clamp_beat_speed_overrides(new_beats)
                 merged_beats = _splice_scene_beats(
                     merged_beats, scene, new_beats, ordered_panel_ids
                 )

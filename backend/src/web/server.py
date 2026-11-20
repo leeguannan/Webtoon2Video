@@ -84,6 +84,7 @@ from core.manifest import (
     infer_stage_status,
 )
 from core.panel_ids import panel_sort_key
+from core.normalize import to_simplified_chinese
 from core.schemas import (
     ArcSummary,
     CharacterProfile,
@@ -543,10 +544,14 @@ PRESERVED_BEAT_FIELDS: tuple[str, ...] = (
     "voice_override",
     # Patch v4.4：单句语速微调（前端未回传时继承旧值；显式传 null = 清空，恢复角色默认语速）
     "speed_override",
+    # Patch v4.13：解说句归属的镜头组（幕）；前端未回传时继承旧值，显式传 null = 解除归属
+    "scene_id",
 )
 
 #: 上面这些字段里允许显式置 ``None``（清空）的，其余字段 ``None`` 非法，按「未提供」处理。
-NULLABLE_BEAT_FIELDS: frozenset[str] = frozenset({"sfx_cue", "speed_override"})
+NULLABLE_BEAT_FIELDS: frozenset[str] = frozenset(
+    {"sfx_cue", "speed_override", "scene_id"}
+)
 
 _MISSING = object()
 
@@ -574,6 +579,25 @@ def _merge_script_beats(
                     raw[field] = getattr(old, field)
         merged.append(ScriptBeat.model_validate(raw))
     return merged
+
+
+def _to_simplified_beat(beat: ScriptBeat) -> ScriptBeat:
+    """把一句解说转成简体中文（Patch v4.13 全链路强制简体）。
+
+    只动 ``narration_text``（屏幕字幕）与 ``tts_text``（送入 TTS 的文本）；
+    语气词/停顿标签是 ASCII，转换器会原样透传，不会被腰斩。
+    """
+    updates: dict[str, Any] = {}
+    narration = to_simplified_chinese(beat.narration_text)
+    if narration != beat.narration_text:
+        updates["narration_text"] = narration
+    if beat.tts_text:
+        tts_text = to_simplified_chinese(beat.tts_text)
+        if tts_text != beat.tts_text:
+            updates["tts_text"] = tts_text
+    if not updates:
+        return beat
+    return beat.model_copy(update=updates)
 
 
 class PanelFlagRequest(BaseModel):
@@ -744,6 +768,55 @@ class WorkspaceView:
     def episode_dir(self, series_id: str, episode_no: int) -> Path:
         return self.registry.series_dir(series_id) / "episodes" / f"ep_{episode_no:03d}"
 
+    def episode_viewer_url(self, series_id: str, episode_no: int, episode: Any = None) -> str:
+        """话次的「原漫链接」（Patch v4.13）。
+
+        主来源是作品目录里的 ``catalog.json``（``episodes[].viewer_url``）；
+        缺失时按顺序回退：
+
+        1. ``episodes_catalog.json``（历史命名，部分作品目录里仍有）；
+        2. 话次目录里落盘的 ``episode.json`` 的 ``source_url``（``EpisodeMeta``）。
+
+        三处都没有就返回空串——前端据此隐藏「查看原漫」入口，而不是给出坏链接。
+        """
+        url = str(getattr(episode, "viewer_url", "") or "").strip()
+        if url:
+            return url
+        series_dir = self.registry.series_dir(series_id)
+        for filename in ("catalog.json", "episodes_catalog.json"):
+            path = series_dir / filename
+            if not path.is_file():
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            for item in payload.get("episodes") or []:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    item_no = int(item.get("episode_no") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if item_no != episode_no:
+                    continue
+                url = str(item.get("viewer_url") or "").strip()
+                if url:
+                    return url
+        meta_path = self.episode_dir(series_id, episode_no) / "episode.json"
+        if meta_path.is_file():
+            try:
+                payload = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = None
+            if isinstance(payload, dict):
+                url = str(payload.get("source_url") or "").strip()
+                if url:
+                    return url
+        return ""
+
     def episode_item(self, series_id: str, episode_no: int) -> dict[str, Any]:
         catalog = self.catalog(series_id)
         episode = next(
@@ -785,7 +858,7 @@ class WorkspaceView:
             "episode_id": episode_id,
             "title": episode.title if episode else f"第 {episode_no} 话",
             "publish_date": episode.publish_date if episode else "",
-            "viewer_url": episode.viewer_url if episode else "",
+            "viewer_url": self.episode_viewer_url(series_id, episode_no, episode),
             "is_locked": bool(episode.is_locked) if episode else False,
             "selected": False,
             "current_stage": current_stage or "s0_catalog",
@@ -1070,6 +1143,8 @@ class WorkspaceView:
                 "speed_override": getattr(beat, "speed_override", None),
                 "sfx_cue": beat.sfx_cue,
                 "focus_hint": beat.focus_hint,
+                # Patch v4.13：这条解说归属的镜头组（幕）；空 = 尚未归属。
+                "scene_id": getattr(beat, "scene_id", None),
             }
             if assignment_ctx is not None:
                 item["resolved_voice"] = self._resolved_voice(beat, assignment_ctx)
@@ -1832,6 +1907,8 @@ def create_app(
             raise HTTPException(status_code=404, detail="该话还没有 Stage 4 剧本")
         script = load_model(NarrationScript, script_path)
         beats = _merge_script_beats(script.beats, payload.beats)
+        # Patch v4.13：人工保存也强制简体中文（字幕与送音文本一起转）。
+        beats = [_to_simplified_beat(beat) for beat in beats]
         script = script.model_copy(update={"beats": beats})
         save_model(script, script_path)
         # Patch v4.6：人工调整停顿后同步进 audio_manifest，只重跑 S6→S7 即生效。
@@ -2023,6 +2100,8 @@ def create_app(
             # 单条合并，再原位替换，其余 beat 与顺序一个不动。
             merged_input = {**old_beat.model_dump(mode="json"), **incoming}
             replacement = _merge_script_beats([old_beat], [merged_input])[0]
+            # Patch v4.13：单句重配前也强制简体中文，避免繁体送进 TTS。
+            replacement = _to_simplified_beat(replacement)
             merged_beats = [
                 replacement if beat.beat_id == beat_id else beat for beat in script.beats
             ]

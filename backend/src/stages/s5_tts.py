@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from core.config import SeriesTTSConfig, VoiceSpec, resolve_voice_for_tts_model
-from core.normalize import resolve_dialogue_speaker_inheritance
+from core.normalize import resolve_dialogue_speaker_inheritance, to_simplified_chinese
 from core.schemas import (
     AudioClipMeta,
     CharacterProfile,
@@ -41,6 +41,12 @@ from core.schemas import (
 )
 from providers.tts_base import TTSResult
 from providers.tts_qwen import DEFAULT_VOICE
+from utils.tts_tags import (
+    MINIMAX_INTERJECTION_TAGS,
+    MINIMAX_TAG_SPLIT_PATTERN,
+    normalize_minimax_pause_tags,
+    strip_minimax_tts_tags,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -183,10 +189,28 @@ def apply_pronunciation(text: str, overrides: Mapping[str, str] | None) -> str:
     （「重」与「重霄」），先替换短的会把长的彻底破坏掉，长 key 优先才能保证
     「重霄」被完整命中。
 
+    Patch v4.14：替换**不进入 MiniMax 标签内部**——``(clear-throat)`` 里的
+    拉丁字母不是台词，多音字字典不该去动它；标签被改坏模型端会直接报错。
+
     本函数只返回新字符串（``str`` 不可变），绝不修改入参，也绝不触碰字幕文本。
     """
     if not text or not overrides:
         return text
+    if "<#" in text or any(tag in text for tag in MINIMAX_INTERJECTION_TAGS):
+        # 文本里带标签：按标签边界切段，只在标签之外替换。
+        out: list[str] = []
+        cursor = 0
+        for match in MINIMAX_TAG_SPLIT_PATTERN.finditer(text):
+            out.append(_apply_pronunciation_plain(text[cursor : match.start()], overrides))
+            out.append(match.group(0))
+            cursor = match.end()
+        out.append(_apply_pronunciation_plain(text[cursor:], overrides))
+        return "".join(out)
+    return _apply_pronunciation_plain(text, overrides)
+
+
+def _apply_pronunciation_plain(text: str, overrides: Mapping[str, str]) -> str:
+    """对**不含 MiniMax 标签**的文本套发音词典（按 key 长度倒序替换）。"""
     result = text
     for key in sorted(overrides, key=len, reverse=True):
         value = overrides[key]
@@ -215,24 +239,59 @@ def build_spoken_text(beat: ScriptBeat, overrides: Mapping[str, str] | None = No
     （见 :data:`TTS_FRAGMENT_RATIO`）时才用它替代字幕原句；模型偶尔只写「被替换
     的那个词」（如「混蛋」），那不是整句，直接拿去合成会让整条解说只剩两三个字，
     此时回退字幕原句再套发音词典。字幕用的 ``narration_text`` 在这里**只读**。
+
+    Patch v4.13 / v4.14：
+
+    * 送音文本统一转简体（最后一道兜底，防止上游漏转）；
+    * 停顿标签先规范化（合并相邻、钳位秒数、剥除贴首贴尾）；
+    * 长度占比按**剥离标签后的可发音正文**算——标签不是台词，不能让
+      ``(laughs)`` 这类标记把整句判定成「碎片」。
     """
-    narration = beat.narration_text
-    tts_text = (beat.tts_text or "").strip()
+    narration = to_simplified_chinese(beat.narration_text)
+    tts_text = to_simplified_chinese((beat.tts_text or "").strip())
     spoken = narration
+    if tts_text:
+        tts_text = normalize_minimax_pause_tags(tts_text)
+    narration_body = strip_minimax_tts_tags(narration)
+    tts_body = strip_minimax_tts_tags(tts_text)
     if (
         tts_text
         and tts_text not in narration
-        and len(tts_text) >= len(narration) * TTS_FRAGMENT_RATIO
+        and len(tts_body) >= len(narration_body) * TTS_FRAGMENT_RATIO
     ):
         spoken = tts_text
     elif tts_text and tts_text != narration:
         logger.warning(
             "[s5_tts] %s：tts_text 不是整句送音文本（%d 字 vs 字幕 %d 字），已回退字幕原句",
             beat.beat_id,
-            len(tts_text),
-            len(narration),
+            len(tts_body),
+            len(narration_body),
         )
     return apply_pronunciation(spoken, overrides)
+
+
+#: MiniMax 语气词 / 停顿标签需要 speech-2.8 系列模型才生效。
+_MINIMAX_TAG_MODEL_PREFIX = "speech-2.8"
+
+
+def _warn_if_tag_model_unsupported(client: Any, *, tts_model: str | None = None) -> None:
+    """当前 TTS 模型不支持语气词 / 停顿标签时给出清晰提示（Patch v4.14）。
+
+    语气词标签（``(laughs)``）与停顿标签（``<#0.5#>``）是 MiniMax Speech 2.8
+    的能力；换用别的模型合成时，标签要么被当普通文本念出来、要么被模型忽略，
+    用户会误以为是自己写错了标签。这里提前打一行提示，避免这种静默失败。
+    """
+    model = tts_model or getattr(client, "model", "") or ""
+    if not isinstance(model, str) or not model:
+        return
+    if model.startswith(_MINIMAX_TAG_MODEL_PREFIX):
+        return
+    logger.warning(
+        "[s5_tts] 当前 TTS 模型 %s 不支持 MiniMax 语气词 / 停顿标签"
+        "（(laughs)、<#0.5#> 需要 speech-2.8-hd 或 speech-2.8-turbo），"
+        "这些标签可能不会被读出来。",
+        model,
+    )
 
 
 def audio_dir_for(series_dir: str | Path, episode_no: int) -> Path:
@@ -1018,6 +1077,8 @@ async def synthesize_episode(
     if not script.beats:
         raise TTSStageError("剧本里没有任何 beat，无法合成音频")
 
+    _warn_if_tag_model_unsupported(client, tts_model=tts_model)
+
     target_dir = Path(audio_dir)
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -1206,6 +1267,7 @@ async def resynthesize_single_beat(
     script_path = episode_dir / "04_script" / "script.json"
     if not script_path.is_file():
         raise TTSStageError(f"缺少 Stage 4 剧本文件：{script_path}")
+    _warn_if_tag_model_unsupported(client, tts_model=tts_model)
     try:
         script = load_model(NarrationScript, script_path)
     except Exception as exc:

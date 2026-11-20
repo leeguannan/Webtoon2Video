@@ -12,6 +12,12 @@ import logging
 import re
 from typing import Any, Mapping, Sequence
 
+from utils.tts_tags import (
+    MINIMAX_INTERJECTION_TAGS,
+    normalize_minimax_pause_tags,
+    strip_minimax_tts_tags,
+)
+
 logger = logging.getLogger(__name__)
 
 # 与 ``core.schemas`` 保持一致的契约取值
@@ -156,6 +162,38 @@ def coerce_int(
     return number
 
 
+def coerce_float(
+    value: Any,
+    default: float | None = None,
+    *,
+    low: float | None = None,
+    high: float | None = None,
+) -> float | None:
+    """转成浮点数；无法解析时返回 ``default``（默认 ``None``）。
+
+    Patch v4.13：用于读取单句语速 ``speed_override``——模型可能给
+    ``1.1``、``"1.1"`` 或 ``null``，三种都要能安全落盘。
+    """
+    if isinstance(value, bool):
+        number: float | None = float(value)
+    elif isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str):
+        try:
+            number = float(value.strip())
+        except ValueError:
+            number = default
+    else:
+        number = default
+    if number is None:
+        return None
+    if low is not None and number < low:
+        number = low
+    if high is not None and number > high:
+        number = high
+    return number
+
+
 def coerce_floats(value: Any, count: int = 4) -> tuple[float, ...] | None:
     """把坐标转成定长浮点元组；数量不对时返回 ``None``（契约允许为空）。"""
     items = coerce_list(value)
@@ -176,8 +214,120 @@ def coerce_floats(value: Any, count: int = 4) -> tuple[float, ...] | None:
 
 
 def clip_text(value: str, limit: int = MAX_NARRATION_CHARS) -> str:
-    """按字符数截断文本。"""
-    return value if len(value) <= limit else value[:limit]
+    """按「可发音字符数」截断文本，MiniMax 标签整段保留且不计入额度。
+
+    Patch v4.14：模型偶尔会写出 ``(clear-throat)`` / ``<#0.5#>`` 这类标签，
+    硬切会切出 ``(clear-th`` 或 ``<#0.`` 这种半截标签，模型端解析会直接
+    报错。这里的规则是：
+
+    * 语气词 / 停顿标签**不计入**长度额度（标签是给模型的指令，不是台词）；
+    * 标签要么完整保留，要么整段丢弃，**绝不切一半**；
+    * 正文精确截到 ``limit`` 字，因此结果可能比 ``limit`` 略长（多出的
+      是保留的标签字符）。
+    """
+    if not value:
+        return value
+    if spoken_length(value) <= limit:
+        return value
+    out: list[str] = []
+    budget = limit
+    cursor = 0
+    for match in _MINIMAX_TAG_SPAN_PATTERN.finditer(value):
+        chunk = value[cursor : match.start()]
+        spoken = spoken_length(chunk)
+        if spoken > budget:
+            # 正文已经超额度：截断正文，并丢弃这条标签及其后内容。
+            out.append(chunk[:budget])
+            return "".join(out).strip()
+        out.append(chunk)
+        budget -= spoken
+        cursor = match.end()
+        # 标签本身不计入额度，完整保留。
+        out.append(match.group(0))
+    out.append(value[cursor:][:budget])
+    return "".join(out).strip()
+
+
+# --------------------------------------------------------------------------
+# Patch v4.13 / v4.14：繁简统一 + 标签感知的长度控制
+# --------------------------------------------------------------------------
+#: MiniMax 语气词 / 停顿标签在文本中的位置（截断时不能切在标签中间）。
+_MINIMAX_TAG_SPAN_PATTERN: re.Pattern[str] = re.compile(
+    "|".join(re.escape(tag) for tag in MINIMAX_INTERJECTION_TAGS)
+    + r"|<#\d+(?:\.\d{1,2})?#>"
+)
+
+#: 单句语速合法区间（与 ``core.schemas.ScriptBeat.speed_override`` 一致）。
+MIN_SPEED_OVERRIDE = 0.5
+MAX_SPEED_OVERRIDE = 2.0
+
+#: OpenCC 繁简转换器（惰性创建；缺依赖时降级为「不转换」）。
+_T2S_CONVERTER: Any = None
+_T2S_READY = False
+
+
+def _get_t2s_converter() -> Any:
+    """惰性创建 OpenCC ``t2s`` 转换器；缺依赖或初始化失败时返回 ``None``。"""
+    global _T2S_CONVERTER, _T2S_READY
+    if _T2S_READY:
+        return _T2S_CONVERTER
+    _T2S_READY = True
+    try:
+        from opencc import OpenCC
+
+        _T2S_CONVERTER = OpenCC("t2s")
+    except Exception as exc:  # noqa: BLE001 - 缺依赖只降级，不阻断流水线
+        logger.warning("[normalize] OpenCC 不可用，繁简转换降级为不转换：%s", exc)
+        _T2S_CONVERTER = None
+    return _T2S_CONVERTER
+
+
+def to_simplified_chinese(text: str) -> str:
+    """把文本里的繁体字转成简体（Patch v4.13）。
+
+    全链路只产出简体，避免同一句台词在字幕 / 送音 / 视觉抽取三处出现
+    繁简混排（例如「後臺」与「后台」）。ASCII 字符、标点与 MiniMax 标签
+    （``(coughs)`` / ``<#0.5#>``）原样透传，OpenCC 不会动它们。
+
+    参数
+    ----
+    text:
+        原始文本。
+
+    返回
+    ----
+    ``str``
+        转换后的简体文本；转换器不可用时原样返回。
+    """
+    if not text:
+        return ""
+    converter = _get_t2s_converter()
+    if converter is None:
+        return text
+    try:
+        return converter.convert(text)
+    except Exception as exc:  # noqa: BLE001 - 转换失败只降级，不阻断流水线
+        logger.warning("[normalize] 繁简转换失败，原样返回：%s", exc)
+        return text
+
+
+def spoken_length(text: str) -> int:
+    """文本里「真正会被念出来」的字符数（MiniMax 标签不计入）。
+
+    语气词 / 停顿标签是给模型的指令，不占字幕与送音的语义长度预算。
+    """
+    if not text:
+        return 0
+    return len(strip_minimax_tts_tags(text))
+
+
+def clip_text_by_spoken_length(value: str, limit: int = MAX_NARRATION_CHARS) -> str:
+    """按「可发音正文长度」截断文本，标签字符不计入额度。
+
+    Patch v4.14：与 :func:`clip_text` 同语义（标签豁免额度、绝不腰斩），
+    单独起名是为了在送音文本（``tts_text``）链路上表意更清楚。
+    """
+    return clip_text(value, limit)
 
 
 # --------------------------------------------------------------------------
@@ -328,8 +478,12 @@ _DEDUPE_CONTAINED_MIN_CHARS = 6
 
 
 def _dedupe_text_key(text: Any) -> str:
-    """去重比较用的文本指纹（去掉标点 / 引号 / 空白）。"""
-    return _DEDUPE_STRIP_RE.sub("", coerce_str(text))
+    """去重比较用的文本指纹（去掉标点 / 引号 / 空白）。
+
+    Patch v4.14：语气词 / 停顿标签**不参与**比较——同一句话加了个 ``(sighs)``
+    仍然算重复，否则模型换个语气就能绕过去重。
+    """
+    return _DEDUPE_STRIP_RE.sub("", strip_minimax_tts_tags(coerce_str(text)))
 
 
 def _beat_panel_ids(beat: dict[str, Any]) -> set[str]:
@@ -541,6 +695,10 @@ def normalize_script_payload(
         if not isinstance(item, dict):
             continue
         narration = coerce_str(item.get("narration_text") or item.get("text"))
+        # Patch v4.14：字幕轨绝不能出现 (laughs) / <#0.5#> 这类送音标记。
+        narration = strip_minimax_tts_tags(narration)
+        # Patch v4.13：全链路统一简体，避免字幕 / 送音 / 视觉抽取繁简混排。
+        narration = to_simplified_chinese(narration)
         # Patch v3.2 Patch 12：对白引号统一成中文双引号（拆对白的前置条件）。
         narration = normalize_dialogue_quotes(narration)
         # Patch v3.1 Patch 9：进字幕 / TTS 之前先净化，杜绝「☒」方块与吞字。
@@ -558,9 +716,14 @@ def normalize_script_payload(
         tts_raw = item.get("tts_text")
         tts_text = coerce_str(tts_raw) if tts_raw is not None else None
         if tts_text is not None:
+            # Patch v4.13：送音文本同样统一简体。
+            tts_text = to_simplified_chinese(tts_text)
             tts_text = normalize_dialogue_quotes(tts_text)
             tts_text = sanitize_narration_and_tts(tts_text, for_tts=True)
-            tts_text = clip_text(tts_text, MAX_NARRATION_CHARS) or None
+            # Patch v4.14：停顿标签规范化（合并相邻、钳位秒数、剥除贴首贴尾）。
+            tts_text = normalize_minimax_pause_tags(tts_text)
+            # 标签字符不计入长度额度，且绝不从标签中间腰斩。
+            tts_text = clip_text_by_spoken_length(tts_text, MAX_NARRATION_CHARS) or None
         # Patch v3.1 Patch 10：可选音效标签（白名单收敛，非法值 / "none" 丢弃）。
         sfx_cue_raw = item.get("sfx_cue")
         sfx_cue = coerce_str(sfx_cue_raw).lower() if sfx_cue_raw is not None else ""
@@ -570,6 +733,14 @@ def normalize_script_payload(
         speaker_gender = coerce_str(item.get("speaker_gender")).lower()
         if speaker_gender not in SPEAKER_GENDERS:
             speaker_gender = "unknown"
+        # Patch v4.13：单句语速微调（模型只在明显节奏 / 情绪变化点给）。
+        speed_override = coerce_float(item.get("speed_override"))
+        if speed_override is not None:
+            speed_override = min(
+                MAX_SPEED_OVERRIDE, max(MIN_SPEED_OVERRIDE, speed_override)
+            )
+        # Patch v4.13：本句归属的镜头组（幕）；缺省为空，由上层按分镜回退。
+        scene_id = coerce_str(item.get("scene_id")).strip() or None
         beats.append(
             {
                 "beat_id": coerce_str(item.get("beat_id")) or f"b{index}",
@@ -583,6 +754,8 @@ def normalize_script_payload(
                 "motion": normalize_enum(item.get("motion"), MOTION_VALUES, "zoom_in"),
                 "pause_after_ms": coerce_int(item.get("pause_after_ms"), 150, low=0, high=2000),
                 "sfx_cue": sfx_cue,
+                "speed_override": speed_override,
+                "scene_id": scene_id,
             }
         )
 

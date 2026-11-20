@@ -150,6 +150,8 @@ FIELD_LOCKS: list[tuple[type, tuple[str, ...]]] = [
             "voice_override",
             # Patch v4.4：单句语速微调（默认 None = 跟随角色默认语速）
             "speed_override",
+            # Patch v4.13：这条解说归属的镜头组（幕）（默认 None = 尚未归属）
+            "scene_id",
         ),
     ),
     (

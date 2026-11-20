@@ -224,6 +224,10 @@ class ScriptBeat(BaseModel):
     #: Patch v4.4：单句语速微调。``None`` = 跟随当前角色的默认语速；非 ``None``
     #: 时本句 TTS 合成强制使用该倍率（合成前仍经 ``normalize_speed`` 收敛到合法区间）。
     speed_override: float | None = Field(default=None, ge=0.5, le=2.0)
+    #: Patch v4.13：本句归属的「镜头组（幕）」ID（形如 ``sc_001``）。
+    #: 幕编排与分句画面彻底解耦——同一格漫画可以被多句解说复用，所以幕归属
+    #: 不再由 ``target_panel_ids`` 推导。``None`` = 尚未归属（上层按分镜回退）。
+    scene_id: str | None = None
 
 
 class NarrationScript(BaseModel):

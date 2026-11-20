@@ -834,6 +834,33 @@ class BgmSpan:
     gain_db: float
 
 
+def load_beat_scene_map(episode_dir: Path) -> dict[str, str]:
+    """读出「解说句 → 镜头组（幕）」映射（Patch v4.13）。
+
+    幕编排与分句画面解耦后，同一格漫画可以被多句解说复用，BGM 归属幕必须
+    以剧本显式记录的 ``scene_id`` 为准，否则改一下 ``target_panel_ids``
+    就会让整幕的 BGM 串到隔壁去。读不到剧本时返回空表（上层回退按分镜归属）。
+    """
+    script_path = Path(episode_dir) / "04_script" / "script.json"
+    if not script_path.is_file():
+        return {}
+    try:
+        payload = json.loads(script_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    mapping: dict[str, str] = {}
+    for beat in payload.get("beats") or []:
+        if not isinstance(beat, dict):
+            continue
+        beat_id = str(beat.get("beat_id") or "").strip()
+        scene_id = str(beat.get("scene_id") or "").strip()
+        if beat_id and scene_id:
+            mapping[beat_id] = scene_id
+    return mapping
+
+
 def build_scene_bgm_spans(
     storyboard: EpisodeStoryboard,
     timeline: RenderTimeline,
@@ -844,11 +871,14 @@ def build_scene_bgm_spans(
     assets_dir: str | Path | None = None,
     cover_duration_ms: int = 0,
     outro_duration_ms: int = 0,
+    beat_scene_map: dict[str, str] | None = None,
 ) -> list[BgmSpan]:
     """按启用幕把正文 ``[0, total_duration_ms]`` 连续切成若干 :class:`BgmSpan`。
 
-    * ``timeline.scenes`` 的 ``panel_id`` 映射到幕（``panel_ids`` 命中），
-      对不上幕的时间格归入相邻前幕（开头悬空归第一幕），保证区间无空洞；
+    * ``timeline.scenes`` 的归属幕按 **beat → scene_id** 优先判定
+      （Patch v4.13：幕与分句画面已解耦，同一分镜可被多句复用），
+      没有 ``scene_id`` 时才回退到按 ``panel_id`` 命中幕；
+    * 时间格对不上任何启用幕时归入相邻前幕（开头悬空归第一幕），保证区间无空洞；
     * 相邻幕若解析出同一文件且增益（保留 1 位小数）相同，自动合并；
     * 首段向前含封页时长（负起点）、末段向后含结尾时长，由混音环节夹取。
     """
@@ -864,6 +894,16 @@ def build_scene_bgm_spans(
     for scene in active_scenes:
         for panel_id in scene.panel_ids:
             panel_owner.setdefault(panel_id, scene)
+
+    scene_owner: dict[str, StoryboardScene] = {
+        scene.scene_id: scene for scene in active_scenes
+    }
+    # Patch v4.13：解说句 → 幕（只保留真实存在的幕）。
+    beat_owner: dict[str, StoryboardScene] = {}
+    for beat_id, scene_id in (beat_scene_map or {}).items():
+        scene = scene_owner.get(scene_id)
+        if scene is not None:
+            beat_owner[beat_id] = scene
 
     resolved: dict[str, tuple[Path | None, float]] = {
         scene.scene_id: resolve_scene_bgm_path(
@@ -883,7 +923,7 @@ def build_scene_bgm_spans(
     # 1) 时间格按出现顺序归组到 owner（None = 没对上任何启用幕）。
     raw: list[tuple[int, int, StoryboardScene | None]] = []
     for tl_scene in sorted(timeline.scenes or [], key=lambda item: int(item.start_ms)):
-        owner = panel_owner.get(tl_scene.panel_id)
+        owner = beat_owner.get(tl_scene.beat_id) or panel_owner.get(tl_scene.panel_id)
         start = max(0, int(tl_scene.start_ms))
         end = min(total_ms, int(tl_scene.end_ms))
         if end <= start:
@@ -2093,6 +2133,8 @@ def render_episode(
                     settings=settings,
                     cover_duration_ms=eff_cover_ms,
                     outro_duration_ms=eff_outro_ms,
+                    # Patch v4.13：BGM 归属幕优先按剧本里的 scene_id 判定。
+                    beat_scene_map=load_beat_scene_map(episode_dir),
                 )
                 if spans:
                     distinct_keys = {
@@ -2200,6 +2242,7 @@ __all__ = [
     "dedupe_series_export_links",
     "exports_dir_for",
     "list_bgm_library",
+    "load_beat_scene_map",
     "out_dir_for",
     "plan_dir_for",
     "probe_duration_ms",

@@ -44,6 +44,7 @@ import { formatMs, playPreviewTone, resolveSpokenText } from '../utils/pronuncia
 import { formatBytes } from '../utils/format';
 import { PanelZoomModal, type RoleOption, type SaveStatus } from './PanelZoomModal';
 import { StoryboardEditor } from './StoryboardEditor';
+import { TtsTagPicker } from './TtsTagPicker';
 import BgmLibraryDrawer from './BgmLibraryDrawer';
 
 interface EpisodeStudioViewProps {
@@ -134,6 +135,8 @@ const DRAFT_EDITABLE_FIELDS: Array<keyof ScriptBeat> = [
   'motion',
   'focus_hint',
   'sfx_cue',
+  /** Patch v4.13：这条解说归属的镜头组（幕）。 */
+  'scene_id',
 ];
 
 /** 把字段值归一化成可比字符串（null/undefined 视作空，数组按 JSON 比）。 */
@@ -406,8 +409,12 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
       beats: [] as ScriptBeat[],
     };
     for (const beat of draftBeats) {
-      const panelId = beat.target_panel_ids[0];
-      const owner = scenes.find((scene) => scene.panel_ids.includes(panelId));
+      // Patch v4.13：幕归属优先用剧本里显式记录的 scene_id（幕与分句画面已解耦，
+      // 同一格漫画可以被多句复用）；没有 scene_id 时才回退按第一张分镜反查。
+      const sceneId = (beat.scene_id ?? '').trim();
+      const owner = sceneId
+        ? scenes.find((scene) => scene.scene_id === sceneId)
+        : scenes.find((scene) => scene.panel_ids.includes(beat.target_panel_ids[0]));
       if (owner) {
         groups.find((group) => group.key === owner.scene_id)?.beats.push(beat);
       } else {
@@ -443,6 +450,14 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   const [audioRevision, setAudioRevision] = useState(0);
   /** 全局只保留一个正在播放的 audio 元素，便于停止 / 切换。 */
   const audioElRef = useRef<HTMLAudioElement | null>(null);
+
+  // ---- Patch v4.14：MiniMax 语气词 / 句中停顿标签 ----
+  /** 标签浮层当前作用的 beat_id（非空即展开浮层）。 */
+  const [tagPickerBeatId, setTagPickerBeatId] = useState<string | null>(null);
+  /** 每条分镜的送音文本 textarea 引用（插入后要还焦、光标停在标签后）。 */
+  const ttsTextareaRefs = useRef<Record<string, HTMLTextAreaElement | null>>({});
+  /** 每条分镜最近一次的选区 {start, end}。 */
+  const ttsSelections = useRef<Record<string, { start: number; end: number }>>({});
 
   // ---- Patch v4.8：重跑前草稿防残留保护 ----
   /** 句间停顿被改动过：必须先重建时间轴（S6）再出片，跳过 S6 会吃到旧停顿。 */
@@ -822,6 +837,11 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     [timelineSegments]
   );
 
+  /** Patch v4.13：原漫链接（后端已做 catalog → episodes_catalog → episode.json 回退）。 */
+  const viewerUrl = (episode.viewer_url ?? '').trim();
+  /** 只有 http/https 才渲染成可点外链；local:// 之类只显示「本地目录导入」标签。 */
+  const isHttpViewerUrl = /^https?:\/\//i.test(viewerUrl);
+
   useEffect(() => {
     if (!isPlayingVideo || totalSimDurationMs === 0) return;
     let rafId = 0;
@@ -888,6 +908,87 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     }
     markTableDirty();
   };
+
+  /**
+   * Patch v4.13：表格行里的紧凑语速微调（-/+ 步进）。
+   *
+   * 只改这一句的 speed_override，不动角色默认语速；「恢复默认」写回 null。
+   */
+  const nudgeBeatSpeed = (beat: ScriptBeat, delta: number) => {
+    const base = beat.speed_override ?? roleSpeedForBeat(beat);
+    const next = Math.min(2, Math.max(0.5, Math.round((base + delta) * 100) / 100));
+    updateBeatField(beat.beat_id, 'speed_override', next);
+  };
+
+  /**
+   * Patch v4.14：把选中的语气词 / 停顿标签写进这句的送音文本。
+   *
+   * 规则（与后端 tts_tags.py 对齐）：
+   * - 送音文本为空 → 用字幕原文铺底；语气词插句首（`{tag} {narration_text}`），
+   *   停顿标签没有「两段文字之间」可放，只给温和提示不插入；
+   * - 送音文本非空 → 按最近选区替换（无选区则按光标处插入）；
+   * - 相邻已有停顿标签 → 替换掉旧的那个，避免连用（后端也会合并，这里先一步收敛）。
+   */
+  const insertTtsTag = (beat: ScriptBeat, snippet: string) => {
+    const isPauseTag = /^<#/.test(snippet);
+    const current = beat.tts_text ?? '';
+    const trimmed = current.trim();
+    if (trimmed === '') {
+      if (isPauseTag) {
+        setSaveHint(
+          '停顿标签只能放在句中两段文字之间：先写好送音文本，或在中间位置插入。'
+        );
+        return;
+      }
+      const base = (beat.narration_text ?? '').trim();
+      if (!base) {
+        setSaveHint('这句还没有字幕原文，无法铺底插入标签。');
+        return;
+      }
+      const next = `${snippet} ${base}`;
+      updateBeatField(beat.beat_id, 'tts_text', next);
+      focusAfterTag(beat.beat_id, next.length, 0);
+      return;
+    }
+
+    const saved = ttsSelections.current[beat.beat_id];
+    const length = current.length;
+    const start = Math.max(0, Math.min(saved ? saved.start : length, length));
+    const end = Math.max(start, Math.min(saved ? saved.end : start, length));
+    let head = current.slice(0, start);
+    let tail = current.slice(end);
+    if (isPauseTag) {
+      // 相邻停顿标签：把紧邻的旧标签摘掉，避免写成 <#0.5#><#0.8#>。
+      head = head.replace(/<#[\d.]+#>$/, '');
+      tail = tail.replace(/^<#[\d.]+#>/, '');
+    }
+    const next = `${head}${snippet}${tail}`;
+    updateBeatField(beat.beat_id, 'tts_text', next);
+    focusAfterTag(beat.beat_id, head.length + snippet.length, 0);
+  };
+
+  /** 插入标签后还焦，并把光标停在插入内容正后方。 */
+  const focusAfterTag = (beatId: string, caret: number, delay = 0) => {
+    requestAnimationFrame(() => {
+      const el = ttsTextareaRefs.current[beatId];
+      if (!el) return;
+      el.focus();
+      const pos = Math.max(0, Math.min(caret, el.value.length));
+      el.setSelectionRange(pos, pos);
+    });
+  };
+
+  /** 浮层打开时，点面板外部即关闭（Esc 由 TtsTagPicker 内部处理）。 */
+  useEffect(() => {
+    if (!tagPickerBeatId) return;
+    const onPointerDown = (event: MouseEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target && target.closest('[data-tts-tag-popover]')) return;
+      setTagPickerBeatId(null);
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    return () => document.removeEventListener('mousedown', onPointerDown);
+  }, [tagPickerBeatId]);
 
   // ── 分镜大图弹窗：字幕原文改完，在切换分镜 / 关闭弹窗时落盘 ────────────
   /**
@@ -1451,6 +1552,37 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     episode.status !== 'queued' &&
     !!onRegenerateBeatTts;
 
+  /** Patch v4.13：重配弹窗里展示的「这一句」信息。 */
+  const regeneratePreview = useMemo(() => {
+    if (!regenerateTarget) return null;
+    const beat =
+      draftBeatsRef.current.find((b) => b.beat_id === regenerateTarget) ??
+      draftBeats.find((b) => b.beat_id === regenerateTarget);
+    if (!beat) return null;
+    const voice = beatVoiceInfo(beat);
+    return {
+      narrationText: beat.narration_text ?? '',
+      ttsText: beat.tts_text ?? '',
+      role: (beat.speaker_role ?? '').trim() || voice.label,
+      voice: voice.voice,
+      speed: voice.speed,
+      speedOverridden: voice.speedOverridden,
+      pauseAfterMs: beat.pause_after_ms ?? 0,
+    };
+  }, [regenerateTarget, draftBeats]);
+
+  /** Patch v4.13：重配弹窗按 Esc 关闭（合成中锁定，防止半途改目标）。 */
+  useEffect(() => {
+    if (!regenerateTarget) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      if (regenerateBusy) return;
+      setRegenerateTarget(null);
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [regenerateTarget, regenerateBusy]);
+
   /** Patch v4.12：确认单句重配；rerunFromS6=true 时后端顺带提交从 S6 出片的任务。 */
   const handleConfirmRegenerate = useCallback(
     async (rerunFromS6: boolean) => {
@@ -1530,8 +1662,28 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
               点击「从此步重跑」或「向后清理」都会先清空该步及全部下游旧产物与完成标记，保证状态与真实成片一致。
             </p>
           </div>
-          <div className="text-xs font-mono-tabular text-slate-500">
-            {episode.episode_id} · 总时长 {totalSimDurationMs > 0 ? formatMs(totalSimDurationMs) : '未合成'}
+          <div className="flex items-center gap-3 text-xs font-mono-tabular text-slate-500">
+            <span>
+              {episode.episode_id} · 总时长{' '}
+              {totalSimDurationMs > 0 ? formatMs(totalSimDurationMs) : '未合成'}
+            </span>
+            {/* Patch v4.13：原漫链接。只渲染 http/https 外链；local:// 目录导入只给标签。 */}
+            {viewerUrl && isHttpViewerUrl ? (
+              <a
+                href={viewerUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-2 py-1 text-[11px] font-medium text-slate-700 hover:border-slate-400 hover:text-slate-900"
+              >
+                <Eye size={12} />
+                查看原漫
+              </a>
+            ) : viewerUrl ? (
+              <span className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-[11px] text-slate-500">
+                <FolderOutput size={12} />
+                本地目录导入
+              </span>
+            ) : null}
           </div>
         </div>
 
@@ -2243,54 +2395,6 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
             {/* TAB 2: Script & Polyphone Editor */}
             {activeTab === 'script' && (
               <div className="space-y-5">
-                {/* Patch v4.12：单句重配 TTS 的内联二次确认条（禁用 window.confirm） */}
-                {regenerateTarget && (
-                  <div className="p-3.5 rounded-lg border border-amber-200 bg-amber-50/70 text-xs text-amber-900">
-                    <div className="flex items-start gap-2">
-                      <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600" />
-                      <div className="flex-1 space-y-2">
-                        <p className="font-medium">
-                          确认只重配「
-                          <span className="font-mono-tabular">{regenerateTarget}</span>
-                          」这一句的配音？
-                        </p>
-                        <ul className="list-disc pl-4 space-y-0.5 text-amber-800/90">
-                          <li>按当前草稿（字幕 / 送音文本 / 情绪 / 角色 / 音色 / 语速 / 停顿）重新合成，只调用 1 次 TTS。</li>
-                          <li>其它句子的音频与顺序完全不动，本句旧音频被新文件原位覆盖。</li>
-                          <li>重配后需从 Stage 6 重建时间轴，新音频才会进入成片；也可以直接让后端顺带提交出片任务。</li>
-                        </ul>
-                        <div className="flex flex-wrap items-center gap-2 pt-0.5">
-                          <button
-                            type="button"
-                            disabled={regenerateBusy}
-                            onClick={() => void handleConfirmRegenerate(false)}
-                            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-amber-600 rounded hover:bg-amber-700 transition-colors cursor-pointer disabled:opacity-50"
-                          >
-                            {regenerateBusy && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-                            只重配此句
-                          </button>
-                          <button
-                            type="button"
-                            disabled={regenerateBusy}
-                            onClick={() => void handleConfirmRegenerate(true)}
-                            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-blue-600 rounded hover:bg-blue-700 transition-colors cursor-pointer disabled:opacity-50"
-                          >
-                            {regenerateBusy && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-                            重配并从 S6 重新出片
-                          </button>
-                          <button
-                            type="button"
-                            disabled={regenerateBusy}
-                            onClick={() => setRegenerateTarget(null)}
-                            className="px-3 py-1.5 text-xs font-medium text-slate-600 bg-white border border-slate-200 rounded hover:bg-slate-50 transition-colors cursor-pointer disabled:opacity-50"
-                          >
-                            取消
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                )}
                 {beatSceneGroups.map((group) => {
                   const scene = group.scene;
                   const sceneDurationMs = group.beats.reduce(
@@ -2499,15 +2603,74 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                           </td>
 
                           <td className="py-3.5 px-3">
-                            <textarea
-                              rows={2}
-                              value={beat.tts_text}
-                              onChange={(e) =>
-                                updateBeatField(beat.beat_id, 'tts_text', e.target.value)
-                              }
-                              placeholder="留空则自动继承字幕 + 词典替换；填写时必须是整句送音文本..."
-                              className="w-full p-2 text-xs text-slate-800 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600 resize-none"
-                            />
+                            <div className="relative">
+                              <div className="mb-1 flex items-center justify-between gap-2">
+                                <span className="text-[10px] text-slate-400">
+                                  标签只写送音文本，字幕不受影响
+                                </span>
+                                {/* Patch v4.14：语气词 / 句中停顿标签浮层入口。 */}
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setTagPickerBeatId((prev) =>
+                                      prev === beat.beat_id ? null : beat.beat_id
+                                    )
+                                  }
+                                  aria-label={`${beat.beat_id} 插入语气或停顿标签`}
+                                  title="插入 MiniMax 语气词（如 (laughs)）或句中停顿（如 <#0.5#>）"
+                                  className="rounded-md border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-600 hover:border-blue-400 hover:text-blue-700 transition-colors"
+                                >
+                                  + 语气 / 停顿标签
+                                </button>
+                              </div>
+                              <textarea
+                                rows={2}
+                                value={beat.tts_text}
+                                ref={(el) => {
+                                  ttsTextareaRefs.current[beat.beat_id] = el;
+                                }}
+                                onSelect={(e) => {
+                                  const el = e.currentTarget;
+                                  ttsSelections.current[beat.beat_id] = {
+                                    start: el.selectionStart,
+                                    end: el.selectionEnd,
+                                  };
+                                }}
+                                onClick={(e) => {
+                                  const el = e.currentTarget;
+                                  ttsSelections.current[beat.beat_id] = {
+                                    start: el.selectionStart,
+                                    end: el.selectionEnd,
+                                  };
+                                }}
+                                onKeyUp={(e) => {
+                                  const el = e.currentTarget;
+                                  ttsSelections.current[beat.beat_id] = {
+                                    start: el.selectionStart,
+                                    end: el.selectionEnd,
+                                  };
+                                }}
+                                onChange={(e) =>
+                                  updateBeatField(beat.beat_id, 'tts_text', e.target.value)
+                                }
+                                placeholder="留空则自动继承字幕 + 词典替换；填写时必须是整句送音文本..."
+                                className="w-full p-2 text-xs text-slate-800 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600 resize-none"
+                              />
+                              {tagPickerBeatId === beat.beat_id && (
+                                <div
+                                  data-tts-tag-popover
+                                  className="absolute right-0 top-full z-40 mt-1"
+                                >
+                                  <TtsTagPicker
+                                    value={beat.tts_text ?? ''}
+                                    selection={ttsSelections.current[beat.beat_id] ?? null}
+                                    ttsModel={config.ttsModel}
+                                    onPick={(snippet) => insertTtsTag(beat, snippet)}
+                                    onClose={() => setTagPickerBeatId(null)}
+                                  />
+                                </div>
+                              )}
+                            </div>
                             <div className="mt-1 text-[11px] text-slate-500 leading-snug">
                               {matchedRules.length > 0 ? (
                                 <span className="text-blue-700">
@@ -2584,6 +2747,53 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                                   {voiceInfo.hint}
                                 </div>
                               )}
+                              {/* Patch v4.13：表格行紧凑语速微调（-/+ 步进 + 数字 + 恢复默认）。 */}
+                              <div className="flex items-center gap-1 text-[11px] font-mono-tabular">
+                                <span className="text-slate-400">语速</span>
+                                <button
+                                  type="button"
+                                  onClick={() => nudgeBeatSpeed(beat, -0.02)}
+                                  aria-label={`${beat.beat_id} 语速降低`}
+                                  className="w-5 h-5 rounded border border-slate-200 bg-white text-slate-600 leading-none hover:border-slate-400 hover:text-slate-900"
+                                >
+                                  −
+                                </button>
+                                <span
+                                  className={`w-12 text-center ${
+                                    voiceInfo.speedOverridden
+                                      ? 'text-blue-700 font-semibold'
+                                      : 'text-slate-500'
+                                  }`}
+                                  title={
+                                    voiceInfo.speedOverridden
+                                      ? `已逐句微调，角色默认 ${voiceInfo.roleSpeed.toFixed(2)}x`
+                                      : `跟随角色默认 ${voiceInfo.roleSpeed.toFixed(2)}x`
+                                  }
+                                >
+                                  {voiceInfo.speed.toFixed(2)}x
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => nudgeBeatSpeed(beat, 0.02)}
+                                  aria-label={`${beat.beat_id} 语速提高`}
+                                  className="w-5 h-5 rounded border border-slate-200 bg-white text-slate-600 leading-none hover:border-slate-400 hover:text-slate-900"
+                                >
+                                  +
+                                </button>
+                                {voiceInfo.speedOverridden && (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      updateBeatField(beat.beat_id, 'speed_override', null)
+                                    }
+                                    aria-label={`${beat.beat_id} 语速恢复默认`}
+                                    title="恢复为角色默认语速"
+                                    className="rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-500 hover:border-slate-400 hover:text-slate-800"
+                                  >
+                                    恢复默认
+                                  </button>
+                                )}
+                              </div>
                             </div>
                           </td>
 
@@ -3063,6 +3273,91 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         onChangeEmotion={handleZoomEmotionChange}
         onChangeSpeed={handleZoomSpeedChange}
       />
+
+      {/* Patch v4.13：单句重配 TTS 的居中确认弹窗（禁用 window.confirm / window.alert）。 */}
+      {regenerateTarget && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-[1px] p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-label="确认重配这一句的配音"
+          onClick={() => {
+            if (!regenerateBusy) setRegenerateTarget(null);
+          }}
+        >
+          <div
+            className="w-full max-w-md rounded-xl border border-slate-200 bg-white shadow-xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-start gap-2 border-b border-slate-100 px-4 py-3">
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600" />
+              <div className="flex-1 space-y-1">
+                <p className="text-sm font-semibold text-slate-900">
+                  确认重配「
+                  <span className="font-mono-tabular">{regenerateTarget}</span>
+                  」这一句的配音？
+                </p>
+                <p className="text-[11px] leading-4 text-slate-500">
+                  按当前草稿重新合成，只调用 1 次 TTS；其它句子的音频与顺序完全不动。
+                </p>
+              </div>
+            </div>
+            <div className="space-y-2.5 px-4 py-3 text-xs text-slate-700">
+              <div className="rounded-lg bg-slate-50 px-2.5 py-2">
+                <div className="text-[11px] text-slate-500">待合成文本</div>
+                <div className="mt-0.5 whitespace-pre-wrap break-words leading-5 text-slate-800">
+                  {regeneratePreview?.ttsText ||
+                    regeneratePreview?.narrationText ||
+                    '（这句还没有草稿文本）'}
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-slate-500">
+                <span>
+                  配音角色：{regeneratePreview?.role || '未指定'}
+                  {regeneratePreview?.voice ? ` · ${regeneratePreview.voice}` : ''}
+                </span>
+                <span>
+                  语速：
+                  {regeneratePreview
+                    ? `${regeneratePreview.speed.toFixed(2)}x${
+                        regeneratePreview.speedOverridden ? '（已逐句微调）' : ''
+                      }`
+                    : '—'}
+                </span>
+                <span>停顿：{regeneratePreview ? `${regeneratePreview.pauseAfterMs}ms` : '—'}</span>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center justify-end gap-2 border-t border-slate-100 px-4 py-3">
+              <button
+                type="button"
+                disabled={regenerateBusy}
+                onClick={() => setRegenerateTarget(null)}
+                className="px-3 py-1.5 text-xs font-medium text-slate-600 bg-white border border-slate-200 rounded hover:bg-slate-50 transition-colors cursor-pointer disabled:opacity-50"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                disabled={regenerateBusy}
+                onClick={() => void handleConfirmRegenerate(false)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-amber-600 rounded hover:bg-amber-700 transition-colors cursor-pointer disabled:opacity-50"
+              >
+                {regenerateBusy && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                只重配此句
+              </button>
+              <button
+                type="button"
+                disabled={regenerateBusy}
+                onClick={() => void handleConfirmRegenerate(true)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-blue-600 rounded hover:bg-blue-700 transition-colors cursor-pointer disabled:opacity-50"
+              >
+                {regenerateBusy && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                重配并从 S6 重新出片
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
