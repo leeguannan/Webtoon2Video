@@ -970,7 +970,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
       if (!isPauseTag) {
         const next = `${snippet} ${base}`;
         updateBeatField(beat.beat_id, 'tts_text', next);
-        focusAfterTag(beat.beat_id, snippet.length + 1, 0);
+        focusAfterTag(beat.beat_id, snippet.length + 1);
         return;
       }
       // 停顿标签：插在句中标点之后（停顿必须夹在两段文字之间）。
@@ -979,7 +979,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         const insertAt = mark.index + mark.text.length;
         const next = `${base.slice(0, insertAt)}${snippet}${base.slice(insertAt)}`;
         updateBeatField(beat.beat_id, 'tts_text', next);
-        focusAfterTag(beat.beat_id, insertAt + snippet.length, 0);
+        focusAfterTag(beat.beat_id, insertAt + snippet.length);
         setSaveHint(`已把停顿标签插在「${mark.text}」后面，可继续微调位置。`);
         return;
       }
@@ -987,31 +987,39 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
       const mid = Math.floor(base.length / 2);
       updateBeatField(beat.beat_id, 'tts_text', base);
       ttsSelections.current[beat.beat_id] = { start: mid, end: mid };
-      focusAfterTag(beat.beat_id, mid, 0);
+      focusAfterTag(beat.beat_id, mid);
       setSaveHint(
         '已把字幕原文铺底为送音文本，光标放在句中；确认位置后再点一次「插入停顿」。'
       );
       return;
     }
 
+    // 选区：优先用最近一次记录的选区；没有记录时回退读文本框当前的
+    // selectionStart / selectionEnd（失焦后浏览器仍会保留光标位置）。
     const saved = ttsSelections.current[beat.beat_id];
+    const el = ttsTextareaRefs.current[beat.beat_id];
+    const live = el
+      ? { start: el.selectionStart ?? current.length, end: el.selectionEnd ?? el.selectionStart ?? current.length }
+      : null;
+    const picked = saved ?? live;
     const length = current.length;
-    const start = Math.max(0, Math.min(saved ? saved.start : length, length));
-    const end = Math.max(start, Math.min(saved ? saved.end : start, length));
+    const start = Math.max(0, Math.min(picked ? picked.start : length, length));
+    const end = Math.max(start, Math.min(picked ? picked.end : start, length));
     let head = current.slice(0, start);
     let tail = current.slice(end);
     if (isPauseTag) {
-      // 相邻停顿标签：把紧邻的旧标签摘掉，避免写成 <#0.5#><#0.8#>（允许中间有空白）。
-      head = head.replace(/<#\s*[\d.]+\s*#>\s*$/, '');
-      tail = tail.replace(/^\s*<#\s*[\d.]+\s*#>/, '');
+      // 相邻停顿标签：把紧邻的旧标签摘掉，避免写成 <#0.5#><#0.8#>。
+      // 标签格式与后端 tts_tags.py 的 MINIMAX_PAUSE_TAG_PATTERN 保持一致。
+      head = head.replace(/<#\d+(?:\.\d+)?#>\s*$/, '');
+      tail = tail.replace(/^\s*<#\d+(?:\.\d+)?#>/, '');
     }
     const next = `${head}${snippet}${tail}`;
     updateBeatField(beat.beat_id, 'tts_text', next);
-    focusAfterTag(beat.beat_id, head.length + snippet.length, 0);
+    focusAfterTag(beat.beat_id, head.length + snippet.length);
   };
 
   /** 插入标签后还焦，并把光标停在插入内容正后方。 */
-  const focusAfterTag = (beatId: string, caret: number, delay = 0) => {
+  const focusAfterTag = (beatId: string, caret: number) => {
     requestAnimationFrame(() => {
       const el = ttsTextareaRefs.current[beatId];
       if (!el) return;
@@ -2636,7 +2644,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                                   }
                                   title="这一句归属哪一幕（留空＝按分镜自动回退）"
                                   aria-label={`${beat.beat_id} 归属幕`}
-                                  className="w-16 px-1 py-0.5 text-[11px] bg-white border border-slate-200 rounded"
+                                  className="w-24 px-1 py-0.5 text-[11px] bg-white border border-slate-200 rounded"
                                 >
                                   <option value="">自动</option>
                                   {storyboardScenes.map((scene) => (
@@ -2710,6 +2718,13 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                                   };
                                 }}
                                 onKeyUp={(e) => {
+                                  const el = e.currentTarget;
+                                  ttsSelections.current[beat.beat_id] = {
+                                    start: el.selectionStart,
+                                    end: el.selectionEnd,
+                                  };
+                                }}
+                                onBlur={(e) => {
                                   const el = e.currentTarget;
                                   ttsSelections.current[beat.beat_id] = {
                                     start: el.selectionStart,

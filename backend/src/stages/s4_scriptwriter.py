@@ -791,10 +791,44 @@ def _scene_panel_index(
     return panel_to_scene
 
 
+def _scene_ordinal_index(
+    scenes: Sequence[StoryboardScene] | None,
+) -> dict[str, int]:
+    """启用幕的 ``scene_id`` → 幕序号（映射不到的不收）。
+
+    幕序号与 ``_scene_panel_index`` 保持一致：只统计启用且 ``panel_ids`` 非空的幕，
+    按 ``scenes`` 中的出现顺序从 1 递增。Patch v4.13 起幕与分句画面解耦，
+    beat 可以直接带 ``scene_id``，跨幕边界优先按它判定。
+    """
+    ordinals: dict[str, int] = {}
+    if not scenes:
+        return ordinals
+    ordinal = 0
+    for scene in scenes:
+        if not getattr(scene, "enabled", True) or not scene.panel_ids:
+            continue
+        ordinal += 1
+        scene_id = str(getattr(scene, "scene_id", "") or "").strip()
+        if scene_id:
+            ordinals.setdefault(scene_id, ordinal)
+    return ordinals
+
+
 def _beat_scene_ordinal(
-    beat: dict[str, Any], panel_to_scene: dict[str, int]
+    beat: dict[str, Any],
+    panel_to_scene: dict[str, int],
+    scene_ordinals: dict[str, int] | None = None,
 ) -> int | None:
-    """按 ``target_panel_ids`` 取该 beat 归属的启用幕序号（映射不到返 None）。"""
+    """取该 beat 归属的启用幕序号（映射不到返 None）。
+
+    Patch v4.13：幕与分句画面已解耦，beat 上的 ``scene_id`` 是权威归属；
+    只有 ``scene_id`` 为空或未命中启用幕时，才回退按 ``target_panel_ids`` 反查。
+    """
+    scene_id = str(beat.get("scene_id") or "").strip()
+    if scene_id and scene_ordinals:
+        ordinal = scene_ordinals.get(scene_id)
+        if ordinal is not None:
+            return ordinal
     for panel_id in beat.get("target_panel_ids") or []:
         ordinal = panel_to_scene.get(str(panel_id))
         if ordinal is not None:
@@ -850,9 +884,17 @@ def apply_narrative_pacing(
 
     durations = dict(audio_durations_ms or {})
     panel_to_scene = _scene_panel_index(scenes)
-    active_scene_count = len(set(panel_to_scene.values()))
+    scene_ordinals_by_id = _scene_ordinal_index(scenes)
+    # 启用幕数量：优先按 scene_id 索引统计（与 _scene_panel_index 的编号一致），
+    # 没有 scenes 时才退回按面板反推的幕序号集合。
+    active_scene_count = (
+        len(scene_ordinals_by_id)
+        if scene_ordinals_by_id
+        else len(set(panel_to_scene.values()))
+    )
     scene_ordinals = [
-        _beat_scene_ordinal(beat, panel_to_scene) for beat in paced
+        _beat_scene_ordinal(beat, panel_to_scene, scene_ordinals_by_id)
+        for beat in paced
     ]
     original_pauses = [int(beat.get("pause_after_ms") or 0) for beat in paced]
 

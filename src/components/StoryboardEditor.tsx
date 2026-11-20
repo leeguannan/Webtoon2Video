@@ -150,6 +150,24 @@ function sortPanelIds(panelIds: string[]): string[] {
 }
 
 /**
+ * 幕内相邻两格能否换序。
+ *
+ * 后端 `_validate_storyboard_scenes` 要求幕内分镜的 `panel_sort_key` 单调不减，
+ * 而幕内本来就得按剧情时间序排列，所以只有「同一张分镜的两个副本」互换才不会
+ * 破坏该约束（两者 sort key 相同）；不同分镜互换必然逆序，保存时会被后端 400
+ * 拒绝（`第 X 幕的分镜顺序必须单调不减`）。据此隐藏会触发后端报错的换序按钮。
+ */
+function canSwapWithinScene(
+  panelIds: string[],
+  localIdx: number,
+  dir: 'up' | 'down'
+): boolean {
+  const neighbourIdx = dir === 'up' ? localIdx - 1 : localIdx + 1;
+  if (neighbourIdx < 0 || neighbourIdx >= panelIds.length) return false;
+  return panelIds[localIdx] === panelIds[neighbourIdx];
+}
+
+/**
  * 在幕内把第 localIdx 格上移 / 下移。
  * 按索引换序而不是按 id 查找：同一分镜在本幕可能重复出现多次，
  * 按 id 换序会连带影响所有副本，与「只动被点的那一格」的语义冲突。
@@ -164,6 +182,8 @@ function movePanelWithinScene(
   if (!target) return scenes;
   const neighbourIdx = dir === 'up' ? localIdx - 1 : localIdx + 1;
   if (neighbourIdx < 0 || neighbourIdx >= target.panel_ids.length) return scenes;
+  // 守卫：只有同一张分镜的副本之间才允许换序，否则会破坏幕内单调不减校验。
+  if (!canSwapWithinScene(target.panel_ids, localIdx, dir)) return scenes;
   const next = scenes.map((scene, index) =>
     index === sceneIdx ? { ...scene, panel_ids: [...scene.panel_ids] } : scene
   );
@@ -756,6 +776,13 @@ export const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                 )}
               </div>
 
+              {/* 幕内换序规则提示：不同分镜不可互换（后端要求幕内单调不减） */}
+              {scene.panel_ids.length > 1 && (
+                <p className="px-4 pt-3 text-[11px] text-slate-500">
+                  同一幕内按剧情时间序排列；跨句复用同一格请通过「添加分镜」插入。
+                </p>
+              )}
+
               {/* 缩略图网格 */}
               <div className="p-4 flex gap-3 overflow-x-auto">
                 {scene.panel_ids.map((panelId, localIdx) => {
@@ -830,29 +857,30 @@ export const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                               <ArrowRight className="w-3 h-3" />
                             </button>
                           )}
-                          {/* 幕内换序：按索引交换，同一分镜重复出现时也能正确换位 */}
-                          {localIdx > 0 && (
+                          {/* 幕内换序：仅同一分镜的两个副本之间可换（不同分镜互换会破坏后端单调序校验） */}
+                          {localIdx > 0 && canSwapWithinScene(scene.panel_ids, localIdx, 'up') && (
                             <button
                               type="button"
                               onClick={() => handleMoveWithinScene(scene.scene_id, localIdx, 'up')}
                               className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-white/95 text-slate-700 text-[10px] font-medium shadow-xs hover:bg-white cursor-pointer"
-                              title="在本幕内上移一格"
+                              title="在本幕内上移一格（同一分镜的副本，交换不影响后端顺序校验）"
                             >
                               <ArrowUp className="w-3 h-3" />
                               上移
                             </button>
                           )}
-                          {localIdx < scene.panel_ids.length - 1 && (
-                            <button
-                              type="button"
-                              onClick={() => handleMoveWithinScene(scene.scene_id, localIdx, 'down')}
-                              className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-white/95 text-slate-700 text-[10px] font-medium shadow-xs hover:bg-white cursor-pointer"
-                              title="在本幕内下移一格"
-                            >
-                              下移
-                              <ArrowDown className="w-3 h-3" />
-                            </button>
-                          )}
+                          {localIdx < scene.panel_ids.length - 1 &&
+                            canSwapWithinScene(scene.panel_ids, localIdx, 'down') && (
+                              <button
+                                type="button"
+                                onClick={() => handleMoveWithinScene(scene.scene_id, localIdx, 'down')}
+                                className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-white/95 text-slate-700 text-[10px] font-medium shadow-xs hover:bg-white cursor-pointer"
+                                title="在本幕内下移一格（同一分镜的副本，交换不影响后端顺序校验）"
+                              >
+                                下移
+                                <ArrowDown className="w-3 h-3" />
+                              </button>
+                            )}
                         </div>
                       </div>
                       <p className="text-[11px] text-slate-500 line-clamp-2 leading-snug">

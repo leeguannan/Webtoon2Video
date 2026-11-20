@@ -892,3 +892,52 @@ def test_sync_helper_supports_dict_container_and_missing_file(tmp_path: Path) ->
     assert [item["pause_after_ms"] for item in reloaded["audios"]] == [650, 700]
     # 非停顿字段保持不变
     assert reloaded["audios"][0]["duration_ms"] == 1000
+
+
+# --------------------------------------------------------------------------
+# Patch v4.13：幕与分句画面解耦后，跨幕边界优先按 beat.scene_id 判定
+# --------------------------------------------------------------------------
+def test_scene_id_takes_priority_over_panel_lookup_for_scene_boundary() -> None:
+    """beat.scene_id 是权威归属：同一张分镜也能判出跨幕边界。
+
+    Patch v4.13 起幕与分句画面解耦，``beat.scene_id`` 才是归属依据；
+    只有 scene_id 缺失或未命中启用幕时，才回退按 target_panel_ids 反查。
+    """
+    scenes = [
+        StoryboardScene(
+            scene_id="s1",
+            scene_index=0,
+            title="第一幕",
+            location="室内",
+            panel_ids=["p1"],
+            enabled=True,
+        ),
+        StoryboardScene(
+            scene_id="s2",
+            scene_index=1,
+            title="第二幕",
+            location="室外",
+            panel_ids=["p2"],
+            enabled=True,
+        ),
+    ]
+    # b1 / b2 引用同一张分镜（回退查表会判成同幕），但 scene_id 不同 → 跨幕。
+    beats = [
+        {**_beat("b1", "她把伞递了过去。", panels=["p1"]), "scene_id": "s1"},
+        {**_beat("b2", "对方接住了伞。", panels=["p1"]), "scene_id": "s2"},
+    ]
+    out, report = apply_narrative_pacing(beats, scenes=scenes)
+    # b1 → b2 跨幕 → 1150ms 留白；b2 是启用幕 >= 2 时的全话末条收尾留白。
+    assert out[0]["pause_after_ms"] == PACE_SCENE_END_MS
+    assert out[1]["pause_after_ms"] == PACE_SCENE_END_MS
+    assert report.scene_end_count == 2
+
+    # 对照：不带 scene_id 时回退按分镜反查 → 同幕 → 不触发跨幕留白。
+    beats_no_scene = [
+        _beat("b1", "她把伞递了过去。", panels=["p1"]),
+        _beat("b2", "对方接住了伞。", panels=["p1"]),
+    ]
+    out_no_scene, report_no_scene = apply_narrative_pacing(beats_no_scene, scenes=scenes)
+    assert out_no_scene[0]["pause_after_ms"] == PACE_SAME_PANEL_MIN_MS
+    # b1 没有被判成跨幕（只有全话末条 b2 触发收尾留白）。
+    assert "b1" not in report_no_scene.changed_beat_ids

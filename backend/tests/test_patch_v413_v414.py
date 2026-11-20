@@ -538,3 +538,41 @@ def test_prompts_document_new_rules() -> None:
 
     vision = (REPO_ROOT / "backend" / "prompts" / "vision_extract.md").read_text(encoding="utf-8")
     assert "简体中文" in vision
+
+
+# --------------------------------------------------------------------------
+# 代码评审修复：截断后残留停顿标签 + 贴首贴尾空白
+# --------------------------------------------------------------------------
+def test_normalize_script_payload_drops_trailing_pause_tag_after_clip() -> None:
+    """截断恰好落在停顿标签前时，句尾不留孤立停顿标签。
+
+    Patch 评审修复：``clip_text`` 保留标签的旧实现会把额度用尽之后的那条
+    停顿标签一并拼到结果末尾，产出 ``...正文<#0.5#>`` 这种孤立标签。
+    """
+    payload = {
+        "episode_id": "wt_test_ep_001",
+        "hook_title": "雨夜来客",
+        "beats": [
+            {
+                "beat_id": "b1",
+                "narration_text": "甲" * 120,
+                "tts_text": "甲" * 120 + "<#0.5#>" + "乙" * 10,
+                "target_panel_ids": ["p_001"],
+            },
+        ],
+    }
+    result = normalize_script_payload(payload, episode_id="wt_test_ep_001", episode_no=1)
+    tts_text = result["beats"][0]["tts_text"]
+    assert tts_text is not None
+    assert not tts_text.endswith("<#0.5#>")
+    assert "<#0.5#>" not in tts_text
+    # 正文额度仍然用满（120 字），不因丢标签而少截。
+    assert tts_text == "甲" * 120
+
+
+def test_normalize_minimax_pause_tags_strips_edge_whitespace() -> None:
+    """剥除贴首 / 贴尾孤立停顿标签时，同步去掉内侧多余空白。"""
+    assert normalize_minimax_pause_tags("<#0.5#> 你好") == "你好"
+    assert normalize_minimax_pause_tags("你好 <#0.5#>") == "你好"
+    # 句中停顿不受影响。
+    assert normalize_minimax_pause_tags("你好<#0.5#>世界") == "你好<#0.5#>世界"

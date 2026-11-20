@@ -149,12 +149,13 @@ def normalize_minimax_pause_tags(text: str) -> str:
 
     # 4) 剥除贴首 / 贴尾的孤立停顿标签（停顿只能放在句中两段可发音文字之间）。
     #    若剥除后整句会变空，则保留它（此时它是句子的全部内容，不是「孤立」标签）。
+    #    剥除时同步去掉标签内侧的空白，避免留下 " 你好" / "你好 " 这种残边。
     leading = re.match(r"^(?P<ws>\s*)<#\d+(?:\.\d{1,2})?#>", merged)
     if leading is not None and merged[leading.end() :].strip():
-        merged = leading.group("ws") + merged[leading.end() :]
+        merged = merged[leading.end() :].lstrip()
     trailing = re.search(r"<#\d+(?:\.\d{1,2})?#>(?P<ws>\s*)$", merged)
     if trailing is not None and merged[: trailing.start()].strip():
-        merged = merged[: trailing.start()] + trailing.group("ws")
+        merged = merged[: trailing.start()].rstrip()
     return merged
 
 

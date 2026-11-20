@@ -723,7 +723,9 @@ def normalize_script_payload(
             # Patch v4.14：停顿标签规范化（合并相邻、钳位秒数、剥除贴首贴尾）。
             tts_text = normalize_minimax_pause_tags(tts_text)
             # 标签字符不计入长度额度，且绝不从标签中间腰斩。
-            tts_text = clip_text_by_spoken_length(tts_text, MAX_NARRATION_CHARS) or None
+            tts_text = clip_text_by_spoken_length(tts_text, MAX_NARRATION_CHARS)
+            # 截断可能把停顿标签留在句尾（变成孤立停顿），兜底再规范化一次。
+            tts_text = normalize_minimax_pause_tags(tts_text) or None
         # Patch v3.1 Patch 10：可选音效标签（白名单收敛，非法值 / "none" 丢弃）。
         sfx_cue_raw = item.get("sfx_cue")
         sfx_cue = coerce_str(sfx_cue_raw).lower() if sfx_cue_raw is not None else ""
