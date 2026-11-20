@@ -47,6 +47,7 @@ from stages.s4_scriptwriter import (
     PACE_LEAD_IN_MAX_MS,
     PACE_LONG_PAUSE_MS,
     PACE_PANEL_SWITCH_MS,
+    PACE_SAME_PANEL_MIN_MS,
     PACE_SCENE_END_MS,
     PACE_TURN_MS,
     PacingReport,
@@ -388,6 +389,57 @@ def test_pacing_is_pure_and_keeps_other_fields() -> None:
     # 空列表安全早退
     empty_out, empty_report = apply_narrative_pacing([])
     assert empty_out == [] and empty_report.updated_count == 0
+
+
+# --------------------------------------------------------------------------
+# 4.6 规则 0 收紧 + 规则 E 同图保底（Patch v4.10）
+# --------------------------------------------------------------------------
+def test_lead_in_protection_only_covers_narrator_openings() -> None:
+    """角色台词与已收尾的旁白句不再吃规则 0 保护，会正常进入规则 A/B/C/D。"""
+    # ① 角色台词（带引号）即使停顿只有 60ms 也不受保护；切到新分镜图 → 规则 D 400ms。
+    beats = [
+        _beat("b1", "“手术一切顺利。”", pause=60, role="恩彗", panels=["p1"]),
+        _beat("b2", "“谢谢您。”", pause=150, role="恩彗", panels=["p2"]),
+    ]
+    out, report = apply_narrative_pacing(beats)
+    assert out[0]["pause_after_ms"] == PACE_PANEL_SWITCH_MS
+    assert report.panel_switch_count == 1
+    assert "b1" in report.changed_beat_ids
+
+    # ② 已经用句号收尾的旁白句（pause=0）不再受保护：进入规则流程后
+    #    由规则 E（同图最小保底）抬到 150ms。
+    beats2 = [
+        _beat("b1", "医生说手术一切顺利。", pause=0, panels=["p1"]),
+        _beat("b2", "“谢谢您。”", pause=150, role="恩彗", panels=["p1"]),
+    ]
+    out2, report2 = apply_narrative_pacing(beats2)
+    assert out2[0]["pause_after_ms"] == PACE_SAME_PANEL_MIN_MS
+    assert "b1" in report2.changed_beat_ids
+
+    # ③ 无冒号的短引导短语仍受规则 0 保护：停顿保持 80ms，连规则 E 也不碰它。
+    beats3 = [
+        _beat("b1", "他接过话头", pause=PACE_LEAD_IN_MAX_MS, panels=["p1"]),
+        _beat("b2", "“终于来了。”", pause=150, role="ethan", panels=["p2"]),
+    ]
+    out3, report3 = apply_narrative_pacing(beats3)
+    assert out3[0]["pause_after_ms"] == PACE_LEAD_IN_MAX_MS
+    assert "b1" not in report3.changed_beat_ids
+
+
+def test_same_panel_min_raises_only_below_floor() -> None:
+    """规则 E：同图连说时低于 150ms 的停顿抬到 150ms，150ms 及以上原样保留。"""
+    beats = [
+        _beat("b1", "第一句。", pause=0, panels=["p1"]),
+        _beat("b2", "第二句。", pause=60, panels=["p1"]),
+        _beat("b3", "第三句。", pause=150, panels=["p1"]),
+        _beat("b4", "第四句。", pause=200, panels=["p1"]),
+    ]
+    out, report = apply_narrative_pacing(beats)
+    assert out[0]["pause_after_ms"] == PACE_SAME_PANEL_MIN_MS
+    assert out[1]["pause_after_ms"] == PACE_SAME_PANEL_MIN_MS
+    assert out[2]["pause_after_ms"] == 150
+    assert out[3]["pause_after_ms"] == 200
+    assert report.changed_beat_ids == ["b1", "b2"]
 
 
 # --------------------------------------------------------------------------

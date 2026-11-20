@@ -115,6 +115,14 @@ _SIDECHAIN_RATIO = 2.0
 _SIDECHAIN_ATTACK_MS = 30
 _SIDECHAIN_RELEASE_MS = 350
 
+#: 视频编码参数（Patch v4.10：码率提质）。
+#:
+#: 旧链路是 ``-preset veryfast -crf 20``，1080×1920 竖屏实测只有 ~800kbps，
+#: 字幕描边与漫画线条在成片里明显发糊。改为「medium 预设 + VBV 码率约束」后
+#: 码率稳定在 3~4Mbps，清晰度提升明显，编码耗时增加有限。
+#: ``aq-mode=3`` 让 x264 按帧的宏观复杂度分配码率，暗部噪点更少。
+_VIDEO_MINRATE = "2500k"
+
 #: 错误信息里保留的 stderr 末尾长度（够定位问题，又不会把整份 ffmpeg 日志塞进异常）。
 _STDERR_TAIL_CHARS = 2000
 
@@ -1346,6 +1354,12 @@ def _render_segment(
     background_darken: float,
     out_path: Path,
     ffmpeg_bin: str,
+    # ---- Patch v4.10：x264 编码参数（码率提质）----
+    video_preset: str = "medium",
+    video_crf: int = 17,
+    video_bitrate: str | None = "3500k",
+    video_maxrate: str | None = "5500k",
+    video_bufsize: str | None = "7000k",
     # ---- Patch v4.5：作品级封页 / 双结尾片包（全默认 = 历史行为 100% 一致）----
     cover_png: Path | None = None,
     cover_duration_ms: int = 0,
@@ -1603,8 +1617,20 @@ def _render_segment(
     args += [
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
-        "-preset", "veryfast",
-        "-crf", "20",
+        "-preset", video_preset,
+    ]
+    # Patch v4.10：码率优先（VBV 约束 + aq-mode=3）；未给码率时才回落到 CRF。
+    if video_bitrate:
+        args += [
+            "-b:v", video_bitrate,
+            "-minrate", _VIDEO_MINRATE,
+            "-maxrate", video_maxrate or video_bitrate,
+            "-bufsize", video_bufsize or video_bitrate,
+            "-x264-params", "aq-mode=3",
+        ]
+    else:
+        args += ["-crf", str(video_crf)]
+    args += [
         "-c:a", "aac",
         "-b:a", "192k",
         "-ar", str(_AUDIO_RATE),
@@ -1636,6 +1662,12 @@ def render_timeline(
     enable_sfx: bool = True,
     sfx_gain_db: float = DEFAULT_SFX_GAIN_DB,
     assets_dir: Path | None = None,
+    # ---- Patch v4.10：x264 编码参数（码率提质）----
+    video_preset: str = "medium",
+    video_crf: int = 17,
+    video_bitrate: str | None = "3500k",
+    video_maxrate: str | None = "5500k",
+    video_bufsize: str | None = "7000k",
     # ---- Patch v4.5：片包参数（全默认 = 历史行为 100% 一致）----
     cover_png: Path | None = None,
     cover_duration_ms: int = 0,
@@ -1819,6 +1851,11 @@ def render_timeline(
             background_darken=background_darken,
             out_path=seg_out,
             ffmpeg_bin=ffmpeg_bin,
+            video_preset=video_preset,
+            video_crf=video_crf,
+            video_bitrate=video_bitrate,
+            video_maxrate=video_maxrate,
+            video_bufsize=video_bufsize,
             cover_png=cover_png if cover_active and is_first_segment else None,
             cover_duration_ms=cover_duration_ms,
             cover_fade_in_ms=cover_fade_in_ms,
@@ -2044,6 +2081,11 @@ def render_episode(
         work_dir=work_dir,
         enable_sfx=settings.render.enable_sfx,
         sfx_gain_db=settings.render.sfx_gain_db,
+        video_preset=settings.render.video_preset,
+        video_crf=settings.render.video_crf,
+        video_bitrate=settings.render.video_bitrate,
+        video_maxrate=settings.render.video_maxrate,
+        video_bufsize=settings.render.video_bufsize,
         cover_png=cover_composed,
         cover_duration_ms=effective.cover_duration_ms,
         cover_fade_in_ms=effective.cover_fade_in_ms,

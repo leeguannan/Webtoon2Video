@@ -642,6 +642,14 @@ PACE_TURN_SFX: frozenset[str] = frozenset(
 PACE_SUSPENSE_ENDINGS: tuple[str, ...] = ("……", "…？", "？！", "...？")
 #: 允许插换气口的自然句末标点。
 PACE_BREATH_ENDINGS: tuple[str, ...] = ("。", "！", "？", "”", "……")
+#: 旁白说话人标识（中英文写法都算旁白）。
+#: 只有旁白说的句子才可能是「引导句」——角色台词一律不走规则 0 保护。
+PACE_NARRATOR_ROLES: frozenset[str] = frozenset({"narrator", "旁白", "解说"})
+#: 句末 / 闭合引号：文本以此收尾说明这句话已经说完，不能再当引导句。
+PACE_SENTENCE_ENDINGS: tuple[str, ...] = ("。", "！", "？", "……", "”", "’", '"', "'")
+#: 规则 E：同一张分镜图内连说时的最小保底留白（Patch v4.10）。
+#: 低于该值的停顿会让两句话硬贴在一起，听感上像「没停顿」。
+PACE_SAME_PANEL_MIN_MS = 150
 
 
 @dataclass(slots=True)
@@ -665,15 +673,36 @@ def _beat_speaker(beat: dict[str, Any]) -> str:
     return str(beat.get("speaker_role") or "narrator")
 
 
+def _is_narrator(beat: dict[str, Any]) -> bool:
+    """该 beat 是否由旁白说出（兼容「旁白」「解说」等中文写法）。"""
+    return _beat_speaker(beat).strip().lower() in PACE_NARRATOR_ROLES
+
+
 def _is_lead_in(beat: dict[str, Any], next_beat: dict[str, Any] | None) -> bool:
-    """规则 0：引号引导句保护——这类短停顿绝不允许被任何规则拉长。"""
+    """规则 0：引号引导句保护——这类短停顿绝不允许被任何规则拉长。
+
+    Patch v4.10 收紧判定口径，避免保护过头把该有的留白一起吞掉：
+
+    1. **只有旁白说的句子才可能是引导句**。角色台词（「“手术一切顺利。”」）
+       永远不吃规则 0 的保护，会正常进入规则 A/B/C/D。
+    2. **旁白引导词**（以「：」或「:」结尾）直接判定为引导句。
+    3. **无冒号的短引导**（如「他接过话头」）需要同时满足四个条件：
+       当前 beat 是旁白、停顿 <= ``PACE_LEAD_IN_MAX_MS``、当前文本**没有**
+       以句末标点 / 闭合引号收尾、下一条是角色台词或含「“」。
+       已经用句号收尾的普通句子（哪怕停顿只有 0ms）不再被保护。
+    """
     if next_beat is None:
+        return False
+    if not _is_narrator(beat):
         return False
     text = _beat_text(beat).strip()
     current_pause = int(beat.get("pause_after_ms") or 0)
     # 旁白引导词（「XX 说道：」）且后面还跟着一条 beat。
-    if _beat_speaker(beat) == "narrator" and text.endswith(("：", ":")):
+    if text.endswith(("：", ":")):
         return True
+    # 已经收尾的句子不是引导句（句号 / 感叹号 / 问号 / 省略号 / 闭合引号）。
+    if text.endswith(PACE_SENTENCE_ENDINGS):
+        return False
     # 显式短停顿（<=80ms）且下一条是角色台词：念完引导词立刻接角色声音。
     next_speaker = _beat_speaker(next_beat)
     next_text = _beat_text(next_beat)
@@ -759,7 +788,8 @@ def apply_narrative_pacing(
 
     规则优先级：规则 0（引号引导句保护）> 规则 A（跨幕结尾 1150ms）>
     规则 B（转折 / 悬念 / 高潮 950ms）> 规则 C（长连说换气 480ms）>
-    规则 D（跨分镜切换底线 400ms，Patch v4.9）。
+    规则 D（跨分镜切换底线 400ms，Patch v4.9）>
+    规则 E（同图最小保底留白 150ms，Patch v4.10）。
     每条 beat 最多命中一个规则；只抬高、不压低停顿，结果统一夹逼到
     ``[0, 2000]``。返回 ``(新 beat 列表, PacingReport)``，入参原对象与
     ``narration_text`` / ``tts_text`` / ``speaker_role`` /
@@ -900,6 +930,15 @@ def apply_narrative_pacing(
                     new_pause = raised
                     rule_hit = "panel_switch"
 
+        # ---- 规则 E：同图最小保底留白 150ms（Patch v4.10）----
+        # 同一张分镜图内连说时也留一点呼吸，避免两句话硬贴在一起、听感上
+        # 像「完全没停顿」。规则 A/B/C/D 都命中不了时才生效，只抬高不压低。
+        if rule_hit is None and original < PACE_SAME_PANEL_MIN_MS:
+            raised = max(original, PACE_SAME_PANEL_MIN_MS)
+            if raised > original:
+                new_pause = raised
+                rule_hit = "same_panel_min"
+
         if rule_hit is not None:
             beat["pause_after_ms"] = max(
                 PACE_PAUSE_MIN_MS, min(PACE_PAUSE_MAX_MS, new_pause)
@@ -917,10 +956,14 @@ def apply_narrative_pacing(
                 report.breath_count += 1
                 streak_ms = 0
                 last_long_idx = i
-            else:
+            elif rule_hit == "panel_switch":
                 # 规则 D：只抬高停顿，不重置连说累计与长停顿间隔基准，
                 # 避免 400ms 切分镜被误当成换气口从而抑制后续规则 B / C。
                 report.panel_switch_count += 1
+            else:
+                # 规则 E：同图保底留白——同样只抬高停顿，不重置连说累计与
+                # 长停顿间隔基准，避免 150ms 保底被误当成换气口。
+                pass
 
     # 统一夹逼（含未被规则触达的 beat，防御非法历史值），不改任何其它字段。
     for beat in paced:

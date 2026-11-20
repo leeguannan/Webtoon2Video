@@ -118,10 +118,16 @@ LOUDNESS_RESAMPLE_FILTER = "aresample=24000"
 #: 破坏「裁完的第一个采样就是人声」这个不变式（实测首采样从 9830 掉到 218）。
 #: 归一后再裁一次即可清掉振铃：阈值取 ``-35dB``（约 1.8% 幅度，远低于人声
 #: 起音电平），正常人声的首尾样本都在 ``-30dB`` 以上，不会被误裁。
+#:
+#: Patch v4.10：**尾端**（作用在反向流上的那一段）放宽到 ``-40dB`` +
+#: ``start_silence=0.08``——四声 / 轻声收尾的音节尾部会自然衰减到 ``-35dB``
+#: 以下，旧阈值容易被过早切断，出现「最后一个字被削掉」的听感；``-40dB``
+#: 仍高于 loudnorm 振铃的 ``-43~-47dB``，振铃照样清得掉。头端保持
+#: ``-35dB:start_silence=0`` 不变（起音必须贴紧时间轴，不留前导静音）。
 LOUDNESS_TRIM_FILTER = (
     "silenceremove=start_periods=1:start_threshold=-35dB:start_silence=0:detection=peak,"
     "areverse,"
-    "silenceremove=start_periods=1:start_threshold=-35dB:start_silence=0.05:detection=peak,"
+    "silenceremove=start_periods=1:start_threshold=-40dB:start_silence=0.08:detection=peak,"
     "areverse"
 )
 

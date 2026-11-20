@@ -135,6 +135,16 @@ class RenderConfig(_StrictModel):
     #: Patch v3.2 Patch 14：音效增益从 -10dB 提升到 -3.5dB（混前再做 dynaudnorm 峰值归一）。
     #: Patch v4.0 Patch 18：再抬到 -2.0dB，让扇耳光 / 摔碎这类关键音效听得见。
     sfx_gain_db: float = -2.0
+    #: Patch v4.10：x264 编码预设（medium 比 veryfast 画质更好，编码略慢）。
+    video_preset: str = "medium"
+    #: Patch v4.10：``video_bitrate`` 为空时回落到 CRF 模式的取值。
+    video_crf: int = 17
+    #: Patch v4.10：目标码率。旧链路是 ``-preset veryfast -crf 20``，
+    #: 1080×1920 实测只有 ~800kbps，字幕边缘发糊；改为 3~4Mbps 明显更清晰。
+    video_bitrate: str | None = "3500k"
+    #: Patch v4.10：码率上限（maxrate）与 VBV 缓冲区大小。
+    video_maxrate: str | None = "5500k"
+    video_bufsize: str | None = "7000k"
 
 
 class VoiceSpec(_StrictModel):

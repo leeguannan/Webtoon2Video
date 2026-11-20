@@ -855,6 +855,10 @@ export default function App() {
 
     if (targets.length === 0) return;
 
+    /* 触发流水线运行：借这次点击手势把音频上下文解锁并保持 running，
+       否则成片完成提示音会在自动播放策略下被拦掉。 */
+    primeNotificationAudio();
+
     try {
       await apiFetch<{ jobs: unknown[] }>('/jobs/batch', {
         method: 'POST',
@@ -880,6 +884,9 @@ export default function App() {
     fromStage: StageId,
     mode: RunMode
   ) => {
+    /* 阶段重跑同样在用户手势里解锁音频上下文：S7 跑完时（往往已经离开
+       了这次点击）提示音才播，提前解锁才不会静音。 */
+    primeNotificationAudio();
     try {
       await apiFetch(`/episodes/${encodeURIComponent(episodeId)}/rerun`, {
         method: 'POST',

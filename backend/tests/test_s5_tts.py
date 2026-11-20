@@ -471,3 +471,25 @@ async def test_manifest_order_follows_script_beats(tmp_path) -> None:
     )
 
     assert [meta.beat_id for meta in metas] == [f"beat_{index:03d}" for index in range(1, 6)]
+
+
+# ----------------------------------------------------------------------
+# Patch v4.10：归一后二次裁剪的尾端参数
+# ----------------------------------------------------------------------
+def test_loudness_trim_filter_keeps_head_and_relaxes_tail() -> None:
+    """头端保持 -35dB/0（起音贴紧时间轴），尾端放宽到 -40dB/0.08。
+
+    尾端放宽是为了不削掉四声 / 轻声收尾的音节尾巴；-40dB 仍高于
+    loudnorm 振铃的 -43~-47dB，振铃照样清得掉。
+    """
+    segments = [
+        part
+        for part in s5_tts.LOUDNESS_TRIM_FILTER.split(",areverse,")
+        if "silenceremove" in part
+    ]
+    assert len(segments) == 2
+    head, tail = segments
+    assert "start_threshold=-35dB" in head
+    assert "start_silence=0:" in head
+    assert "start_threshold=-40dB" in tail
+    assert "start_silence=0.08" in tail
