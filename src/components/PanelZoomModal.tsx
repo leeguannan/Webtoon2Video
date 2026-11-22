@@ -41,8 +41,6 @@ interface PanelZoomModalProps {
   onChangeNarration: (beatId: string, text: string) => void;
   /** 改本句说话人；音色由角色自动带出，不直接挑音色。 */
   onChangeRole: (beatId: string, role: string) => void;
-  /** 情绪指令（送音时的语气提示）。 */
-  onChangeEmotion: (beatId: string, text: string) => void;
   /** Patch v4.4：改本句语速（传 null = 清空微调，恢复角色默认语速）。 */
   onChangeSpeed: (beatId: string, speed: number | null) => void;
 }
@@ -82,7 +80,6 @@ export const PanelZoomModal: React.FC<PanelZoomModalProps> = ({
   onSelectBeat,
   onChangeNarration,
   onChangeRole,
-  onChangeEmotion,
   onChangeSpeed,
 }) => {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -326,26 +323,6 @@ export const PanelZoomModal: React.FC<PanelZoomModalProps> = ({
                   className="w-full accent-blue-600 cursor-pointer"
                 />
               </div>
-
-              <div>
-                <label
-                  htmlFor="zoom-emotion-input"
-                  className="block text-xs font-medium text-slate-700 mb-1.5"
-                >
-                  情绪指令（emotion_instruction · 送音语气）
-                </label>
-                <input
-                  id="zoom-emotion-input"
-                  type="text"
-                  aria-label="情绪指令"
-                  value={beat.emotion_instruction ?? ''}
-                  onChange={(event) =>
-                    onChangeEmotion(beat.beat_id, event.target.value)
-                  }
-                  placeholder="例如：急切、颤抖地低语"
-                  className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 focus:border-blue-600 focus:outline-none"
-                />
-              </div>
             </div>
 
             {/* 保存状态 */}
@@ -412,7 +389,7 @@ export const PanelZoomModal: React.FC<PanelZoomModalProps> = ({
             <p className="text-[11px] text-slate-400 leading-relaxed">
               快捷键：Esc 关闭 · ←/→ 翻格（焦点在输入框内时为移动光标）
               <br />
-              修改字幕原文、配音角色、情绪指令、语速后，在切换分镜或关闭弹窗时自动保存，不会触发重新配音；如需重出配音请回审核台点「保存并从 Stage 5 重跑配音」。
+              修改字幕原文、配音角色、语速后，在切换分镜或关闭弹窗时自动保存，不会触发重新配音；如需重出配音请回审核台点「保存并从 Stage 5 重跑配音」。
             </p>
           </div>
         </div>

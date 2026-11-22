@@ -96,7 +96,7 @@ AUDIO_CACHE_DIRNAME = "_cache"
 AUDIO_CACHE_INDEX_FILENAME = "index.json"
 #: 缓存指纹的版本号：合成链路（裁剪 / 响度 / 采样率 / 音色解析）一旦变化就换版本，
 #: 旧缓存自然失效，不会被误当成「同一段音频」。
-AUDIO_CACHE_PIPELINE_VERSION = "v4.16-trim-lufs16"
+AUDIO_CACHE_PIPELINE_VERSION = "v4.18-trim-lufs16"
 
 #: ``pause_after_ms`` 缺省值（与 :class:`core.schemas.ScriptBeat` 的默认值一致）。
 DEFAULT_PAUSE_AFTER_MS = 250
@@ -1040,11 +1040,17 @@ def _cache_store(
     *,
     duration_ms: int,
     beat_id: str,
+    overwrite: bool = False,
 ) -> dict[str, Any] | None:
     """把合成结果存进缓存，返回待写入索引的记录。
 
     **只有真实合成且探测成功**的音频才会进来；失败静音占位（Patch v4.3）
     走的是另一条路径，永远不会污染缓存。
+
+    Patch v4.18：``overwrite=True`` 时**无条件覆盖**同名缓存文件。
+    单句重配（``resynthesize_single_beat``）的音频可能与旧音频**字节长度完全相同**
+    （同一句话重配，采样率与时长不变），只比大小会误判「内容没变」而保留旧音频，
+    于是重配结果被旧缓存吞掉。
     """
     if not synth_hash or duration_ms <= 0:
         return None
@@ -1052,7 +1058,7 @@ def _cache_store(
         cache_dir.mkdir(parents=True, exist_ok=True)
         suffix = source.suffix or ".wav"
         target = cache_dir / f"{synth_hash}{suffix}"
-        if not target.is_file() or target.stat().st_size != source.stat().st_size:
+        if overwrite or not target.is_file() or target.stat().st_size != source.stat().st_size:
             tmp = cache_dir / f".{synth_hash}{suffix}.tmp"
             shutil.copyfile(source, tmp)
             os.replace(tmp, target)
@@ -1123,15 +1129,18 @@ def _resolve_beat_synth_plan(
 
     * ``v``：合成链路版本；
     * ``spoken_text``：最终送音文本（含多音字替换与标签）；
-    * ``instruction``：情绪指令；
     * ``voice``：最终实际音色；
     * ``speed`` / ``native_speed``：语速；
     * ``tts_model`` / ``provider`` / ``sample_rate``：合成器身份；
     * ``trim_silence``：是否做静音裁剪与响度归一。
 
-    **明确不纳入**：``beat_id`` / ``pause_after_ms`` / ``target_panel_ids`` /
-    ``motion`` / ``focus_hint`` / ``sfx_cue`` / ``scene_id``——它们不影响音频本身，
-    纳入只会让缓存白白失效。
+    **明确不纳入**：``emotion_instruction`` / ``beat_id`` / ``pause_after_ms`` /
+    ``target_panel_ids`` / ``motion`` / ``focus_hint`` / ``sfx_cue`` / ``scene_id``
+    ——它们不参与「是不是同一段音频」的判定，纳入只会让缓存白白失效。
+
+    Patch v4.18：``emotion_instruction`` **明确不纳入**缓存指纹——情绪指令只是送音
+    语气提示，改了它绝不触发重新 TTS 合成（否则调个语气就把整话配音全部重算一遍）。
+    指纹之外的 ``plan.instruction`` 仍然原样透传给 ``client.synthesize``。
     """
     # Patch v3.4 Patch 17：连续对白说话人继承。没写「XX说：」的纯引号对白
     # 继承上一句对白的说话人 / 性别，避免「男角色说一半突然变女声」。
@@ -1207,7 +1216,7 @@ def _resolve_beat_synth_plan(
     fingerprint: dict[str, Any] = {
         "v": AUDIO_CACHE_PIPELINE_VERSION,
         "spoken_text": spoken,
-        "instruction": str(getattr(beat, "emotion_instruction", "") or ""),
+        # Patch v4.18：情绪指令不进指纹——改了它不重新合成（仍原样透传给合成器）。
         "voice": str(beat_voice or ""),
         "speed": round(float(speed), 4),
         "native_speed": bool(native_speed),
@@ -1371,6 +1380,10 @@ async def _synthesize_beat(
             final_path,
             duration_ms=duration_ms,
             beat_id=beat.beat_id,
+            # Patch v4.18：单句重配（不读缓存但写回缓存）必须**无条件覆盖**同名缓存文件。
+            # 重配后的音频可能与旧音频字节长度完全相同，只比大小会留下旧音频，
+            # 导致「重配完再跑整话」又变回旧声音。
+            overwrite=not use_cache and write_cache,
         )
         if record is not None and cache_records is not None:
             cache_records.append(record)

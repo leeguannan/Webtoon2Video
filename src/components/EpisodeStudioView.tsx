@@ -1115,11 +1115,6 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     });
   };
 
-  /** Patch v4.2：弹窗内改情绪指令（送音语气）。 */
-  const handleZoomEmotionChange = (beatId: string, text: string) => {
-    updateZoomBeat(beatId, 'emotion_instruction', text);
-  };
-
   /**
    * Patch v4.4：弹窗内调单句语速。
    *
@@ -2577,8 +2572,8 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                               <th className="py-3 px-3 min-w-[220px]">
                                 TTS 送音文本（整句 · 不改字幕）
                               </th>
-                              <th className="py-3 px-3 min-w-[210px]">
-                                Qwen TTS 情绪指令 (instruction)
+                              <th className="py-3 px-3 min-w-[185px]">
+                                配音角色与语速
                               </th>
                               <th className="py-3 px-3 w-36">运镜与停顿</th>
                               <th className="py-3 pl-3 pr-5 w-32 text-right">试听 / 插入 / 删</th>
@@ -2766,19 +2761,9 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                           </td>
 
                           <td className="py-3.5 px-3">
-                            <textarea
-                              rows={2}
-                              value={beat.emotion_instruction}
-                              onChange={(e) =>
-                                updateBeatField(
-                                  beat.beat_id,
-                                  'emotion_instruction',
-                                  e.target.value
-                                )
-                              }
-                              className="w-full p-2 text-xs text-slate-800 bg-white border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600 resize-none"
-                            />
-                            <div className="mt-1 text-[11px] font-mono-tabular text-slate-400">
+                            {/* Patch v4.18：移除情绪指令输入框——情绪指令不再由前端设置，
+                                合成侧固定使用后端契约里的默认/继承值。 */}
+                            <div className="text-[11px] font-mono-tabular text-slate-400">
                               {config.ttsModel}
                             </div>
                             {/* Patch v3.4：显示「本句配音」（角色 + 音色），并可就地改角色。 */}
@@ -3290,10 +3275,6 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                         <dd className="font-mono-tabular font-medium text-blue-700">
                           {currentVideoSegment.beat.motion}
                         </dd>
-                        <dt className="text-slate-500">TTS 情绪指令</dt>
-                        <dd className="text-slate-800">
-                          {currentVideoSegment.beat.emotion_instruction}
-                        </dd>
                         <dt className="text-slate-500">实际送音文本</dt>
                         <dd className="text-slate-800">
                           {resolveSpokenText(currentVideoSegment.beat, rules).spokenText}
@@ -3352,7 +3333,6 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         onSelectBeat={handleZoomSelectBeat}
         onChangeNarration={handleZoomNarrationChange}
         onChangeRole={handleZoomRoleChange}
-        onChangeEmotion={handleZoomEmotionChange}
         onChangeSpeed={handleZoomSpeedChange}
       />
 
