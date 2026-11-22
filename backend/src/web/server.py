@@ -32,6 +32,7 @@ import binascii
 import json
 import os
 import re
+import sys
 import tempfile
 import time
 import zipfile
@@ -602,6 +603,46 @@ def _to_simplified_beat(beat: ScriptBeat) -> ScriptBeat:
     if not updates:
         return beat
     return beat.model_copy(update=updates)
+
+
+def _canonicalize_script_beats(
+    series_dir: Path, beats: list[ScriptBeat]
+) -> list[ScriptBeat]:
+    """统一一批句子的角色名写法（Patch v4.16）。
+
+    * ``speaker_role`` 走角色位归一（全名 / 简称 / 同音变体 → 规范角色名）；
+    * ``narration_text`` / ``tts_text`` 走正文归一（只替换确知的角色名变体，
+      外貌称呼与「小恩小惠」这类惯用词不受影响）。
+
+    任何异常都不应阻断人工保存，因此失败时原样返回。
+    """
+    if not beats:
+        return beats
+    try:
+        from stages.s4_scriptwriter import build_episode_canonicalizer
+
+        characters = s5_tts.load_bible_characters(series_dir)
+        canonicalizer = build_episode_canonicalizer(
+            series_dir,
+            characters,
+            extra_names=[beat.speaker_role for beat in beats if beat.speaker_role],
+            extra_texts=[
+                text
+                for beat in beats
+                for text in (beat.narration_text, beat.tts_text or "")
+                if text
+            ],
+        )
+        payload = canonicalizer.canonicalize_script_dict(
+            {"beats": [beat.model_dump(mode="json") for beat in beats]}
+        )
+        raw_beats = payload.get("beats") or []
+        if len(raw_beats) != len(beats):
+            return beats
+        return [ScriptBeat.model_validate(raw) for raw in raw_beats]
+    except Exception as exc:  # noqa: BLE001 - 角色名归一失败不应阻断保存
+        print(f"[server] 角色名归一失败，保留原文：{exc}", file=sys.stderr)
+        return beats
 
 
 class PanelFlagRequest(BaseModel):
@@ -1913,6 +1954,9 @@ def create_app(
         beats = _merge_script_beats(script.beats, payload.beats)
         # Patch v4.13：人工保存也强制简体中文（字幕与送音文本一起转）。
         beats = [_to_simplified_beat(beat) for beat in beats]
+        # Patch v4.16：人工保存也统一角色名写法（同音错字归一，
+        # 例如把「恩慧」「恩惠」统一成规范名「恩彗」）。
+        beats = _canonicalize_script_beats(view.registry.series_dir(series_id), beats)
         script = script.model_copy(update={"beats": beats})
         save_model(script, script_path)
         # Patch v4.6：人工调整停顿后同步进 audio_manifest，只重跑 S6→S7 即生效。

@@ -315,6 +315,12 @@ class SeriesConfig(_StrictModel):
     tts: SeriesTTSConfig | None = None
     #: Patch v4.5：作品级通用封页写字 + 双结尾图 + 平滑转场片包。
     branding: SeriesBrandingConfig = Field(default_factory=SeriesBrandingConfig)
+    #: Patch v4.16：作品级角色别名表（角色名 → 规范名或别名列表）。
+    #:
+    #: 例：``{"恩彗": ["恩慧", "恩惠"]}`` 或 ``{"恩惠": "恩彗"}``。
+    #: Stage 4 产出的角色名写法不一时，用这张表把别名归并到同一个规范名，
+    #: 避免同一角色在解说词、角色表与音色表里被拆成好几个人。
+    character_aliases: dict[str, str | list[str]] = Field(default_factory=dict)
 
 
 def _package_root() -> Path:

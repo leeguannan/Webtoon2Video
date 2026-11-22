@@ -20,6 +20,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from core.character_unify import are_homophone_name_variants
 from core.schemas import (
     ArcSummary,
     CharacterProfile,
@@ -353,6 +354,11 @@ class StoryBibleManager:
 
             模型可能把角色从描述性称呼改成正式名（“黑发橙眼少年” → “Bam”），
             只按名字匹配会把同一个人拆成两条档案，Layer 1 角色表就会出现重名。
+
+            Patch v4.16：再加一条**同音异写**兜底——模型把「恩彗」写成
+            「恩慧」时按名字匹配不上，会把同一个人拆成两条档案；这里用
+            :func:`core.character_unify.are_homophone_name_variants` 识别，
+            归并行为与原有 aliases 合并完全一致（不改变既有归并语义）。
             """
             existing = index.get(update.name)
             if existing is not None:
@@ -365,6 +371,13 @@ class StoryBibleManager:
                     return character
                 if new_aliases & {alias for alias in character.aliases if alias}:
                     return character
+            # Patch v4.16：同音异写兜底（仅同音簇内的单字差异才算）。
+            for character in bible.characters:
+                if are_homophone_name_variants(update.name, character.name):
+                    return character
+                for alias in character.aliases:
+                    if are_homophone_name_variants(update.name, alias):
+                        return character
             return None
 
         for update in updates:

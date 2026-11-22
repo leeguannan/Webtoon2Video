@@ -679,6 +679,7 @@ def normalize_script_payload(
     episode_id: str,
     episode_no: int,
     valid_panel_ids: set[str] | None = None,
+    canonicalizer: Any | None = None,
 ) -> dict[str, Any]:
     """把模型返回的剧本 JSON 归一化到 ``NarrationScript`` 契约。
 
@@ -687,7 +688,10 @@ def normalize_script_payload(
     * ``target_panel_ids`` 过滤空值，并可按真实存在的面板 ID 过滤；
     * ``motion`` / 伏笔状态等枚举越界时收敛；
     * 相邻重复对白确定性去重（Patch v3.4 Patch 17）；
-    * 话号与话次 ID 一律以流水线为准。
+    * 话号与话次 ID 一律以流水线为准；
+    * ``canonicalizer``（Patch v4.16）非空时，收尾再把角色名 / 解说词里的
+      角色别名归并到规范名（类型标注见 :class:`core.character_unify.CharacterNameCanonicalizer`，
+      这里用 ``Any`` 以避免与 character_unify 形成循环导入）。
     """
     beats: list[dict[str, Any]] = []
     raw_beats = coerce_list(payload.get("beats"))
@@ -820,7 +824,7 @@ def normalize_script_payload(
             }
         )
 
-    return {
+    result = {
         "episode_id": episode_id,
         "hook_title": coerce_str(payload.get("hook_title")) or f"第 {episode_no} 话",
         # Patch v3.4 Patch 17：相邻重复对白确定性去重（模型偶尔把同一句写两遍）。
@@ -830,6 +834,13 @@ def normalize_script_payload(
         "new_plot_threads": new_threads,
         "resolved_thread_ids": coerce_str_list(payload.get("resolved_thread_ids")),
     }
+
+    # Patch v4.16：角色名全链路统一。Stage 4 可能把同一个角色写成「恩慧」「恩惠」，
+    # 这里用 canonicalizer 把角色名、解说词与摘要里的别名归并到规范名。
+    # 注意 ``canonicalize_script_dict`` 返回的是**新字典**（不原地改），必须接住返回值。
+    if canonicalizer is not None:
+        result = canonicalizer.canonicalize_script_dict(result)
+    return result
 
 
 def normalize_panel_payload(payload: dict[str, Any], *, panel_id: str) -> dict[str, Any]:

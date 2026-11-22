@@ -249,12 +249,18 @@ class ManifestManager:
         "story_draft.md",
     )
 
+    #: Patch v4.16：Stage 5 音频合成缓存目录名。
+    #: 与 ``stages/s5_tts.py`` 的 ``AUDIO_CACHE_DIRNAME`` 保持一致；这里不直接
+    #: import stages（core 是 stages 的下层，会形成循环依赖）。
+    TTS_CACHE_DIRNAME = "_cache"
+
     def reset_from_stage(
         self,
         episode_no: int,
         from_stage: str,
         *,
         include_human_storyboard: bool = False,
+        preserve_tts_cache: bool = False,
     ) -> dict[str, Any]:
         """清空 ``from_stage`` 及其之后所有阶段的产物，并把状态重置为「待执行」。
 
@@ -270,7 +276,10 @@ class ManifestManager:
         * Stage 4 精细清理：剧本 / 故事稿一律删；人工编排的镜头组
           （``storyboard.json`` 的 ``source == "human"``）默认保留，
           传 ``include_human_storyboard=True`` 才连它一起删；
-        * Stage 7 额外清掉作品级 ``exports/EP{话次}_*`` 导出成片。
+        * Stage 7 额外清掉作品级 ``exports/EP{话次}_*`` 导出成片；
+        * Patch v4.16：``preserve_tts_cache=True`` 且清理到 Stage 5 时，
+          ``05_audio/_cache/``（音频合成缓存）保留，Stage 5 重跑可直接复用
+          没变的句子，不必重新调 TTS。默认 ``False`` 的行为完全不变。
         """
         if from_stage not in STAGE_KEYS:
             raise ValueError(
@@ -294,6 +303,20 @@ class ManifestManager:
             if not path.is_dir():
                 return
             for child in sorted(path.iterdir()):
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                    removed += 1
+                else:
+                    _remove_file(child)
+
+        def _clear_dir_keeping(path: Path, keep_names: tuple[str, ...]) -> None:
+            """清空目录但保留指定子目录（Patch v4.16：保留 05_audio/_cache）。"""
+            nonlocal removed
+            if not path.is_dir():
+                return
+            for child in sorted(path.iterdir()):
+                if child.name in keep_names:
+                    continue
                 if child.is_dir():
                     shutil.rmtree(child, ignore_errors=True)
                     removed += 1
@@ -325,7 +348,12 @@ class ManifestManager:
                     self.series_dir / "bible_snapshots" / f"ep_{episode_no:03d}.json"
                 )
             else:
-                _clear_dir(stage_dir)
+                if stage == "s5_tts" and preserve_tts_cache:
+                    # Patch v4.16：Stage 5 重跑时保留音频合成缓存目录，
+                    # 让「没改的句子」直接复用缓存，不必重新调 TTS。
+                    _clear_dir_keeping(stage_dir, (self.TTS_CACHE_DIRNAME,))
+                else:
+                    _clear_dir(stage_dir)
                 if stage == "s7_renderer":
                     exports_dir = self.series_dir / "exports"
                     prefix = f"EP{episode_no:03d}_"

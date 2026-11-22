@@ -19,6 +19,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from core.character_unify import (
+    CharacterNameCanonicalizer,
+    build_character_canonicalizer,
+)
+from core.config import SeriesConfig, load_series_config
 from core.normalize import (
     MAX_SPEED_OVERRIDE,
     MIN_NARRATION_CHARS,
@@ -1987,6 +1992,102 @@ def render_readable_script(script: NarrationScript, *, base_source: str = "") ->
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _load_series_config_safe(series_dir: str | Path | None) -> SeriesConfig | None:
+    """安全读取作品级配置（Patch v4.16）。
+
+    读不到 / 校验失败一律返回 ``None``——Stage 4 不该因为作品配置里一个
+    拼写错误就整话失败，角色名统一只是"锦上添花"。
+    """
+    if not series_dir:
+        return None
+    try:
+        return load_series_config(Path(series_dir))
+    except Exception:  # noqa: BLE001 - 配置异常不应阻断撰稿
+        return None
+
+
+def build_episode_canonicalizer(
+    series_dir: str | Path | None,
+    characters: Sequence[Any] | None,
+    *,
+    extra_names: Iterable[str] | None = None,
+    extra_texts: Iterable[str] | None = None,
+) -> CharacterNameCanonicalizer:
+    """构建本话的角色名归一器（Patch v4.16）。
+
+    规范名优先级：作品级专属音色 > 已有 StoryBible > 本话出现频次更高者。
+    """
+    series_config = _load_series_config_safe(series_dir)
+    return build_character_canonicalizer(
+        characters=characters,
+        series_tts=getattr(series_config, "tts", None),
+        series_aliases=getattr(series_config, "character_aliases", None),
+        extra_names=extra_names,
+        extra_texts=extra_texts,
+    )
+
+
+def _story_draft_texts(draft: Any) -> list[str]:
+    """收集故事稿里的全部可读文本（Patch v4.16）。
+
+    用来做同音写法的「出现即发现」——正文里出现过的写法才算数。
+    """
+    texts: list[str] = []
+    for field_name in ("hook_opening", "full_story_markdown", "overall_plot_arc"):
+        value = getattr(draft, field_name, None)
+        if isinstance(value, str) and value:
+            texts.append(value)
+    for chapter in getattr(draft, "chapters", None) or []:
+        title = getattr(chapter, "chapter_title", "") or ""
+        prose = getattr(chapter, "story_prose", "") or ""
+        if isinstance(title, str) and title:
+            texts.append(title)
+        if isinstance(prose, str) and prose:
+            texts.append(prose)
+    return texts
+
+
+def _canonicalize_story_draft_with_text(
+    draft: Any,
+    canonicalizer: CharacterNameCanonicalizer,
+    series_dir: str | Path | None,
+    context: Any,
+) -> Any:
+    """用故事稿自身的正文重建归一器后再归一（Patch v4.16）。"""
+    texts = _story_draft_texts(draft)
+    if texts and series_dir is not None:
+        canonicalizer = build_episode_canonicalizer(
+            series_dir,
+            getattr(context, "characters", None),
+            extra_texts=texts,
+        )
+    return canonicalizer.canonicalize_story_draft(draft)
+
+
+def _append_lock(memory_block: str, character_lock: str) -> str:
+    """把「角色名锁定」提示追加到记忆块末尾（Patch v4.16）。"""
+    if not character_lock:
+        return memory_block
+    return f"{memory_block}\n\n{character_lock}"
+
+
+def canonicalizer_lock(canonicalizer: CharacterNameCanonicalizer | None) -> str:
+    """取角色名锁定提示文本（Patch v4.16）。"""
+    if canonicalizer is None:
+        return ""
+    return canonicalizer.prompt_lock_block()
+
+
+def _with_character_lock(memory_block: str, canonicalizer: CharacterNameCanonicalizer | None) -> str:
+    """把「角色名锁定」提示追加到记忆块末尾（Patch v4.16）。"""
+    if canonicalizer is None:
+        return memory_block
+    lock = canonicalizer.prompt_lock_block()
+    if not lock:
+        return memory_block
+    return f"{memory_block}\n\n{lock}"
+
+
 async def _write_overview(
     client: LLMClient,
     *,
@@ -1997,12 +2098,13 @@ async def _write_overview(
     series_title: str,
     template: str | None,
     temperature: float,
+    character_lock: str = "",
 ) -> dict:
     """第一段：通读整话，只产出钩子/摘要/角色/伏笔等元数据（不写解说句）。"""
     prompt = render_prompt(
         template if template is not None else load_prompt_template(OVERVIEW_PROMPT_FILENAME),
         {
-            "MEMORY": context.prompt_block(),
+            "MEMORY": _append_lock(context.prompt_block(), character_lock),
             "PANELS": format_panel_list(panels),
             "EPISODE_ID": episode_id,
             "EPISODE_NO": str(context.episode_no),
@@ -2040,6 +2142,7 @@ async def _write_story_draft(
     temperature: float,
     story_word_budget: str = "",
     storyboard_constraints: str = "",
+    character_lock: str = "",
 ) -> EpisodeStoryDraft:
     """Stage 4A：全话通读 + 说书体故事反写，产出按时间单调排列的章节稿。
 
@@ -2055,7 +2158,7 @@ async def _write_story_draft(
     prompt = render_prompt(
         template if template is not None else load_prompt_template(STORY_PROMPT_FILENAME),
         {
-            "MEMORY": context.prompt_block(),
+            "MEMORY": _append_lock(context.prompt_block(), character_lock),
             "PANELS": format_panel_list(panels),
             "EPISODE_ID": episode_id,
             "EPISODE_NO": str(context.episode_no),
@@ -2179,6 +2282,7 @@ async def _write_narration_chapter(
     temperature: float,
     beat_budget: str = "",
     scene_directives: str = "",
+    character_lock: str = "",
 ) -> list[dict]:
     """Step 4B：对一章故事做一次拆拍调用，产出这一章的解说句草稿。
 
@@ -2221,6 +2325,7 @@ async def _write_narration_chapter(
                     temperature=temperature,
                     beat_budget=chunk_budget,
                     scene_directives=scene_directives,
+                    character_lock=character_lock,
                 )
             )
         return result
@@ -2236,7 +2341,7 @@ async def _write_narration_chapter(
             "CHAPTER_STORY": chapter.story_prose
             or "（本章没有正文，请依据整话故事主干讲述这一段）",
             "STORY_FULL": story_full or chapter.story_prose,
-            "MEMORY_MIN": _minimal_memory_block(context),
+            "MEMORY_MIN": _append_lock(_minimal_memory_block(context), character_lock),
             "PANELS": _format_panel_ids(panel_ids, panel_map),
             "PREVIOUS_TAIL": previous_tail or "（本话开头，没有上一句需要衔接）",
             "ALIGNMENT_FEEDBACK": alignment_feedback or "（首轮，没有需要修正的问题）",
@@ -2281,6 +2386,7 @@ async def _write_narration_chapter(
             temperature=temperature,
             beat_budget=half_budgets[0],
             scene_directives=scene_directives,
+            character_lock=character_lock,
         )
         right = await _write_narration_chapter(
             client,
@@ -2298,6 +2404,7 @@ async def _write_narration_chapter(
             temperature=temperature,
             beat_budget=half_budgets[1],
             scene_directives=scene_directives,
+            character_lock=character_lock,
         )
         return left + right
     if not isinstance(data, dict):
@@ -2481,6 +2588,8 @@ async def write_episode_script(
     panels_dir: Path | None = None,
     reset_storyboard: bool = False,
     storyboard_sink: list[EpisodeStoryboard] | None = None,
+    canonicalizer: CharacterNameCanonicalizer | None = None,
+    series_dir: str | Path | None = None,
 ) -> NarrationScript:
     """Story-First 两步撰稿：先讲清故事，再顺着故事挑图配解说。
 
@@ -2537,6 +2646,7 @@ async def write_episode_script(
         series_title=series_title,
         template=overview_template,
         temperature=temperature,
+        character_lock=canonicalizer_lock(canonicalizer),
     )
     overview_text = _overview_brief(overview)
 
@@ -2703,6 +2813,7 @@ async def write_episode_script(
                 temperature=temperature,
                 story_word_budget=story_word_budget,
                 storyboard_constraints=storyboard_constraints,
+                character_lock=canonicalizer_lock(canonicalizer),
             )
         except Exception as exc:  # noqa: BLE001 - 故事反写失败不阻断流水线
             # 故事反写失败不阻断流水线：退回整话概览作为 4B 的锚点。
@@ -2711,6 +2822,15 @@ async def write_episode_script(
                 file=sys.stderr,
             )
             story_draft = _fallback_story_draft(episode_id, panels, overview_text)
+
+    # Patch v4.16：故事稿里的角色名写法归一（4A 可能把「恩彗」写成「恩慧」）。
+    # 人工改过的初稿（human_markdown 非空）不覆写，所以只在这里改自动稿。
+    # 先用故事稿自身的正文重建归一器——「恩慧」这种同音写法只有出现在
+    # 正文里才会被认出来，光有角色表是发现不了的。
+    if canonicalizer is not None:
+        story_draft = _canonicalize_story_draft_with_text(
+            story_draft, canonicalizer, series_dir, context
+        )
 
     if story_draft_path is not None:
         Path(story_draft_path).parent.mkdir(parents=True, exist_ok=True)
@@ -2850,6 +2970,7 @@ async def write_episode_script(
                 temperature=temperature,
                 beat_budget=chapter_budget,
                 scene_directives=_scene_directives_block(scene),
+                character_lock=canonicalizer_lock(canonicalizer),
             )
             if not raw_beats:
                 chapter_errors.append(
@@ -2982,6 +3103,7 @@ async def write_episode_script(
                     temperature=temperature,
                     beat_budget=budget,
                     scene_directives=_scene_directives_block(scene),
+                character_lock=canonicalizer_lock(canonicalizer),
                 )
                 if not new_beats:
                     continue
@@ -3053,11 +3175,34 @@ async def write_episode_script(
         "resolved_thread_ids": overview.get("resolved_thread_ids"),
         "beats": merged_beats,
     }
+    # Patch v4.16：4B 汇聚后**重建**角色名归一器——这一轮才知道本话真正出现了
+    # 哪些角色写法（第 1 话没有历史 StoryBible 时尤其重要：靠本话高频自发现
+    # 规范名），随后把归一结果交给 normalize_script_payload 收口。
+    final_canonicalizer = canonicalizer
+    if series_dir is not None:
+        extra_names = {
+            str(beat.get("speaker_role") or "").strip()
+            for beat in merged_beats
+            if isinstance(beat, dict)
+        }
+        extra_texts = [
+            str(beat.get("narration_text") or beat.get("tts_text") or "")
+            for beat in merged_beats
+            if isinstance(beat, dict)
+        ]
+        final_canonicalizer = build_episode_canonicalizer(
+            series_dir,
+            context.characters,
+            extra_names=[name for name in extra_names if name],
+            extra_texts=extra_texts,
+        )
+
     normalized = normalize_script_payload(
         payload,
         episode_id=episode_id,
         episode_no=context.episode_no,
         valid_panel_ids=valid_panel_ids,
+        canonicalizer=final_canonicalizer,
     )
     try:
         script = NarrationScript.model_validate(normalized)
@@ -3197,6 +3342,8 @@ async def write_story_draft_document(
     context = memory.build_stage4_context(
         episode_no, vision_keywords=extract_vision_keywords(vision)
     )
+    # Patch v4.16：角色名归一器（作品配置 + StoryBible 角色表）。
+    canonicalizer = build_episode_canonicalizer(series_root, context.characters)
     draft = await _write_story_draft(
         client,
         model=model,
@@ -3206,7 +3353,10 @@ async def write_story_draft_document(
         series_title=series_title,
         template=template,
         temperature=temperature,
+        character_lock=canonicalizer_lock(canonicalizer),
     )
+    # Patch v4.16：故事稿落盘前统一角色名写法。
+    draft = _canonicalize_story_draft_with_text(draft, canonicalizer, series_root, context)
     target_dir.mkdir(parents=True, exist_ok=True)
     save_model(draft, json_path)
     markdown_path.write_text(
@@ -3286,6 +3436,10 @@ async def run_stage4(
                 reset=reset_storyboard,
             )
     storyboard_sink: list[EpisodeStoryboard] = []
+    # Patch v4.16：构建角色名归一器（作品配置 + StoryBible 角色表）。
+    episode_canonicalizer = build_episode_canonicalizer(
+        series_root, context.characters
+    )
     script = await write_episode_script(
         client,
         model=model,
@@ -3309,6 +3463,8 @@ async def run_stage4(
         panels_dir=panels_dir,
         reset_storyboard=reset_storyboard,
         storyboard_sink=storyboard_sink,
+        canonicalizer=episode_canonicalizer,
+        series_dir=series_root,
     )
     # Patch v4.0 Patch 20.1：auto 版镜头组**总是**回写（把整幕视觉复核得到的
     # visual_recap 落盘，下次打开镜头编排 Tab 直接能看到摘要）；

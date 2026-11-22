@@ -418,6 +418,9 @@ class JobRunner:
                     episode.episode_no,
                     reset_stage,
                     include_human_storyboard=False,
+                    # Patch v4.16：后台重跑保留 Stage 5 音频合成缓存，
+                    # 没改的句子直接复用缓存音频，不必重新调 TTS。
+                    preserve_tts_cache=True,
                 )
                 self._log(state, f"[清理重置] 已清空 {reset_stage} 及下游的旧产物")
             except Exception as exc:  # noqa: BLE001 - 清理失败不应阻断重跑
@@ -680,6 +683,8 @@ class JobRunner:
             / "script.json"
         )
         script = load_model(NarrationScript, script_path) if script_path.is_file() else None
+        # Patch v4.16：统计音频缓存复用情况（复用 X 条 / 新合成 Y 条）。
+        stats_out: dict[str, int] = {}
         await s5_tts.run_stage5(
             series_dir,
             episode.episode_no,
@@ -696,7 +701,16 @@ class JobRunner:
             placeholder_on_failure=self.config.tts.silence_placeholder_on_failure,
             ffmpeg_bin=self.config.render.ffmpeg_bin,
             tts_model=self.config.models.tts,
+            use_cache=True,
+            stats_out=stats_out,
         )
+        reused = int(stats_out.get("reused") or 0)
+        synthesized = int(stats_out.get("synthesized") or 0)
+        if reused or synthesized:
+            self._log(
+                state,
+                f"[配音缓存] 复用 {reused} 条缓存音频，新合成 {synthesized} 条",
+            )
 
     # ------------------------------------------------------------------
     # 事件

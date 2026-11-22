@@ -20,8 +20,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import wave
@@ -29,6 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from core.character_unify import are_homophone_name_variants
 from core.config import SeriesTTSConfig, VoiceSpec, resolve_voice_for_tts_model
 from core.normalize import resolve_dialogue_speaker_inheritance, to_simplified_chinese
 from core.schemas import (
@@ -85,6 +88,15 @@ AUDIO_MANIFEST_FILENAME = "audio_manifest.json"
 
 #: 降级问题记录（裁剪失败等），单独成文件便于 CLI/Web 展示，不污染音频清单契约。
 AUDIO_ISSUES_FILENAME = "audio_issues.json"
+
+#: Patch v4.16：Stage 5 音频增量检测与缓存复用。
+#: 缓存放在 ``05_audio/_cache/``（**不用** beat_*.wav 命名，避免与清单里的音频文件混淆），
+#: 索引文件 ``05_audio/_cache/index.json`` 记录「指纹 → 缓存文件 + 时长」。
+AUDIO_CACHE_DIRNAME = "_cache"
+AUDIO_CACHE_INDEX_FILENAME = "index.json"
+#: 缓存指纹的版本号：合成链路（裁剪 / 响度 / 采样率 / 音色解析）一旦变化就换版本，
+#: 旧缓存自然失效，不会被误当成「同一段音频」。
+AUDIO_CACHE_PIPELINE_VERSION = "v4.16-trim-lufs16"
 
 #: ``pause_after_ms`` 缺省值（与 :class:`core.schemas.ScriptBeat` 的默认值一致）。
 DEFAULT_PAUSE_AFTER_MS = 250
@@ -750,6 +762,21 @@ def _resolve_beat_voice_assignment_base(
                     gender=gender,
                 )
 
+    # Patch v4.16：同音错字 / 显式别名兜底——Stage 4 可能把「恩彗」写成
+    # 「恩慧」「恩惠」，这里仍要命中该角色的专属音色，而不是退回通用女声。
+    homophone_match = _match_character_voice_by_variant(
+        role, series_tts=series_tts, characters=characters
+    )
+    if homophone_match is not None:
+        name, spec = homophone_match
+        return BeatVoiceAssignment(
+            spec=spec,
+            source="character",
+            label=f"角色专属 · {name}",
+            role=str(name),
+            gender=gender,
+        )
+
     # 3) 按性别兜底。
     #
     # 作品级配置优先：作品已经配了「通用男声 / 通用女声」时，就用作品里的音色，
@@ -820,6 +847,63 @@ def resolve_beat_voice_spec(
     ).spec
 
 
+def _match_character_by_variant(
+    role: str,
+    *,
+    characters: Sequence[CharacterProfile] | None = None,
+) -> CharacterProfile | None:
+    """角色名（含同音 / 别名变体）→ StoryBible 里的角色档案（Patch v4.16）。
+
+    精确匹配由调用方先行处理；这里只补「同音异写」与「别名」两条兜底：
+    Stage 4 可能把角色写成「恩慧」，而角色表里的正式名是「恩彗」。
+    """
+    name = str(role or "").strip()
+    if not name:
+        return None
+    for character in characters or []:
+        canonical = str(getattr(character, "name", "") or "").strip()
+        if not canonical:
+            continue
+        aliases = [str(item).strip() for item in getattr(character, "aliases", []) or []]
+        if name == canonical or name in aliases:
+            return character
+        if are_homophone_name_variants(name, canonical):
+            return character
+        for alias in aliases:
+            if are_homophone_name_variants(name, alias):
+                return character
+    return None
+
+
+def _match_character_voice_by_variant(
+    role: str,
+    *,
+    series_tts: SeriesTTSConfig | None = None,
+    characters: Sequence[CharacterProfile] | None = None,
+) -> tuple[str, VoiceSpec] | None:
+    """角色名（含同音 / 别名变体）→ 作品级专属音色（Patch v4.16）。
+
+    两种命中方式：
+
+    1. 作品级 ``character_voices`` 的键与角色名同音（如「恩慧」↔「恩彗」）；
+    2. 角色名是某个角色的别名 / 同音变体，而该角色的正式名配了专属音色。
+    """
+    name = str(role or "").strip()
+    if not name or series_tts is None:
+        return None
+    voices = series_tts.character_voices
+    for key, spec in voices.items():
+        if are_homophone_name_variants(name, str(key).strip()):
+            return str(key), spec
+    character = _match_character_by_variant(name, characters=characters)
+    if character is not None:
+        canonical = str(getattr(character, "name", "") or "").strip()
+        for key, spec in voices.items():
+            if str(key).strip() == canonical:
+                return str(key), spec
+    return None
+
+
 def _voice_role_kind(
     beat: ScriptBeat,
     *,
@@ -829,6 +913,9 @@ def _voice_role_kind(
 
     Patch v3.4 Patch 16：跨模型音色兜底时需要知道「这个音色本来是给谁用的」，
     才能换成同定位的 MiniMax 音色（旁白 / 男配 / 女配）。
+
+    Patch v4.16：角色名写错一个字（「恩彗」→「恩慧」）时也要能认出是同一个人，
+    否则会退回旁白音色，角色声线在成片里突然变掉。
     """
     role = str(getattr(beat, "speaker_role", "") or "").strip()
     if role.lower() in _NARRATOR_ROLES or role in _NARRATOR_ROLES:
@@ -840,28 +927,212 @@ def _voice_role_kind(
     if role and role.lower() in gender_index:
         # 角色名但角色表没写性别：不采信可能过期的 speaker_gender，按旁白定位。
         return "narrator"
+    # Patch v4.16：同音/别名变体也当「认得出的角色名」，不采信旧 speaker_gender。
+    if _match_character_by_variant(role, characters=characters):
+        return "narrator"
     explicit = _explicit_gender(beat)
     return explicit if explicit in {"male", "female"} else "narrator"
 
 
-async def _synthesize_beat(
+# ----------------------------------------------------------------------
+# Patch v4.16：合成计划（指纹）与音频缓存
+# ----------------------------------------------------------------------
+@dataclass(frozen=True)
+class _BeatSynthPlan:
+    """一条 beat 的合成计划（Patch v4.16）。
+
+    **指纹与合成共用同一份解析结果**：只有这样「缓存命中」和「真实合成」
+    才一定产出同样的音频——否则改了音色解析逻辑却仍命中旧缓存，
+    就会出现「界面上换了音色、听到的还是旧声音」。
+    """
+
+    #: 应用了对白说话人继承后的 beat。
+    beat: ScriptBeat
+    #: 最终送进 TTS 的文本（含多音字替换与语气/停顿标签）。
+    spoken: str
+    #: 情绪指令，原样透传。
+    instruction: str
+    #: 最终音色（已做跨模型兜底）。
+    voice: str
+    #: 最终语速。
+    speed: float
+    #: provider 是否自带语速控制（自带时 ffmpeg 不再二次变速）。
+    native_speed: bool
+    #: ffmpeg 侧的变速倍率（provider 自带语速时恒为 1.0）。
+    trim_speed: float
+    #: 合成指纹（sha256 前 24 位）。
+    synth_hash: str
+    #: 指纹的原始载荷（调试用）。
+    fingerprint: dict[str, Any]
+
+
+def _cache_dir(audio_dir: Path) -> Path:
+    """``05_audio/_cache`` 目录。"""
+    return Path(audio_dir) / AUDIO_CACHE_DIRNAME
+
+
+def _read_cache_index(cache_dir: Path) -> dict[str, Any]:
+    """读缓存索引（读不到就当空索引）。"""
+    empty: dict[str, Any] = {"version": AUDIO_CACHE_PIPELINE_VERSION, "entries": {}}
+    path = cache_dir / AUDIO_CACHE_INDEX_FILENAME
+    if not path.is_file():
+        return empty
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("[s5_tts] 读音频缓存索引失败（%s）：%s", path, exc)
+        return empty
+    if not isinstance(raw, dict):
+        return empty
+    entries = raw.get("entries")
+    return {
+        "version": str(raw.get("version") or AUDIO_CACHE_PIPELINE_VERSION),
+        "entries": entries if isinstance(entries, dict) else {},
+    }
+
+
+def _write_cache_index(cache_dir: Path, index: Mapping[str, Any]) -> None:
+    """原子写缓存索引。"""
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        path = cache_dir / AUDIO_CACHE_INDEX_FILENAME
+        tmp = cache_dir / f".{AUDIO_CACHE_INDEX_FILENAME}.tmp"
+        tmp.write_text(
+            json.dumps(dict(index), ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        os.replace(tmp, path)
+    except OSError as exc:  # pragma: no cover - 索引写失败只影响命中率
+        logger.warning("[s5_tts] 写音频缓存索引失败（%s）：%s", cache_dir, exc)
+
+
+def _cache_lookup(cache_dir: Path, synth_hash: str) -> tuple[Path, int] | None:
+    """查缓存命中：``(缓存文件, 时长毫秒)``，没命中返回 ``None``。
+
+    命中条件：索引里有记录、缓存文件真实存在、大小大于 44 字节（空 WAV 头）、
+    时长大于 0——避免把「半截文件」当成可复用音频。
+    """
+    if not synth_hash:
+        return None
+    index = _read_cache_index(cache_dir)
+    entry = index["entries"].get(synth_hash)
+    if not isinstance(entry, dict):
+        return None
+    name = str(entry.get("file") or "")
+    try:
+        duration_ms = int(entry.get("duration_ms") or 0)
+    except (TypeError, ValueError):
+        duration_ms = 0
+    if not name or duration_ms <= 0:
+        return None
+    path = cache_dir / Path(name).name
+    try:
+        if not path.is_file() or path.stat().st_size <= 44:
+            return None
+    except OSError:
+        return None
+    return path, duration_ms
+
+
+def _cache_store(
+    cache_dir: Path,
+    synth_hash: str,
+    source: Path,
+    *,
+    duration_ms: int,
+    beat_id: str,
+) -> dict[str, Any] | None:
+    """把合成结果存进缓存，返回待写入索引的记录。
+
+    **只有真实合成且探测成功**的音频才会进来；失败静音占位（Patch v4.3）
+    走的是另一条路径，永远不会污染缓存。
+    """
+    if not synth_hash or duration_ms <= 0:
+        return None
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        suffix = source.suffix or ".wav"
+        target = cache_dir / f"{synth_hash}{suffix}"
+        if not target.is_file() or target.stat().st_size != source.stat().st_size:
+            tmp = cache_dir / f".{synth_hash}{suffix}.tmp"
+            shutil.copyfile(source, tmp)
+            os.replace(tmp, target)
+    except OSError as exc:
+        logger.warning("[s5_tts] 写音频缓存失败（%s）：%s", cache_dir, exc)
+        return None
+    return {
+        "synth_hash": synth_hash,
+        "file": f"{synth_hash}{suffix}",
+        "duration_ms": int(duration_ms),
+        "beat_id": beat_id,
+    }
+
+
+def _flush_cache_index(cache_dir: Path, records: Sequence[Mapping[str, Any]]) -> None:
+    """把缓存记录合并进索引（读-改-写，原子替换）。"""
+    if not records:
+        return
+    index = _read_cache_index(cache_dir)
+    entries = dict(index["entries"])
+    for record in records:
+        key = str(record.get("synth_hash") or "")
+        if not key:
+            continue
+        entries[key] = {
+            "file": str(record.get("file") or ""),
+            "duration_ms": int(record.get("duration_ms") or 0),
+            "beat_id": str(record.get("beat_id") or ""),
+        }
+    _write_cache_index(
+        cache_dir,
+        {"version": AUDIO_CACHE_PIPELINE_VERSION, "entries": entries},
+    )
+
+
+def _copy_cached_audio(cache_path: Path, target: Path) -> bool:
+    """把缓存音频复制到 ``05_audio/beat_xxx.wav``（原子替换）。"""
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(f".{target.name}.tmp")
+        shutil.copyfile(cache_path, tmp)
+        os.replace(tmp, target)
+    except OSError as exc:
+        logger.warning("[s5_tts] 复制缓存音频失败（%s）：%s", target, exc)
+        return False
+    return True
+
+
+def _resolve_beat_synth_plan(
     client: Any,
     beat: ScriptBeat,
     *,
-    audio_dir: Path,
     overrides: Mapping[str, str] | None,
     voice: str | None,
     default_voice: str | None = None,
     voice_cast: Mapping[str, str] | None = None,
     series_tts: SeriesTTSConfig | None = None,
     characters: Sequence[CharacterProfile] | None = None,
-    ffmpeg_bin: str,
-    trim_silence: bool,
+    trim_silence: bool = True,
     tts_model: str | None = None,
     inheritance: Mapping[str, tuple[str, str]] | None = None,
-) -> tuple[AudioClipMeta | None, list[_Issue]]:
-    """合成单个 beat 的音频，返回 ``(清单项, 问题列表)``。"""
-    issues: list[_Issue] = []
+) -> _BeatSynthPlan | None:
+    """解析一条 beat 的合成计划（Patch v4.16）：送音文本 + 音色 + 语速 + 指纹。
+
+    送音文本为空时返回 ``None``（由调用方记 issue 并跳过）。
+
+    指纹载荷（**只包含真正影响音频的输入**）：
+
+    * ``v``：合成链路版本；
+    * ``spoken_text``：最终送音文本（含多音字替换与标签）；
+    * ``instruction``：情绪指令；
+    * ``voice``：最终实际音色；
+    * ``speed`` / ``native_speed``：语速；
+    * ``tts_model`` / ``provider`` / ``sample_rate``：合成器身份；
+    * ``trim_silence``：是否做静音裁剪与响度归一。
+
+    **明确不纳入**：``beat_id`` / ``pause_after_ms`` / ``target_panel_ids`` /
+    ``motion`` / ``focus_hint`` / ``sfx_cue`` / ``scene_id``——它们不影响音频本身，
+    纳入只会让缓存白白失效。
+    """
     # Patch v3.4 Patch 17：连续对白说话人继承。没写「XX说：」的纯引号对白
     # 继承上一句对白的说话人 / 性别，避免「男角色说一半突然变女声」。
     inherited = (inheritance or {}).get(beat.beat_id)
@@ -877,10 +1148,8 @@ async def _synthesize_beat(
         )
     spoken = build_spoken_text(beat, overrides)
     if not spoken.strip():
-        issues.append(_Issue(beat.beat_id, "synthesize", "送音文本为空，已跳过"))
-        return None, issues
+        return None
 
-    extra: dict[str, Any] = {}
     # 显式指定的音色优先（命令行 ``--voice`` / Web 单音覆盖）。
     # 没有作品级模板（series_tts=None）时保留 Patch v3.1 旧契约：只查
     # voice_cast，未命中返回 None，由 provider 自己决定默认音色（不硬塞）。
@@ -922,7 +1191,6 @@ async def _synthesize_beat(
                 tts_model=model_name,
                 role_kind=_voice_role_kind(beat, characters=characters),
             )
-        extra["voice"] = beat_voice
         logger.info(
             "[s5_tts] %s：speaker_role=%s → 音色 %s（语速 %.2fx）",
             beat.beat_id,
@@ -934,16 +1202,127 @@ async def _synthesize_beat(
     # Patch v3.4 Patch 16：provider 自带语速控制（MiniMax）时把语速交给它，
     # ffmpeg 不再二次变速，避免「两段变速」导致语速失真。
     native_speed = bool(getattr(client, "supports_native_speed", False))
-    if native_speed:
-        extra["speed"] = speed
-        trim_speed = 1.0
-    else:
-        trim_speed = speed
+    trim_speed = 1.0 if native_speed else speed
+
+    fingerprint: dict[str, Any] = {
+        "v": AUDIO_CACHE_PIPELINE_VERSION,
+        "spoken_text": spoken,
+        "instruction": str(getattr(beat, "emotion_instruction", "") or ""),
+        "voice": str(beat_voice or ""),
+        "speed": round(float(speed), 4),
+        "native_speed": bool(native_speed),
+        "tts_model": str(tts_model or getattr(client, "model", "") or ""),
+        "provider": str(getattr(client, "provider_name", "") or type(client).__name__),
+        "sample_rate": str(getattr(client, "sample_rate", None) or ""),
+        "trim_silence": bool(trim_silence),
+    }
+    digest = hashlib.sha256(
+        json.dumps(fingerprint, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()[:24]
+
+    return _BeatSynthPlan(
+        beat=beat,
+        spoken=spoken,
+        instruction=str(getattr(beat, "emotion_instruction", "") or ""),
+        voice=str(beat_voice or ""),
+        speed=speed,
+        native_speed=native_speed,
+        trim_speed=trim_speed,
+        synth_hash=digest,
+        fingerprint=fingerprint,
+    )
+
+
+async def _synthesize_beat(
+    client: Any,
+    beat: ScriptBeat,
+    *,
+    audio_dir: Path,
+    overrides: Mapping[str, str] | None,
+    voice: str | None,
+    default_voice: str | None = None,
+    voice_cast: Mapping[str, str] | None = None,
+    series_tts: SeriesTTSConfig | None = None,
+    characters: Sequence[CharacterProfile] | None = None,
+    ffmpeg_bin: str,
+    trim_silence: bool,
+    tts_model: str | None = None,
+    inheritance: Mapping[str, tuple[str, str]] | None = None,
+    use_cache: bool = True,
+    write_cache: bool = True,
+    cache_records: list[dict[str, Any]] | None = None,
+    stats_out: dict[str, int] | None = None,
+) -> tuple[AudioClipMeta | None, list[_Issue]]:
+    """合成单个 beat 的音频，返回 ``(清单项, 问题列表)``。
+
+    Patch v4.16：命中音频缓存时**不调用** TTS、也不跑静音裁剪，
+    直接把缓存里的成品音频复制成本 beat 的文件名。
+
+    ``use_cache`` 控制「是否读缓存」，``write_cache`` 控制「是否写缓存」——
+    单句重配要「不读缓存但写回缓存」。
+    """
+    issues: list[_Issue] = []
+    # Patch v4.16：指纹与合成共用同一份解析结果（plan）。
+    plan = _resolve_beat_synth_plan(
+        client,
+        beat,
+        overrides=overrides,
+        voice=voice,
+        default_voice=default_voice,
+        voice_cast=voice_cast,
+        series_tts=series_tts,
+        characters=characters,
+        trim_silence=trim_silence,
+        tts_model=tts_model,
+        inheritance=inheritance,
+    )
+    if plan is None:
+        issues.append(_Issue(beat.beat_id, "synthesize", "送音文本为空，已跳过"))
+        return None, issues
+    beat = plan.beat
+
+    # Patch v4.16：命中缓存 → 直接复用成品音频（不调 TTS、不跑裁剪）。
+    cache_dir = _cache_dir(audio_dir)
+    if use_cache:
+        cached = _cache_lookup(cache_dir, plan.synth_hash)
+        if cached is not None:
+            cache_path, cached_duration = cached
+            suffix = cache_path.suffix or ".wav"
+            target = Path(audio_dir) / f"beat_{safe_beat_id(beat.beat_id)}{suffix}"
+            if _copy_cached_audio(cache_path, target):
+                logger.info(
+                    "[s5_tts] %s：命中音频缓存（%s，%d ms），跳过合成",
+                    beat.beat_id,
+                    plan.synth_hash[:12],
+                    cached_duration,
+                )
+                if stats_out is not None:
+                    stats_out["reused"] = int(stats_out.get("reused", 0)) + 1
+                return (
+                    AudioClipMeta(
+                        beat_id=beat.beat_id,
+                        audio_path=target.name,
+                        duration_ms=cached_duration,
+                        pause_after_ms=(
+                            beat.pause_after_ms
+                            if beat.pause_after_ms is not None
+                            else DEFAULT_PAUSE_AFTER_MS
+                        ),
+                        word_timestamps=[],
+                    ),
+                    issues,
+                )
+
+    extra: dict[str, Any] = {}
+    if plan.voice:
+        extra["voice"] = plan.voice
+    if plan.native_speed:
+        extra["speed"] = plan.speed
 
     try:
         result: TTSResult = await client.synthesize(
-            spoken,
-            instruction=beat.emotion_instruction,
+            plan.spoken,
+            instruction=plan.instruction,
             **extra,
         )
     except Exception as exc:  # 单条失败不影响其他 beat
@@ -964,20 +1343,40 @@ async def _synthesize_beat(
     raw_path.write_bytes(audio)
 
     final_path = raw_path
+    trim_ok = True
     if trim_silence:
         # 静音裁剪与变速合并在同一条 ffmpeg 滤镜链里（Patch v3.2 Patch 13 B3）：
         # 一次子进程同时完成「去首尾静音」+「atempo 不变调变速」。
         trimmed, problem = await _trim_silence(
-            raw_path, ffmpeg_bin=ffmpeg_bin, speed=trim_speed
+            raw_path, ffmpeg_bin=ffmpeg_bin, speed=plan.trim_speed
         )
         if trimmed is not None:
             final_path = trimmed
         else:
+            trim_ok = False
             issues.append(_Issue(beat.beat_id, "trim_silence", problem or "静音裁剪失败"))
 
     duration_ms = await _probe_duration_ms(final_path, ffmpeg_bin=ffmpeg_bin)
     if duration_ms <= 0:
         issues.append(_Issue(beat.beat_id, "probe", f"无法读取音频时长：{final_path.name}"))
+
+    # Patch v4.16：真实合成且探测成功才进缓存。裁剪失败的音频不进缓存——
+    # 否则下一次命中缓存会把「没裁干净」的音频当成成品复用。
+    # ``write_cache`` 与 ``use_cache`` 分开：单句重配不读缓存（用户明确要重合成），
+    # 但合成成功后**仍然要写回缓存**，后续整话重跑才能直接复用。
+    if write_cache and trim_ok and duration_ms > 0:
+        record = _cache_store(
+            cache_dir,
+            plan.synth_hash,
+            final_path,
+            duration_ms=duration_ms,
+            beat_id=beat.beat_id,
+        )
+        if record is not None and cache_records is not None:
+            cache_records.append(record)
+
+    if stats_out is not None:
+        stats_out["synthesized"] = int(stats_out.get("synthesized", 0)) + 1
 
     meta = AudioClipMeta(
         beat_id=beat.beat_id,
@@ -1013,7 +1412,11 @@ def load_bible_characters(series_dir: str | Path) -> list[CharacterProfile]:
 _STALE_AUDIO_PATTERNS: tuple[str, ...] = ("beat_*.wav", "beat_*.mp3")
 
 
-def clean_stale_audio(audio_dir: Path) -> list[str]:
+def clean_stale_audio(
+    audio_dir: Path,
+    *,
+    keep_names: set[str] | frozenset[str] | None = None,
+) -> list[str]:
     """清理 ``05_audio`` 里上一轮遗留的 beat 音频（Patch v3.4 Patch 17）。
 
     重跑撰稿后 beat 编号会变（相邻去重少几条、拆拍多几条都会让编号错位），
@@ -1021,11 +1424,19 @@ def clean_stale_audio(audio_dir: Path) -> list[str]:
     音频清单与目录内容也会对不上。
 
     只删 ``beat_`` 前缀的音频文件，不碰其它素材。
+
+    Patch v4.16：``keep_names`` 非空时**保留**这些文件名（本轮产出），
+    只清掉多余的旧文件；``keep_names`` 为 ``None`` 时行为与旧版完全一致
+    （全删）。无论哪种情况都不会碰 ``05_audio/_cache/``（缓存目录里的
+    文件名是 ``{指纹}.wav``，不在 ``beat_*`` 模式内）。
     """
     removed: list[str] = []
+    keep = {str(name) for name in keep_names} if keep_names is not None else None
     for pattern in _STALE_AUDIO_PATTERNS:
         for path in sorted(audio_dir.glob(pattern)):
             if not path.is_file():
+                continue
+            if keep is not None and path.name in keep:
                 continue
             try:
                 path.unlink()
@@ -1057,6 +1468,8 @@ async def synthesize_episode(
     ffmpeg_bin: str = "ffmpeg",
     trim_silence: bool = True,
     tts_model: str | None = None,
+    use_cache: bool = True,
+    stats_out: dict[str, int] | None = None,
 ) -> list[AudioClipMeta]:
     """合成整话音频，返回音频清单（顺序与剧本 beats 一致）。
 
@@ -1073,6 +1486,9 @@ async def synthesize_episode(
     * ``retry_rounds`` 是失败 beat 的**串行**补齐轮数（Patch v4.3）。
     * ``placeholder_on_failure`` 打开后，补齐仍失败的 beat 用等长静音占位，
       保证时间轴与字幕不错位（默认关闭，保持"失败 beat 不进音频清单"的既有契约）。
+    * ``use_cache`` 打开后（默认），逐条按「合成指纹」查 ``05_audio/_cache/``：
+      命中就直接复用成品音频（**不调 TTS、不跑静音裁剪**），未命中才真合成；
+      ``stats_out`` 会被填上 ``reused`` / ``synthesized`` 两个计数。
     """
     if not script.beats:
         raise TTSStageError("剧本里没有任何 beat，无法合成音频")
@@ -1085,12 +1501,9 @@ async def synthesize_episode(
     except OSError as exc:
         raise TTSStageError(f"音频目录不可写：{target_dir}：{exc}") from exc
 
-    # Patch v3.4 Patch 17：先清掉上一轮遗留的 beat 音频，避免重跑后
-    # 目录里混着编号错位的旧文件（下游按文件名引用会拿到旧音频）。
-    clean_stale_audio(target_dir)
-
-    # Patch v4.3：同时清掉上一轮的问题记录。否则整轮全部成功（或补齐成功）后，
-    # 旧的 audio_issues.json 会原地残留，让人误以为仍有 beat 合成失败。
+    # Patch v4.16：不再开头无条件清空旧音频——那样会把「内容没变」的 beat
+    # 也逼着重新合成。改为**整轮结束后**按本轮产出清单清理多余旧文件，
+    # 期间复用缓存命中的音频不受影响。
     stale_issues = target_dir / AUDIO_ISSUES_FILENAME
     try:
         if stale_issues.is_file():
@@ -1103,6 +1516,10 @@ async def synthesize_episode(
     inheritance = resolve_dialogue_speaker_inheritance(
         [beat.model_dump() for beat in script.beats]
     )
+
+    # Patch v4.16：缓存索引与本轮缓存命中统计。
+    cache_dir = _cache_dir(target_dir)
+    cache_records: list[dict[str, Any]] = []
 
     async def synth_one(beat: ScriptBeat) -> tuple[AudioClipMeta | None, list[_Issue]]:
         return await _synthesize_beat(
@@ -1119,6 +1536,10 @@ async def synthesize_episode(
             trim_silence=trim_silence,
             tts_model=tts_model,
             inheritance=inheritance,
+            use_cache=use_cache,
+            write_cache=use_cache,
+            cache_records=cache_records,
+            stats_out=stats_out,
         )
 
     # Patch v4.3：带进程内 RPM 闸门的 provider（MiniMax）要求严格串行。
@@ -1232,6 +1653,23 @@ async def synthesize_episode(
         raise TTSStageError(f"本话所有 beat 合成失败（共 {len(script.beats)} 条）：\n{detail}")
 
     _write_issues(target_dir, issues)
+
+    # Patch v4.16：整轮结束后清理「本轮没用到」的旧音频（保留本轮产出）。
+    # 缓存目录 05_audio/_cache/ 不在 beat_* 匹配范围内，不会被误删。
+    clean_stale_audio(
+        target_dir,
+        keep_names={meta.audio_path for meta in final_metas},
+    )
+    if cache_records:
+        _flush_cache_index(cache_dir, cache_records)
+    if stats_out is not None:
+        reused = int(stats_out.get("reused", 0))
+        synthesized = int(stats_out.get("synthesized", 0))
+        logger.info(
+            "[s5_tts] 音频缓存：复用 %d 条，新合成 %d 条", reused, synthesized
+        )
+        stats_out.setdefault("reused", 0)
+        stats_out.setdefault("synthesized", 0)
     return final_metas
 
 
@@ -1296,6 +1734,7 @@ async def resynthesize_single_beat(
     )
     old_audio_name = metas[old_index].audio_path if old_index is not None else None
 
+    cache_records: list[dict[str, Any]] = []
     meta, new_issues = await _synthesize_beat(
         client,
         target,
@@ -1310,10 +1749,18 @@ async def resynthesize_single_beat(
         trim_silence=trim_silence,
         tts_model=tts_model,
         inheritance=inheritance,
+        cache_records=cache_records,
+        # Patch v4.16：单句重配是用户显式要求「重新合成」，
+        # 不读缓存（否则点重配会拿回同一份旧音频）；合成成功后再写回缓存。
+        use_cache=False,
     )
     if meta is None:
         detail = "；".join(item.message for item in new_issues) or "未知原因"
         raise TTSStageError(f"单句重配失败（{beat_id}）：{detail}")
+
+    # Patch v4.16：单句重配同样把成品写进音频缓存，后续整话重跑可直接复用。
+    if cache_records:
+        _flush_cache_index(_cache_dir(audio_dir), cache_records)
 
     # 新合成换了后缀（如旧 mp3 → 新 wav）时，只清理该 beat 自己的旧文件，
     # 其它 beat 的文件一个都不碰。
@@ -1449,6 +1896,8 @@ async def run_stage5(
     ffmpeg_bin: str = "ffmpeg",
     trim_silence: bool = True,
     tts_model: str | None = None,
+    use_cache: bool = True,
+    stats_out: dict[str, int] | None = None,
 ) -> Path:
     """执行 Stage 5，返回 ``05_audio/audio_manifest.json`` 路径。
 
@@ -1461,6 +1910,8 @@ async def run_stage5(
     ``tts_model`` 是当前 TTS 模型名（Patch v3.4 Patch 16），用于跨模型音色兜底。
     ``retry_rounds`` 是失败 beat 的串行补齐轮数（Patch v4.3）。
     ``placeholder_on_failure`` 打开后，失败的 beat 用等长静音占位保住时间轴（Patch v4.3）。
+    ``use_cache`` 打开后（Patch v4.16），逐条按「合成指纹」复用 ``05_audio/_cache/``
+    里的成品音频；``stats_out`` 会被填上 ``reused`` / ``synthesized`` 两个计数。
     """
     series_root = Path(series_dir)
     script_path = series_root / "episodes" / f"ep_{episode_no:03d}" / "04_script" / "script.json"
@@ -1489,6 +1940,8 @@ async def run_stage5(
         ffmpeg_bin=ffmpeg_bin,
         trim_silence=trim_silence,
         tts_model=tts_model,
+        use_cache=use_cache,
+        stats_out=stats_out,
     )
 
     audio_dir.mkdir(parents=True, exist_ok=True)
