@@ -2281,6 +2281,9 @@ def create_app(
             # 首次打开：自动聚类并落盘，后续人工编辑与重置都基于这份文件。
             storyboard = s3b_scenes.auto_build_storyboard(episode_id, vision)
             s3b_scenes.save_storyboard(storyboard, storyboard_path)
+        # Patch v4.20：分镜页不列出纯文字卡（章节标题条 / 字幕条）——它们不是
+        # 剧情画面，留在幕里只会被 Stage 6 渲成成片里用户没配过的一帧。
+        storyboard = s3b_scenes.strip_text_cards_from_storyboard(storyboard, vision)
         return _storyboard_payload(storyboard, episode_id, series_id, episode_no)
 
     @app.put("/api/episodes/{episode_id}/storyboard")

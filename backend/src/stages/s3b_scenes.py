@@ -32,7 +32,12 @@ from core.schemas import (
 )
 from providers.image_utils import encode_pil_data_url, load_image
 from providers.llm_base import ChatMessage, ContentPart, LLMClient, parse_json_response
-from stages.s3_vision import format_character_block, load_prompt_template, render_prompt
+from stages.s3_vision import (
+    format_character_block,
+    is_text_only_card,
+    load_prompt_template,
+    render_prompt,
+)
 
 #: 镜头编排清单的文件名（落在 ``04_script/`` 下）。
 STORYBOARD_FILENAME = "storyboard.json"
@@ -242,13 +247,22 @@ def extract_location(summary: str) -> str:
     return ""
 
 
-def _is_usable_panel(panel: PanelVisionInfo) -> bool:
+def _is_usable_panel(
+    panel: PanelVisionInfo,
+    *,
+    include_text_cards: bool = False,
+) -> bool:
     """该格是否进入镜头组（与 Stage 4 的有效分镜口径一致）。"""
     if panel.is_transition_blank:
         return False
     if panel.non_story_type in _INVALID_NON_STORY_TYPES:
         return False
     if panel.non_story_type in _SFX_ONLY_NON_STORY_TYPES:
+        return False
+    # Patch v4.20：画面上只有文字的格子（章节标题条 / 字幕条）不是剧情画面，
+    # 不能进镜头组——它留在幕里，Stage 6 会把它当成一帧画面渲进成片，
+    # 分镜页上也会多出一条用户根本没配过的画面。
+    if not include_text_cards and is_text_only_card(panel):
         return False
     return True
 
@@ -368,6 +382,12 @@ def auto_build_storyboard(
     all_panels = sorted(vision.panels, key=lambda item: panel_sort_key(item.panel_id))
     panels = {panel.panel_id: panel for panel in all_panels}
 
+    # Patch v4.20：整话都被判成纯文字卡属于异常素材（正常漫画至少有几格剧情），
+    # 这时退回未过滤口径，避免切出空编排。
+    include_text_cards = not any(
+        _is_usable_panel(panel) for panel in all_panels
+    )
+
     scene_panel_ids: list[list[str]] = []
     current: list[str] = []
     current_location = ""
@@ -379,7 +399,7 @@ def auto_build_storyboard(
             if len(current) >= MIN_SCENE_PANELS:
                 pending_boundary = True
             continue
-        if not _is_usable_panel(panel):
+        if not _is_usable_panel(panel, include_text_cards=include_text_cards):
             continue
 
         location = extract_location(panel.scene_summary)
@@ -1002,6 +1022,43 @@ def save_storyboard(storyboard: EpisodeStoryboard, path: str | Path) -> Path:
     return file_path
 
 
+def strip_text_cards_from_storyboard(
+    storyboard: EpisodeStoryboard,
+    vision: VisionWindowOutput | None,
+) -> EpisodeStoryboard:
+    """把编排里的纯文字卡（章节标题条 / 字幕条）剔出去（Patch v4.20）。
+
+    * ``source == "human"`` 的编排**原样保留**——那是用户的显式意图；
+    * 其余编排逐幕剔除纯文字格，被剔空的幕置为 ``enabled=False``；
+    * 只改内存，不落盘（调用方决定要不要写回）。
+    """
+    if vision is None or storyboard.source == "human":
+        return storyboard
+    text_card_ids = {
+        panel.panel_id for panel in vision.panels if is_text_only_card(panel)
+    }
+    if not text_card_ids:
+        return storyboard
+    scenes: list[StoryboardScene] = []
+    changed = False
+    for scene in storyboard.scenes:
+        kept = [
+            panel_id for panel_id in scene.panel_ids if panel_id not in text_card_ids
+        ]
+        if len(kept) != len(scene.panel_ids):
+            changed = True
+            scenes.append(
+                scene.model_copy(
+                    update={"panel_ids": kept, "enabled": bool(kept) and scene.enabled}
+                )
+            )
+            continue
+        scenes.append(scene)
+    if not changed:
+        return storyboard
+    return storyboard.model_copy(update={"scenes": scenes})
+
+
 def load_or_build_storyboard(
     episode_id: str,
     vision: VisionWindowOutput,
@@ -1026,7 +1083,8 @@ def load_or_build_storyboard(
             # 人工编排保护：永远不覆写用户的镜头组。
             return existing
         if not reset:
-            return existing
+            # Patch v4.20：既有编排里的纯文字卡剔掉（分镜页与成片口径一致）。
+            return strip_text_cards_from_storyboard(existing, vision)
 
     storyboard = auto_build_storyboard(episode_id, vision)
     if path is not None:
@@ -1061,7 +1119,8 @@ async def resolve_or_build_storyboard(
             # 人工编排保护：永远不覆写用户的镜头组。
             return existing
         if not reset:
-            return existing
+            # Patch v4.20：既有编排里的纯文字卡剔掉（分镜页与成片口径一致）。
+            return strip_text_cards_from_storyboard(existing, vision)
 
     storyboard = await semantic_build_storyboard(
         client,

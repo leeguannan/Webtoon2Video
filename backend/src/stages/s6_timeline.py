@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -604,6 +605,33 @@ def select_sfx_events(
 # --------------------------------------------------------------------------
 # 时间轴编排
 # --------------------------------------------------------------------------
+def text_card_panel_ids(series_dir: str | Path, episode_no: int) -> set[str]:
+    """判定本话哪些面板是「纯文字卡」（章节标题条 / 白底黑字 PPT）。
+
+    读 Stage 3 的 ``03_vision/vision.json``，按**内容**判据识别（而不是模型
+    自己打的 ``is_pure_text_card`` 标记——模型常常漏标）。
+
+    读不到 / 解析失败一律返回空集合：宁可放过，也不要因为旧产物格式变化
+    把整话的时间轴判废。
+    """
+    path = vision_path_for(series_dir, episode_no)
+    if not path.is_file():
+        return set()
+    try:
+        vision = load_model(VisionWindowOutput, path)
+    except Exception:  # noqa: BLE001 - 视觉结果读不到就不过滤
+        return set()
+    try:
+        from stages.s3_vision import is_text_only_card
+    except Exception:  # noqa: BLE001 - 同上
+        return set()
+    return {
+        panel.panel_id
+        for panel in vision.panels
+        if panel.panel_id and is_text_only_card(panel)
+    }
+
+
 def build_timeline(
     *,
     episode_id: str,
@@ -877,6 +905,21 @@ def build_timeline_from_workspace(
         raise TimelineError(
             f"没有可用面板：{panel_dir_for(series_dir, episode_no)}"
             "（Stage 2 尚未产出面板图，无法编排时间轴）"
+        )
+
+    # Patch v4.20：纯文字卡（章节标题条 / 白底黑字）永远不进成片。
+    #
+    # Stage 4 的候选池与分镜编排已经把它们剔掉，正常流程走不到这里；
+    # 这一层是给「旧脚本里还留着对纯文字卡的引用」兜底——历史产物里
+    # 出现过粉色标题条被当成画面插进 b9 与 b10 之间的情况。剔除后，
+    # 那一拍会自动回退到上一张画面（build_timeline 的兜底规则），
+    # 不会多出一帧文字条。
+    text_card_ids = text_card_panel_ids(series_dir, episode_no)
+    if text_card_ids:
+        panels = [panel for panel in panels if panel.panel_id not in text_card_ids]
+        print(
+            f"[s6_timeline] 剔除纯文字卡面板：{sorted(text_card_ids)}",
+            file=sys.stderr,
         )
 
     focus_regions = load_focus_regions(series_dir, episode_no)

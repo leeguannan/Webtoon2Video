@@ -108,6 +108,65 @@ _DRAMATIC_PERSON_MARKERS: tuple[str, ...] = (
 _DRAMATIC_DIALOGUE_MIN_CHARS = 3
 
 
+# --------------------------------------------------------------------------
+# Patch v4.20：纯文字卡判定（画面上只有字，不是剧情画面）
+# --------------------------------------------------------------------------
+#: 章节标题条 / 字幕条 / 纯文字 PPT 这类格子一旦留在候选池里，Stage 6 会
+#: 把它当成一帧画面渲进成片（实测：b9 与 b10 之间多出一条粉色标题条）。
+#: 模型自己常常不标 ``is_pure_text_card``，所以这里用确定性判据再认一遍。
+
+#: ``scene_summary`` 里「画面上写着字」的描述词。
+_TEXT_CARD_SUMMARY_KEYWORDS: tuple[str, ...] = (
+    "文字", "标题", "字幕", "标语", "文本", "标识", "字样", "问句",
+    "行字", "行文字",
+)
+
+#: 更强的信号：摘要明说「这就是一张文字卡」。
+_TEXT_CARD_EXPLICIT_MARKERS: tuple[str, ...] = (
+    "纯文字", "文字卡片", "文字卡", "纯字卡", "纯文字卡", "整幅都是文字",
+    "只有文字", "全是文字", "文字条", "标题条", "字幕条", "满屏文字", "整幅文字",
+)
+
+#: 画了**对话气泡**（圆/椭圆、带尾巴的气球）的格子是这一话的正式画面，
+#: 哪怕整格只有气泡没有人物，也不能按纯文字卡剔除——那会把这一话真正的
+#: 剧情画面砍掉（实测 wt_3924 有一话大量「纯白背景 + 对话气泡」的画风）。
+_TEXT_CARD_SPEECH_BALLOON_MARKERS: tuple[str, ...] = (
+    "气泡", "带尾巴", "椭圆形", "圆形对话", "圆形气泡", "尖角尾巴", "尖刺边缘",
+)
+
+#: 「方框 + 文字」的引用卡（内心独白卡 / 叙述框），不是对话气泡 → 算纯字卡。
+_TEXT_CARD_BOX_MARKERS: tuple[str, ...] = (
+    "矩形框", "矩形文字框", "矩形对话框", "文字框", "文本框", "框内",
+)
+
+#: 摘要里明说「没有气泡」——这时不能因为出现「气泡」二字就当成对话气泡。
+_NO_SPEECH_BALLOON_MARKERS: tuple[str, ...] = (
+    "无气泡", "没有气泡", "不含气泡", "无对话框", "没有对话框", "无对白框",
+    "未画气泡", "并非气泡",
+)
+
+#: 「一整块底色 + 上面写着字」的平面文字帧（章节标题条 / 字幕条 / 出版方标识）。
+_FLAT_BACKGROUND_MARKERS: tuple[str, ...] = (
+    "纯黑背景", "纯白背景", "粉色背景", "浅粉背景", "白色背景", "黑色背景",
+    "白底", "黑底", "纯色背景", "单色背景", "底色",
+    "背景上显示", "背景中央显示", "背景中央", "背景上写着", "背景右上角",
+    "空白色背景",
+)
+
+#: 摘要明说「画面里什么都没有」（纯字卡的典型描述）。
+_TEXT_CARD_EMPTY_MARKERS: tuple[str, ...] = (
+    "无任何人物", "无任何角色", "没有任何人物", "没有人物", "无角色", "无人物",
+    "无动作", "无气泡", "无背景", "无任何背景", "无环境元素", "无任何环境元素",
+    "无背景细节", "无任何背景细节", "无任何人物、动作或环境元素",
+)
+
+#: 「画面上的字」类说话人：模型把画中文字当成台词时用的说话人。
+_TEXT_CARD_SPEAKERS: frozenset[str] = frozenset({
+    "旁白", "字幕", "文字", "标题", "文案", "画面", "画面文字", "旁白文字",
+    "说明", "说明文字", "narration", "narrator", "caption", "subtitle", "text",
+})
+
+
 class VisionError(RuntimeError):
     """Stage 3 视觉抽取失败。"""
 
@@ -822,6 +881,72 @@ def _has_dramatic_evidence(summary: str) -> bool:
     return False
 
 
+def is_on_screen_text_speaker(speaker_guess: str) -> bool:
+    """这个说话人是不是「画面上的字」而不是角色。
+
+    模型把画中文字（章节标题条、字幕条）当台词时，说话人常写成「旁白」
+    「字幕」「文字」「标题」等；这些「台词」不是角色说的话，不能拿来判断
+    这一格是不是剧情格。
+    """
+    text = coerce_str(speaker_guess).strip().lower()
+    if not text:
+        return False
+    if text in _TEXT_CARD_SPEAKERS:
+        return True
+    return any(marker in text for marker in ("字幕", "文字", "标题", "文案", "旁白"))
+
+
+def is_text_only_card(panel: Any) -> bool:
+    """这一格是不是「画面上只有文字」的纯文字卡（Patch v4.20）。
+
+    判定只依据 ``scene_summary``，**不看**模型给的 ``is_pure_text_card``
+    （那个标记正是「暗黑高潮格护栏」要推翻的，拿它当输入会误伤深黑底火光格）。
+
+    判定顺序（任一条命中即判定为纯文字卡）：
+
+    1. 摘要明说「纯文字卡片 / 只有文字 / 文字条」这类平面文字帧；
+    2. 摘要写着画面里有字，**且**画面是「一整块底色 + 字」
+       （纯黑底、纯白底、粉底标题条……），或明说画面里空无一物
+       （无人物 / 无动作 / 无气泡……），或就是一个「方框 + 字」的引用卡。
+
+    两种情况**不算**纯文字卡（必须保留，否则会砍掉真正的剧情画面）：
+
+    - 画面上画了对话气泡（圆/椭圆/带尾巴的气球）——哪怕整格只有气泡；
+    - 画面上的字有明确角色归属（角色台词、角色内心独白）。
+    """
+    summary = coerce_str(getattr(panel, "scene_summary", ""))
+    if not summary:
+        return False
+    # 1) 强信号：摘要明说这就是一张文字卡。
+    if any(marker in summary for marker in _TEXT_CARD_EXPLICIT_MARKERS):
+        return True
+    # 2) 摘要压根没提「文字 / 标题 / 字幕……」→ 不是字卡。
+    if not any(marker in summary for marker in _TEXT_CARD_SUMMARY_KEYWORDS):
+        return False
+    # 3) 画了对话气泡 → 这一话的正式画面，保留（摘要明说「无气泡」时不算）。
+    if (
+        any(marker in summary for marker in _TEXT_CARD_SPEECH_BALLOON_MARKERS)
+        and not any(marker in summary for marker in _NO_SPEECH_BALLOON_MARKERS)
+    ):
+        return False
+    # 4) 画面里有真实的人 / 动作 / 场景 → 是插画，不是字卡（哪怕角落有个文字框）。
+    if _has_dramatic_evidence(summary):
+        return False
+    # 5) 画面上的字有角色归属（角色台词 / 角色内心独白）→ 有角色信息，保留。
+    dialogues = list(getattr(panel, "dialogues", ()) or ())
+    if any(
+        not is_on_screen_text_speaker(getattr(bubble, "speaker_guess", ""))
+        for bubble in dialogues
+    ):
+        return False
+    # 6) 其余：文字 + 平面底色 / 空无一物 / 方框引用卡 → 判定为纯文字卡。
+    return (
+        any(marker in summary for marker in _FLAT_BACKGROUND_MARKERS)
+        or any(marker in summary for marker in _TEXT_CARD_EMPTY_MARKERS)
+        or any(marker in summary for marker in _TEXT_CARD_BOX_MARKERS)
+    )
+
+
 def protect_dramatic_panels(panels: list[PanelVisionInfo]) -> list[PanelVisionInfo]:
     """暗黑高潮格护栏：把被误判成空页 / 纯字卡 / 纯拟声的高潮格救回来。
 
@@ -832,18 +957,28 @@ def protect_dramatic_panels(panels: list[PanelVisionInfo]) -> list[PanelVisionIn
 
     判据（任一成立即恢复成普通剧情格）：
 
-    1. 该格有**有效台词**：去掉标点后仍 ≥ 3 字（纯拟声词「啪！」不算）；
+    1. 该格有**有效台词**：去掉标点后仍 ≥ 3 字（纯拟声词「啪！」不算），
+       且说话人不是「画面上的字」（旁白 / 字幕 / 文案……）；
     2. ``scene_summary`` 写明了人物 / 躯体动作 / 空间。
 
     版权声明页与推广尾页（``copyright_notice`` / ``promo_banner``）不在此列。
+
+    Patch v4.20：画面上只有文字的格子（章节标题条 / 字幕条）**不救回**——
+    它不是剧情格，救回来只会让 Stage 6 把它当一帧画面渲进成片。
     """
     protected: list[PanelVisionInfo] = []
     for panel in panels:
         if panel.non_story_type in NON_STORY_BANNER_TYPES:
             protected.append(panel)
             continue
+        if is_text_only_card(panel):
+            # 纯文字卡：标记成纯字卡后跳过护栏，绝不救回成剧情格。
+            panel.is_pure_text_card = True
+            protected.append(panel)
+            continue
         has_dialogue = any(
             len(_strip_punct(bubble.text)) >= _DRAMATIC_DIALOGUE_MIN_CHARS
+            and not is_on_screen_text_speaker(bubble.speaker_guess)
             for bubble in panel.dialogues
         )
         if has_dialogue or _has_dramatic_evidence(panel.scene_summary):

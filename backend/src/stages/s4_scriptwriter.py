@@ -61,6 +61,7 @@ from providers.llm_base import (
     LLMTruncatedError,
     parse_json_response,
 )
+from stages.s3_vision import is_text_only_card
 from utils.tts_tags import (
     MINIMAX_TAG_SPLIT_PATTERN,
     mask_minimax_tts_tags,
@@ -1560,9 +1561,16 @@ def exclude_pure_text_cards(
 
     Patch v3.2 Patch 12：纯字卡是「白底黑字 PPT」，一旦被选进候选池就会被
     念成 PPT 朗读。整批都是纯字卡时保留原样（否则这一章无处可挑）。
+
+    Patch v4.20：模型常常不标 ``is_pure_text_card``，所以再按内容判一次
+    （章节标题条 / 字幕条等「画面上只有字」的格子）——它们被选中后会在
+    成片里多出一帧用户没配过的画面。
     """
     kept = [
-        panel for panel in panels if not getattr(panel, "is_pure_text_card", False)
+        panel
+        for panel in panels
+        if not getattr(panel, "is_pure_text_card", False)
+        and not is_text_only_card(panel)
     ]
     return kept or list(panels)
 

@@ -155,6 +155,26 @@ _DESCRIPTIVE_MARKERS = (
     "大妈", "小子", "丫头", "男人婆", "神秘人", "黑衣人", "面具男", "面具女",
 )
 
+#: 关系 / 身份泛称：含这些词的别名说的是「这个人的身份」而不是「这个人的
+#: 名字」，同样不进正文替换表。
+#:
+#: Patch v4.20：story_bible 里常把「丈夫」「岳母」这类身份词登记成别名，
+#: 于是用户写「我未来的丈夫」会被归一成角色本名「道振」——人工改好的字幕
+#: 一保存就被冲回原文。角色位（``role_map``）不受影响，照常归一。
+_RELATION_MARKERS = (
+    "丈夫", "妻子", "老公", "老婆", "先生", "夫人", "太太", "小姐",
+    "爸爸", "妈妈", "父亲", "母亲", "爸爸", "爹妈",
+    "哥哥", "姐姐", "弟弟", "妹妹", "儿子", "女儿",
+    "岳父", "岳母", "公公", "婆婆", "儿媳", "女婿",
+    "嫂子", "姑妈", "姑父", "姨妈", "姨父", "舅舅", "舅妈",
+    "叔叔", "婶婶", "伯伯", "伯母", "姑姑", "婶母",
+    "师父", "师母", "徒弟", "师兄", "师姐", "学弟", "学妹",
+    "未婚夫", "未婚妻", "前夫", "前妻", "恋人", "情侣",
+    "对象", "邻居", "同事", "同学", "老师", "医生", "护士", "律师",
+    "店长", "老板", "警察", "司机", "服务员", "快递员",
+    "教练", "队友", "经纪人", "秘书", "助理", "管家", "仆人", "侍卫",
+)
+
 #: 惯用词前缀：``受人恩惠`` / ``施以恩惠`` / ``小恩小惠`` 这类搭配里的角色名
 #: 只是普通词的一部分，替换会改变语义，必须保护。
 _COMMON_PHRASE_PREFIXES = ("小", "受人", "施以", "给予", "报答", "感念", "莫大", "一点")
@@ -602,12 +622,16 @@ def build_character_canonicalizer(
             role_map[variant] = canonical
             role_map.setdefault(variant.lower(), canonical)
             role_map.setdefault(canonical.lower(), canonical)
-            # 正文规则：外貌称呼不进正文；单字不改正文；简称不拉长成全名。
+            # 正文规则：外貌称呼不进正文；单字不改正文；简称不拉长成全名；
+            # Patch v4.20：关系 / 身份泛称（丈夫 / 岳母……）也不进正文，
+            # 否则用户写「我未来的丈夫」会被改回角色本名，保存后又被冲掉。
             if len(variant) < 2:
                 continue
             if len(variant) < len(canonical):
                 continue
             if any(marker in variant for marker in _DESCRIPTIVE_MARKERS):
+                continue
+            if any(marker in variant for marker in _RELATION_MARKERS):
                 continue
             text_rules.append((variant, canonical))
 
