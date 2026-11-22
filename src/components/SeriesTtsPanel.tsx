@@ -15,10 +15,10 @@ import {
 
 /**
  * 作品级配音设置面板（Patch v3.2 Patch 13；Patch v3.3 Patch 15 升级 34 音色；
- * Patch v3.4 Patch 16 接入 MiniMax 28 音色）。
+ * Patch v3.4 Patch 16 接入 MiniMax 28 音色；Patch v4.15 音色只保留 MiniMax）。
  *
  * 四块设置：讲解者 / 通用男声 / 通用女声 / 已识别角色专属音色。
- * 每块 = 音色选择（百炼 34 + MiniMax 28，可手填目录外音色 ID）
+ * 每块 = 音色选择（Patch v4.15 起只列 MiniMax 音色，可手填目录外音色 ID）
  * + 语速滑块 + 试听样例按钮。
  *
  * 试听**只播放后端预生成的静态样例**，用 ``audio.playbackRate`` 实时变速，
@@ -127,9 +127,9 @@ export const SeriesTtsPanel: React.FC<SeriesTtsPanelProps> = ({ seriesId }) => {
   const [savedAt, setSavedAt] = useState<string | null>(null);
   const { playingKey, preview: previewSample, stop: stopPreview } = useVoicePreview(setError);
 
-  /** Patch v3.4 Patch 16：百炼 34 + MiniMax 28 合并成一份候选清单。 */
+  /** Patch v4.15：音色选择仅保留 MiniMax（剔除百炼 / 阿里音色）。 */
   const voiceOptions: VoiceOption[] = useMemo(
-    () => [...(data?.voices ?? []), ...(data?.minimax_voices ?? [])],
+    () => [...(data?.minimax_voices ?? [])],
     [data],
   );
 

@@ -40,14 +40,14 @@ backend/.venv/bin/python -m pytest backend/tests
 
 ## 测试跑法（分级）
 
-后端共 **808** 条用例。默认 `pytest` 行为保持兼容（串行跑全部，含重型 ffmpeg），
+后端共 **859** 条用例。默认 `pytest` 行为保持兼容（串行跑全部，含重型 ffmpeg），
 但开发期建议按下表分档执行：
 
 | 档位 | 命令 | 用例数 | 用途 |
 | :--- | :--- | :--- | :--- |
-| 快速回归 | `pytest -n auto -m "not slow"` | 786 | 日常小改动：纯单测 + API，跳过重型 ffmpeg |
+| 快速回归 | `pytest -n auto -m "not slow"` | 837 | 日常小改动：纯单测 + API，跳过重型 ffmpeg |
 | 定向验证 | `pytest tests/test_patch_v412_single_beat_tts.py` | 18 | 单句重配 TTS 等指定模块的精确验证 |
-| 全量兜底 | `pytest -n auto --dist loadfile` | 808 | 改动 s5/s6/s7 媒体链路，或准备提交前必跑 |
+| 全量兜底 | `pytest -n auto --dist loadfile` | 859 | 改动 s5/s6/s7 媒体链路，或准备提交前必跑 |
 
 > `-n auto` 依赖 `pytest-xdist`（已列入 `[project.optional-dependencies].dev`）。
 > 全量档建议加 `--dist loadfile`：同一文件的用例固定在同一个 worker，

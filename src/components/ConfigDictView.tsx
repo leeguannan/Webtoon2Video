@@ -12,10 +12,22 @@ interface ConfigDictViewProps {
 }
 
 /** Patch v3.3 Patch 15：Stage 4 撰稿模型候选（后端未给选项时的兜底）。 */
-const FALLBACK_SCRIPT_MODEL_OPTIONS = ['qwen3.7-plus', 'qwen3-max', 'qwen-plus', 'deepseek-v3'];
+const FALLBACK_SCRIPT_MODEL_OPTIONS = [
+  'qwen3.7-plus',
+  'qwen3-max',
+  'qwen-plus',
+  'deepseek-v3',
+  'deepseek-v4.1-flash-1017',
+];
 
 /** Patch v3.3 Patch 15：Stage 4A 说书体模型候选（后端未给选项时的兜底）。 */
-const FALLBACK_STORY_MODEL_OPTIONS = ['qwen4-max', 'qwen3.8-max', 'qwen3.7-plus', 'qwen-plus'];
+const FALLBACK_STORY_MODEL_OPTIONS = [
+  'qwen4-max',
+  'qwen3.8-max',
+  'qwen3.7-plus',
+  'qwen-plus',
+  'deepseek-v4.1-flash-1017',
+];
 
 /** Patch v3.4 Patch 16：Stage 5 TTS 模型候选（后端未给选项时的兜底）。 */
 const FALLBACK_TTS_MODEL_OPTIONS = [
@@ -32,6 +44,7 @@ const SCRIPT_MODEL_LABELS: Record<string, string> = {
   'qwen3-max': 'qwen3-max (长篇精修)',
   'qwen-plus': 'qwen-plus (高性价比)',
   'deepseek-v3': 'deepseek-v3 (百炼内置)',
+  'deepseek-v4.1-flash-1017': 'deepseek-v4.1-flash-1017 (百炼 · DeepSeek 高性价比)',
 };
 
 const STORY_MODEL_LABELS: Record<string, string> = {
@@ -39,6 +52,7 @@ const STORY_MODEL_LABELS: Record<string, string> = {
   'qwen3.8-max': 'qwen3.8-max (备选)',
   'qwen3.7-plus': 'qwen3.7-plus (备选)',
   'qwen-plus': 'qwen-plus (兜底)',
+  'deepseek-v4.1-flash-1017': 'deepseek-v4.1-flash-1017 (百炼 · DeepSeek 高性价比)',
 };
 
 /** Patch v3.4 Patch 16：TTS 模型下拉标签（百炼 / MiniMax / Edge 三套 provider）。 */
@@ -115,10 +129,10 @@ export const ConfigDictView: React.FC<ConfigDictViewProps> = ({
     return base.includes(draft.ttsModel) ? base : [draft.ttsModel, ...base];
   }, [draft.ttsModelOptions, draft.ttsModel]);
 
-  /** Patch v3.4 Patch 16：两套供应商的音色合并（百炼 34 + MiniMax 28）。 */
+  /** Patch v4.15：音色选择仅保留 MiniMax（剔除百炼 / 阿里音色）。 */
   const voiceOptions: VoiceOption[] = React.useMemo(
-    () => [...(draft.ttsVoiceOptions ?? []), ...(draft.minimaxVoiceOptions ?? [])],
-    [draft.ttsVoiceOptions, draft.minimaxVoiceOptions],
+    () => [...(draft.minimaxVoiceOptions ?? [])],
+    [draft.minimaxVoiceOptions],
   );
   const currentVoice = findVoiceOption(voiceOptions, draft.ttsVoice);
   const minimaxModel = draft.ttsModel.startsWith('speech-');
@@ -211,7 +225,8 @@ export const ConfigDictView: React.FC<ConfigDictViewProps> = ({
               ))}
             </select>
             <p className="text-[11px] text-slate-400 mt-1">
-              账号未开通该模型时自动降级：qwen4-max → qwen3.8-max → qwen3.7-plus → qwen-plus
+              账号未开通该模型时自动降级：qwen4-max → qwen3.8-max → qwen3.7-plus → qwen-plus；
+              选用 deepseek-v4.1-flash-1017 前需先在百炼控制台开通该模型的调用权限
             </p>
           </div>
 

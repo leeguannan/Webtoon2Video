@@ -152,15 +152,19 @@ TTS_MODEL_OPTIONS: tuple[str, ...] = (
 )
 
 #: Stage 4 模型下拉推荐项（Patch v3.3 Patch 15：新增 qwen4-max / qwen3.7-plus）。
+#: Patch v4.15：新增 deepseek-v4.1-flash-1017（百炼 · DeepSeek 高性价比），
+#: 需先在百炼控制台开通该模型的调用权限，未开通时按 MODEL_FALLBACK_CHAIN 降级。
 STORY_MODEL_OPTIONS: tuple[str, ...] = (
     "qwen4-max",
     "qwen3.8-max",
     "qwen3.7-plus",
     "qwen-plus",
+    "deepseek-v4.1-flash-1017",
 )
 SCRIPT_MODEL_OPTIONS: tuple[str, ...] = (
     "qwen3.7-plus",
     "qwen-plus",
+    "deepseek-v4.1-flash-1017",
     "qwen3.8-max",
 )
 

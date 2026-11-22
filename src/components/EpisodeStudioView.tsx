@@ -586,7 +586,8 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
           minimax_voices?: VoiceOption[];
         };
         if (cancelled) return;
-        setVoiceOptions([...(data.voices ?? []), ...(data.minimax_voices ?? [])]);
+        // Patch v4.15：音色选择仅保留 MiniMax（剔除百炼 / 阿里音色）。
+        setVoiceOptions([...(data.minimax_voices ?? [])]);
       } catch {
         // 拉不到就退回「只显示后端已解析结果」的降级模式。
       }

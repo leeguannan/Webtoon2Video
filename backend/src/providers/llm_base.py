@@ -126,6 +126,9 @@ _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 # 只有开头围栏、没有闭合围栏的场景：输出在围栏内部被 max_tokens 截断。
 _OPEN_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*", re.IGNORECASE)
 _TRAILING_FENCE_RE = re.compile(r"\s*```\s*$")
+# Patch v4.15：部分推理模型会把思考过程包在 <think>...</think> 里再输出 JSON，
+# 围栏提取前先成对剥掉，避免思考块里的 ``` 把 JSON 围栏匹配错位。
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 
 
 def extract_json_text(text: str) -> str:
@@ -133,8 +136,10 @@ def extract_json_text(text: str) -> str:
 
     成对围栏优先；若只有开头围栏（输出被截断、闭合围栏丢失），也剥掉开头
     围栏并返回剩余全文，让上层拿到真正的 JSON 残片去做归因。
+
+    Patch v4.15：先剥掉成对的 ``<think>...</think>`` 思考块再做围栏提取。
     """
-    stripped = text.strip()
+    stripped = _THINK_BLOCK_RE.sub("", text).strip()
     match = _CODE_FENCE_RE.search(stripped)
     if match:
         return match.group(1).strip()

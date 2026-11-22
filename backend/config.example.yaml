@@ -33,8 +33,10 @@ models:
   # Stage 3 识图（密集文字可用 qwen-vl-max）
   vision: qwen3-vl-plus
   # Stage 4B 拆拍配图（快、便宜、JSON 稳定）
+  # 可选：deepseek-v4.1-flash-1017（百炼 · DeepSeek 高性价比，需先在百炼控制台开通权限）
   script: qwen3.7-plus
   # Stage 4A 故事编剧（说书体正文，最吃文笔与逻辑；留空则回退到 script）
+  # 可选：deepseek-v4.1-flash-1017（百炼 · DeepSeek 高性价比，需先在百炼控制台开通权限）
   story_model: qwen4-max
   # Stage 5 配音。可选值：
   #   百炼：  qwen3-tts-flash / qwen-audio-3.1-tts-plus

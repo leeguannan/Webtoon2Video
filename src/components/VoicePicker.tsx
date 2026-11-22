@@ -9,8 +9,8 @@ import type { VoiceOption, VoiceSpec } from '../types/studio';
  * - 作品配音面板（`SeriesTtsPanel`）：讲解者 / 通用男女声 / 角色专属音色
  * - 全局配置页（`ConfigDictView`）：Stage 5 的默认音色
  *
- * 音色清单来自两个供应商（百炼 qwen 34 条 + MiniMax 28 条），下拉按
- * 「供应商 → 分类」分组，避免两套 provider 的音色混在一起
+ * Patch v4.15：音色下拉**只保留 MiniMax**（百炼 / 阿里音色一律不在候选里），
+ * 分组仍按「供应商 → 分类」组织，避免不同 provider 的音色混在一起
  * （百炼音色发给 MiniMax 会直接 2013 invalid voice_id）。
  *
  * 试听**只播放后端预生成的静态样例**，用 `audio.playbackRate` 实时变速，
@@ -28,15 +28,14 @@ export const CATEGORY_LABELS: Record<string, string> = {
   other: '其他',
 };
 
-/** 供应商 → 中文标签（Patch v3.4 Patch 16）。 */
+/** 供应商 → 中文标签（Patch v3.4 Patch 16；Patch v4.15 起仅保留 MiniMax）。 */
 export const PROVIDER_LABELS: Record<string, string> = {
-  qwen: '百炼（通义千问）',
   minimax: 'MiniMax Speech',
 };
 
 /** 分组展示顺序（未列出的分类排最后）。 */
 const CATEGORY_ORDER = ['narrator', 'character', 'dialect', 'drama', 'male', 'female', 'other'];
-const PROVIDER_ORDER = ['qwen', 'minimax'];
+const PROVIDER_ORDER = ['minimax'];
 
 /** 「自定义音色 ID」占位值（不是合法音色 ID）。 */
 export const CUSTOM_VOICE = '__custom__';
@@ -49,11 +48,13 @@ export interface VoiceGroup {
   label: string;
 }
 
-/** 把两套供应商的音色按「供应商 → 分类」分组。 */
+/** 把音色按「供应商 → 分类」分组（Patch v4.15：只保留 MiniMax 音色）。 */
 export function groupVoices(voices: VoiceOption[]): VoiceGroup[] {
   const map = new Map<string, VoiceOption[]>();
   for (const item of voices) {
-    const provider = item.provider ?? 'qwen';
+    // Patch v4.15：剔除百炼 / 阿里等非 MiniMax 音色，下拉只展示 MiniMax 分组。
+    if ((item.provider ?? 'qwen') !== 'minimax') continue;
+    const provider = item.provider ?? 'minimax';
     const category = item.category || 'other';
     const key = `${provider}::${category}`;
     const bucket = map.get(key);

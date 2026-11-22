@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -67,6 +68,58 @@ def _flatten_content(content: Any) -> str:
                     chunks.append(text)
         return "".join(chunks)
     return str(content)
+
+
+#: Patch v4.15：模型不存在时的报错特征（这些一律不触发「剥离 enable_thinking 重试」）。
+_MODEL_MISSING_MARKERS = ("modelnotfound", "model not found", "does not exist")
+#: Patch v4.15：鉴权 / 权限不足的特征（同样一律不触发重试）。
+_ACCESS_DENIED_MARKERS = ("accessdenied", "access denied", "forbidden")
+#: Patch v4.15：DeepSeek 等模型报「参数非法 / 不支持」的特征。
+_INVALID_PARAMETER_MARKERS = (
+    "invalidparameter",
+    "unsupported",
+    "unknown parameter",
+    "extra inputs are not permitted",
+)
+
+
+def _should_retry_without_thinking(
+    status_code: int,
+    body_text: str,
+    payload: dict[str, Any],
+    model: str,
+) -> bool:
+    """判断是否该剥掉 ``enable_thinking`` 参数、用同一模型原地重试一次。
+
+    Patch v4.15：DeepSeek 系列（``deepseek-v4.1-flash-1017`` 等）不支持
+    ``enable_thinking``，百炼会直接返回 400 InvalidParameter。若不在客户端
+    层自愈，上层会把它当成模型失败并静默降级到 ``MODEL_FALLBACK_CHAIN`` 的
+    下一个模型（qwen3.8-max），用户看不到真实原因。
+
+    触发条件（全部满足才剥离重试）：
+
+    * 状态码是 400（404 / 403 一律不触发）；
+    * 请求体里带了 ``enable_thinking``；
+    * 响应体里没有「模型不存在」的特征，也没有「鉴权 / 权限不足」的特征
+      （ModelNotFound / AccessDenied 即便以 400 返回也不触发）；
+    * 且满足其一：响应体点名了 ``enable_thinking``；
+      或模型不是 qwen 系（DeepSeek 等）且响应体是「参数非法 / 不支持」。
+    """
+    if status_code != 400:
+        return False
+    if "enable_thinking" not in payload:
+        return False
+    lowered = body_text.lower()
+    if any(marker in lowered for marker in _MODEL_MISSING_MARKERS):
+        return False
+    if any(marker in lowered for marker in _ACCESS_DENIED_MARKERS):
+        return False
+    if "enable_thinking" in lowered:
+        return True
+    if not model.strip().lower().startswith("qwen"):
+        if any(marker in lowered for marker in _INVALID_PARAMETER_MARKERS):
+            return True
+    return False
 
 
 class BailianClient(LLMClient):
@@ -179,6 +232,8 @@ class BailianClient(LLMClient):
             kwargs=kwargs,
         )
         last_error: LLMError | None = None
+        # Patch v4.15：剥掉 enable_thinking 后原地重试只做一次。
+        stripped_thinking_retried = False
         for attempt in range(self._max_retries + 1):
             try:
                 response = await self._client.post(url, json=payload, headers=self._headers())
@@ -191,9 +246,45 @@ class BailianClient(LLMClient):
                     f"百炼请求失败（第 {attempt + 1} 次，{type(exc).__name__}）：{exc}"
                 )
             else:
-                if response.status_code < 400:
+                if (
+                    not stripped_thinking_retried
+                    and _should_retry_without_thinking(
+                        response.status_code, _brief(response), payload, model
+                    )
+                ):
+                    # Patch v4.15：模型不支持 enable_thinking（如 DeepSeek 系列）。
+                    # 剥掉该参数后**原地用同一个 model 重试一次**，避免上层把它
+                    # 当成模型失败并静默降级到 MODEL_FALLBACK_CHAIN 的下一个模型。
+                    stripped_thinking_retried = True
+                    payload = {k: v for k, v in payload.items() if k != "enable_thinking"}
+                    print(
+                        f"[llm_bailian] 模型 {model} 不支持 enable_thinking 参数，"
+                        "已剥离该参数并原地重试一次。",
+                        file=sys.stderr,
+                    )
+                    try:
+                        retry_response = await self._client.post(
+                            url, json=payload, headers=self._headers()
+                        )
+                    except httpx.HTTPError as exc:
+                        last_error = LLMError(
+                            f"百炼请求失败（剥离 enable_thinking 后重试，{type(exc).__name__}）：{exc}"
+                        )
+                    else:
+                        if retry_response.status_code < 400:
+                            return self._parse_response(retry_response, model=model)
+                        if retry_response.status_code in RETRYABLE_STATUS:
+                            last_error = LLMRequestError(
+                                f"百炼返回 {retry_response.status_code}"
+                                f"（剥离 enable_thinking 后重试）：{_brief(retry_response)}"
+                            )
+                        else:
+                            raise LLMRequestError(
+                                f"百炼返回 {retry_response.status_code}：{_brief(retry_response)}"
+                            )
+                elif response.status_code < 400:
                     return self._parse_response(response, model=model)
-                if response.status_code in RETRYABLE_STATUS:
+                elif response.status_code in RETRYABLE_STATUS:
                     last_error = LLMRequestError(
                         f"百炼返回 {response.status_code}（第 {attempt + 1} 次）：{_brief(response)}"
                     )
