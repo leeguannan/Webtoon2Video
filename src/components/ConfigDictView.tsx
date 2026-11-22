@@ -38,6 +38,28 @@ const FALLBACK_TTS_MODEL_OPTIONS = [
   'edge-tts',
 ];
 
+/** Patch v4.22：识图（视觉抽取）模型候选（后端未给选项时的兜底）。 */
+const FALLBACK_VISION_MODEL_OPTIONS = [
+  'qwen3.7-plus',
+  'qwen-vl-max',
+  'qwen3-vl-plus',
+  'deepseek-v4.1-flash-1017',
+];
+
+/**
+ * Patch v4.22：识图模型下拉标签。
+ * qwen3.7-plus 原生多图 + 长上下文，Stage 3 走批窗抽取（主力推荐）；
+ * qwen-vl-max 密集小字 / 气泡归属更强，但百炼该模型 ID 已下线（404）；
+ * qwen3-vl-plus 经典视觉线（单图模型，逐格抽取）；
+ * deepseek-v4.1-flash-1017 实测对图片输入返回空内容（仅作对比测试）。
+ */
+const VISION_MODEL_LABELS: Record<string, string> = {
+  'qwen3.7-plus': 'qwen3.7-plus (原生多模态 · 主力推荐)',
+  'qwen-vl-max': 'qwen-vl-max (密集小字增强 · 百炼已下线 404)',
+  'qwen3-vl-plus': 'qwen3-vl-plus (经典视觉线)',
+  'deepseek-v4.1-flash-1017': 'deepseek-v4.1-flash-1017 (百炼多模态 · 对比测试)',
+};
+
 const SCRIPT_MODEL_LABELS: Record<string, string> = {
   'qwen3.7-plus': 'qwen3.7-plus (新版主力)',
   'qwen3.8-max': 'qwen3.8-max (长篇精修)',
@@ -129,6 +151,15 @@ export const ConfigDictView: React.FC<ConfigDictViewProps> = ({
     return base.includes(draft.ttsModel) ? base : [draft.ttsModel, ...base];
   }, [draft.ttsModelOptions, draft.ttsModel]);
 
+  /** Patch v4.22：识图模型候选（后端为准，当前值兜底进列表避免回退丢值）。 */
+  const visionModelOptions = React.useMemo(() => {
+    const base =
+      draft.visionModelOptions && draft.visionModelOptions.length > 0
+        ? draft.visionModelOptions
+        : FALLBACK_VISION_MODEL_OPTIONS;
+    return base.includes(draft.visionModel) ? base : [draft.visionModel, ...base];
+  }, [draft.visionModelOptions, draft.visionModel]);
+
   /** Patch v4.15：音色选择仅保留 MiniMax（剔除百炼 / 阿里音色）。 */
   const voiceOptions: VoiceOption[] = React.useMemo(
     () => [...(draft.minimaxVoiceOptions ?? [])],
@@ -186,12 +217,11 @@ export const ConfigDictView: React.FC<ConfigDictViewProps> = ({
                 onChange={(e) => setDraft({ ...draft, visionModel: e.target.value })}
                 className="w-full px-3 py-2 text-xs font-mono-tabular bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
               >
-                <option value="qwen3-vl-plus">qwen3-vl-plus (标准主力)</option>
-                <option value="qwen-vl-max">qwen-vl-max (密集小字/气泡归属推荐)</option>
-                {/* Patch v4.19：开放多模态模型对比（百炼 deepseek 多模态）。 */}
-                <option value="deepseek-v4.1-flash-1017">
-                  deepseek-v4.1-flash-1017 (百炼多模态 · 对比测试)
-                </option>
+                {visionModelOptions.map((model) => (
+                  <option key={model} value={model}>
+                    {VISION_MODEL_LABELS[model] ?? model}
+                  </option>
+                ))}
               </select>
             </div>
 

@@ -33,6 +33,7 @@ from core.schemas import (
 )
 from providers.image_utils import encode_pil_data_url, load_image
 from providers.llm_base import ChatMessage, ContentPart, LLMClient, parse_json_response
+from stages import s3_vision
 from stages.s3_vision import (
     format_character_block,
     is_text_only_card,
@@ -1003,11 +1004,12 @@ async def enrich_storyboard_with_vision(
                 parts.append(
                     ContentPart(type="image_url", image_url=encode_pil_data_url(strip))
                 )
-            response = await client.chat(
-                [ChatMessage(role="user", content=parts)],
+            response = await s3_vision._call_vision_chat(
+                client,
+                messages=[ChatMessage(role="user", content=parts)],
                 model=model,
                 temperature=0.2,
-                max_tokens=1200,
+                max_tokens=1500,
             )
             raw_content = (response.content or "").strip()
             parsed_bgm = _parse_bgm_lines(raw_content)
@@ -1110,7 +1112,10 @@ def load_or_build_storyboard(
         if existing.source == "human":
             # 人工编排保护：永远不覆写用户的镜头组。
             return existing
-        if not reset:
+        if not existing.scenes:
+            # Patch v4.22：空编排（上一轮 Stage 3 全军覆没留下的垃圾）视为无效，重建。
+            existing = None
+        elif not reset:
             # Patch v4.20：既有编排里的纯文字卡剔掉（分镜页与成片口径一致）。
             return strip_text_cards_from_storyboard(existing, vision)
 
@@ -1152,7 +1157,12 @@ async def resolve_or_build_storyboard(
         if existing.source == "human":
             # 人工编排保护：永远不覆写用户的镜头组。
             return existing
-        if not reset:
+        if not existing.scenes:
+            # Patch v4.22：磁盘上是**空编排**（``scenes`` 为空）——多半是上一轮
+            # Stage 3 全军覆没留下的垃圾文件。这种编排没有任何可用分镜，
+            # 直接沿用会让 Stage 4 拿着空候选池产出空 beats。视为无效，重建。
+            existing = None
+        elif not reset:
             # Patch v4.21：前端预览落盘的规则占位编排 → 自动升级成语义切幕一次。
             if existing.auto_strategy == "rule" and client is not None and model:
                 upgraded = await semantic_build_storyboard(

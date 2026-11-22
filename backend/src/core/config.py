@@ -81,7 +81,9 @@ class ApiConfig(_StrictModel):
 class ModelConfig(_StrictModel):
     """各阶段使用的模型名。"""
 
-    vision: str = "qwen3-vl-plus"
+    #: Patch v4.22：主力识图模型升级为 qwen3.7-plus——原生多图 + 长上下文，
+    #: Stage 3 可按 2~4 格批窗抽取，请求数约为逐格模式的 1/3~1/4。
+    vision: str = "qwen3.7-plus"
     #: Patch v3.3 Patch 15：Step 4B 拆拍配图升级新一代均衡主力 qwen3.7-plus。
     script: str = "qwen3.7-plus"
     #: Patch v3.0-7：Step 4A（故事编剧）专用的「说书体」模型。

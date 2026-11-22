@@ -169,6 +169,18 @@ SCRIPT_MODEL_OPTIONS: tuple[str, ...] = (
     "qwen3.8-max",
 )
 
+#: Patch v4.22：识图（视觉抽取）模型下拉。
+#: qwen3.7-plus 原生多图 + 长上下文，Stage 3 走批窗抽取（主力推荐）；
+#: qwen-vl-max 密集小字 / 气泡归属更强但百炼已下线（404），保留备查；
+#: qwen3-vl-plus 经典视觉线（单图模型，逐格抽取）；
+#: deepseek-v4.1-flash-1017 百炼多模态，实测带图返回空内容（对比测试用）。
+VISION_MODEL_OPTIONS: tuple[str, ...] = (
+    "qwen3.7-plus",
+    "qwen-vl-max",
+    "qwen3-vl-plus",
+    "deepseek-v4.1-flash-1017",
+)
+
 
 def voice_sample_dir() -> Path:
     """试听样例目录：``backend/assets/voice_samples/``。"""
@@ -2807,6 +2819,8 @@ def _config_payload(config: AppConfig) -> dict[str, Any]:
     return {
         "bailianBaseUrl": config.api.base_url,
         "visionModel": config.models.vision,
+        # Patch v4.22：识图模型下拉推荐项（前端「视觉模型」下拉）。
+        "visionModelOptions": list(VISION_MODEL_OPTIONS),
         "scriptModel": config.models.script,
         # Patch v3.3 Patch 15：4A 故事模型与 Stage 4 模型下拉推荐项。
         "storyModel": config.models.story_model,

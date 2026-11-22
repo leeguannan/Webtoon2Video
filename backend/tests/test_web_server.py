@@ -488,7 +488,9 @@ def test_export_zip_without_videos_returns_404(client: TestClient, workspace: Pa
 def test_get_config_returns_studio_shape(client: TestClient) -> None:
     payload = client.get("/api/config").json()
     assert payload["aspectRatio"] == "9:16"
-    assert payload["visionModel"] == "qwen3-vl-plus"
+    # Patch v4.22：默认识图模型升级为 qwen3.7-plus，下拉候选一并回显。
+    assert payload["visionModel"] == "qwen3.7-plus"
+    assert "qwen3.7-plus" in payload["visionModelOptions"]
     assert payload["scriptModel"] == "qwen3.7-plus"
     # Patch v3.3 Patch 15：4A 说书体模型与下拉候选一并回显。
     assert payload["storyModel"] == "qwen4-max"
@@ -744,7 +746,8 @@ async def test_job_runner_executes_stage1_to_stage4(
     assert len(list((episode_dir / "01_raw").glob("*.png"))) == 2
     assert (episode_dir / "03_vision" / "vision.json").is_file()
     assert (episode_dir / "04_script" / "script.json").is_file()
-    assert any("qwen3-vl-plus" in model for model in stub.models)
+    # Patch v4.22：默认识图模型升级为 qwen3.7-plus。
+    assert any("qwen3.7-plus" in model for model in stub.models)
     # Patch v3.3 Patch 15：默认撰稿模型已升级为 qwen3.7-plus。
     assert any("qwen3.7-plus" in model for model in stub.models)
 

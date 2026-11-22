@@ -84,6 +84,13 @@ const API_BASE = '/api';
 const FALLBACK_CONFIG: StudioConfig = {
   bailianBaseUrl: '',
   visionModel: '',
+  /** Patch v4.22：后端未就绪时的识图模型下拉兜底。 */
+  visionModelOptions: [
+    'qwen3.7-plus',
+    'qwen-vl-max',
+    'qwen3-vl-plus',
+    'deepseek-v4.1-flash-1017',
+  ],
   scriptModel: '',
   storyModel: '',
   ttsModel: '',
@@ -139,6 +146,8 @@ type RawSeries = {
 type RawConfig = {
   bailianBaseUrl: string;
   visionModel: string;
+  /** Patch v4.22：识图模型候选清单。 */
+  visionModelOptions?: string[];
   scriptModel: string;
   /** Patch v3.3 Patch 15：Stage 4A 说书体模型与候选清单。 */
   storyModel?: string;
@@ -318,6 +327,7 @@ function toStudioConfig(raw: RawConfig): StudioConfig {
   return {
     bailianBaseUrl: raw.bailianBaseUrl,
     visionModel: raw.visionModel,
+    visionModelOptions: raw.visionModelOptions,
     scriptModel: raw.scriptModel,
     storyModel: raw.storyModel ?? '',
     storyModelOptions: raw.storyModelOptions,

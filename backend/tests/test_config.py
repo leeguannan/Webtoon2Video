@@ -40,7 +40,8 @@ def test_default_config_values() -> None:
     config = load_config()
     assert config.api.base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
     assert config.api.api_key_env == "DASHSCOPE_API_KEY"
-    assert config.models.vision == "qwen3-vl-plus"
+    # Patch v4.22：默认识图模型升级为 qwen3.7-plus（原生多图批窗抽取）。
+    assert config.models.vision == "qwen3.7-plus"
     # Patch v3.3 Patch 15：默认撰稿模型升级为 qwen3.7-plus，4A 说书体模型升级为 qwen4-max。
     assert config.models.script == "qwen3.7-plus"
     assert config.models.story_model == "qwen4-max"

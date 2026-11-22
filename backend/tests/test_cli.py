@@ -144,7 +144,16 @@ class StubClient:
         self.tracker.enter()
         try:
             await asyncio.sleep(self.delay)
-            if "vl" in model:
+            # Patch v4.22：默认识图模型从 qwen-vl-max 换成 qwen3.7-plus（模型名里
+            # 不再带 "vl"），所以除了看模型名，还要按提示词特征判定这是不是视觉调用
+            # （单格/批窗模板首句都是「你是漫画画面解析助手」，整幕复核提示词以
+            # 「同一个镜头组（连续一幕）」开头）。
+            is_vision_call = (
+                "vl" in model
+                or "漫画画面解析助手" in prompt
+                or "同一个镜头组（连续一幕）" in prompt
+            )
+            if is_vision_call:
                 match = _VISION_RE.search(prompt)
                 title, episode_no = (match.group(1), int(match.group(2))) if match else ("?", 0)
                 self.tracker.vision_calls.append(

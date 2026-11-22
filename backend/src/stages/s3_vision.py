@@ -54,6 +54,43 @@ TALL_PANEL_SLICE_MIN_HEIGHT = 400
 #: 又不至于把每格的请求体积翻倍。
 NEIGHBOR_MAX_EDGE = 640
 
+# --------------------------------------------------------------------------
+# Patch v4.22：qwen3.7-plus 原生多图「批窗」抽取
+# --------------------------------------------------------------------------
+#: 多图批窗抽取用的提示词文件名（单格 ``vision_extract.md`` 保持原样不动，
+#: 以确保既有单格单测 100% 兼容）。
+BATCH_PROMPT_FILENAME = "vision_extract_batch.md"
+
+#: 关闭思考链：视觉抽取要的是结构化 JSON，不是长篇推理。百炼 qwen3 系默认
+#: 开启 thinking，推理 token 会挤占 ``max_tokens``（Stage 4 早已统一关闭）。
+_VISION_NO_THINKING_KWARGS: dict[str, object] = {"enable_thinking": False}
+
+#: Patch v4.22：视觉模型降级链（模型 ID 下线 / 未开通时按顺序降级）。
+#: 实测（2026-11-22）：``qwen-vl-max`` 这个 ID 在百炼已下线（404 Model not exist），
+#: ``qwen3.7-plus`` 识图与多图均实测可用，故放在链首。
+VISION_MODEL_FALLBACK_CHAIN: tuple[str, ...] = (
+    "qwen3.7-plus",
+    "qwen-vl-max",
+    "qwen3-vl-plus",
+)
+
+#: 原生多图模型前缀：一次请求可以看多张图 → 可以按「格」批窗抽取。
+_MULTI_IMAGE_MODEL_PREFIXES: tuple[str, ...] = (
+    "qwen3.7",
+    "qwen3.8",
+    "qwen4",
+    "deepseek-v4",
+)
+
+#: 经典单图视觉模型前缀：一次只吃一张图 → 保持逐格抽取（行为与旧版完全一致）。
+_SINGLE_IMAGE_MODEL_PREFIXES: tuple[str, ...] = ("qwen3-vl-plus", "qwen-vl-max")
+
+#: 多图模型的默认批窗大小（一次最多看 4 格）。
+DEFAULT_VISION_BATCH_SIZE = 4
+
+#: 批窗里每格的 max_tokens 预算（4 格 → 3600；下限 2000）。
+VISION_BATCH_TOKENS_PER_PANEL = 900
+
 #: Patch v2.5-1：non_story_type 合法取值（与 schemas.PanelVisionInfo 对齐）。
 #: Patch v3.0-6：新增 ``sfx_only``——整格只有拟声词/气氛特效、没有人物动作与对白。
 NON_STORY_TYPES = frozenset(
@@ -453,6 +490,112 @@ def _slice_tall_panel(image_path: str | Path) -> list[PanelTile]:
     ]
 
 
+def _vision_fallback_candidates(primary_model: str) -> list[str]:
+    """视觉模型降级候选（按 :data:`VISION_MODEL_FALLBACK_CHAIN` 的顺序）。"""
+    return [item for item in VISION_MODEL_FALLBACK_CHAIN if item != primary_model]
+
+
+async def _call_vision_chat(
+    client: LLMClient,
+    *,
+    messages: list[ChatMessage],
+    model: str,
+    temperature: float = 0.2,
+    max_tokens: int = 2000,
+) -> Any:
+    """统一封装视觉模型调用（Patch v4.22）。
+
+    * 每次调用都透传 ``enable_thinking=False``——视觉抽取要的是结构化 JSON，
+      思考链只会挤占 ``max_tokens``（Stage 4 早已统一关闭，Stage 3 此前漏了）。
+    * 模型 ID 下线 / 未开通（复用 :func:`stages.s4_scriptwriter.is_model_access_error`）
+      时按 :data:`VISION_MODEL_FALLBACK_CHAIN` 自动降级；其余异常原样抛出。
+    """
+    from stages.s4_scriptwriter import is_model_access_error  # 局部导入避免循环依赖
+
+    last_error: Exception | None = None
+    for candidate in [model, *_vision_fallback_candidates(model)]:
+        try:
+            return await client.chat(
+                messages,
+                model=candidate,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                **_VISION_NO_THINKING_KWARGS,
+            )
+        except Exception as exc:  # noqa: BLE001 - 按错误类型决定是否降级
+            if not is_model_access_error(exc):
+                raise
+            last_error = exc
+            print(
+                f"[s3_vision] 视觉模型 {candidate} 不可用（{exc}），按降级链尝试下一个模型。",
+                file=sys.stderr,
+            )
+    assert last_error is not None  # pragma: no cover - 循环至少执行一次
+    raise last_error
+
+
+def resolve_vision_batch_size(model: str, batch_size: int | None = None) -> int:
+    """这个视觉模型一次能看几张图（Patch v4.22）。
+
+    * 原生多图模型（``qwen3.7`` / ``qwen3.8`` / ``qwen4`` / ``deepseek-v4`` 前缀）
+      默认按 :data:`DEFAULT_VISION_BATCH_SIZE`（4 格）批窗抽取。
+    * 经典单图视觉模型（``qwen3-vl-plus`` / ``qwen-vl-max``）默认 1——保持既有
+      单格调用行为不变（既有单测 100% 兼容）。
+    * 显式传入 ``batch_size`` 时以传入值为准（小于 1 视为未传）。
+    """
+    if batch_size is not None:
+        try:
+            explicit = int(batch_size)
+        except (TypeError, ValueError):
+            explicit = 0
+        if explicit >= 1:
+            return explicit
+    name = str(model or "").strip().lower()
+    if any(name.startswith(prefix) for prefix in _SINGLE_IMAGE_MODEL_PREFIXES):
+        return 1
+    if any(name.startswith(prefix) for prefix in _MULTI_IMAGE_MODEL_PREFIXES):
+        return DEFAULT_VISION_BATCH_SIZE
+    return 1
+
+
+def _panel_info_from_payload(payload: dict[str, Any], *, panel_id: str) -> PanelVisionInfo:
+    """把模型返回的原始 JSON 规整成 :class:`PanelVisionInfo`。
+
+    单格抽取（:func:`analyze_panel`）与批窗抽取（:func:`_analyze_panel_batch`）
+    共用同一套规整逻辑，避免两条路径的字段口径漂移。
+    """
+    normalized = normalize_panel_payload(payload, panel_id=panel_id)
+    # Patch v2.5-1 第二重：core.normalize 不在补丁清单内、不处理 non_story_type，
+    # 在此做白名单收敛；模型给出的非法/缺失值一律回落 "none"。
+    raw_non_story = payload.get("non_story_type")
+    non_story_type = raw_non_story if raw_non_story in NON_STORY_TYPES else "none"
+    normalized["non_story_type"] = non_story_type
+    if non_story_type in NON_STORY_BANNER_TYPES:
+        # 版权声明/推广尾页同步标记过渡空页，下游统一按 is_transition_blank 过滤
+        normalized["is_transition_blank"] = True
+    try:
+        return PanelVisionInfo.model_validate(normalized)
+    except Exception as exc:  # pydantic ValidationError
+        raise VisionError(f"面板 {panel_id} 的视觉结果不合法：{exc}") from exc
+
+
+def _ensure_vision_content(response: Any, *, model: str) -> str:
+    """确保视觉模型真的回了内容（Patch v4.22）。
+
+    有些「能聊天但不看图」的模型（例如纯文本模型被误选成视觉模型）会返回
+    HTTP 200 + 空字符串内容。若放任它继续，后面的 JSON 解析只会报
+    「模型返回内容不是合法 JSON：''」，完全指不出真正的原因。这里提前拦下，
+    直接把「模型不支持图片输入」这件事讲清楚。
+    """
+    content = str(getattr(response, "content", "") or "").strip()
+    if not content:
+        raise VisionError(
+            f"视觉模型 {model} 返回空内容（该模型很可能不支持图片输入，"
+            "请改用多模态视觉模型）"
+        )
+    return content
+
+
 def _extract_panel_payload(data: Any, *, panel_id: str) -> dict[str, Any]:
     """从模型返回的 JSON 中取出面板对象（兼容单对象与 ``panels`` 数组两种写法）。"""
     if not isinstance(data, dict):
@@ -673,11 +816,18 @@ async def _analyze_tall_panel(
                 *neighbor_parts,
             ],
         )
-        response = await client.chat(
-            [message], model=model, temperature=temperature, max_tokens=2000
+        response = await _call_vision_chat(
+            client,
+            messages=[message],
+            model=model,
+            temperature=temperature,
+            max_tokens=2000,
         )
         payload = _extract_panel_payload(
-            parse_json_response(response.content, finish_reason=response.finish_reason),
+            parse_json_response(
+                _ensure_vision_content(response, model=model),
+                finish_reason=response.finish_reason,
+            ),
             panel_id=panel_id,
         )
         tile_payloads.append((tile, payload))
@@ -761,26 +911,146 @@ async def analyze_panel(
             *_neighbor_reference_parts(prev_image_path, next_image_path),
         ],
     )
-    response = await client.chat(
-        [message], model=model, temperature=temperature, max_tokens=2000
+    response = await _call_vision_chat(
+        client,
+        messages=[message],
+        model=model,
+        temperature=temperature,
+        max_tokens=2000,
     )
     payload = _extract_panel_payload(
-        parse_json_response(response.content, finish_reason=response.finish_reason),
+        parse_json_response(
+            _ensure_vision_content(response, model=model),
+            finish_reason=response.finish_reason,
+        ),
         panel_id=panel_id,
     )
-    normalized = normalize_panel_payload(payload, panel_id=panel_id)
-    # Patch v2.5-1 第二重：core.normalize 不在补丁清单内、不处理 non_story_type，
-    # 在此做白名单收敛；模型给出的非法/缺失值一律回落 "none"。
-    raw_non_story = payload.get("non_story_type")
-    non_story_type = raw_non_story if raw_non_story in NON_STORY_TYPES else "none"
-    normalized["non_story_type"] = non_story_type
-    if non_story_type in NON_STORY_BANNER_TYPES:
-        # 版权声明/推广尾页同步标记过渡空页，下游统一按 is_transition_blank 过滤
-        normalized["is_transition_blank"] = True
+    return _panel_info_from_payload(payload, panel_id=panel_id)
+
+
+def _is_tall_panel(image_path: str | Path) -> bool:
+    """该画格是否是超高竖长画格（要纵向切片，不能进批窗）。
+
+    只读图片尺寸，不做解码切片——分批规划阶段每格都要问一次。
+    """
     try:
-        return PanelVisionInfo.model_validate(normalized)
-    except Exception as exc:  # pydantic ValidationError
-        raise VisionError(f"面板 {panel_id} 的视觉结果不合法：{exc}") from exc
+        with Image.open(image_path) as raw:
+            width, height = raw.size
+    except Exception:  # pragma: no cover - 图片损坏时按普通格处理
+        return False
+    return bool(width and height and height > TALL_PANEL_SLICE_THRESHOLD)
+
+
+async def _analyze_panel_batch(
+    client: LLMClient,
+    *,
+    paths: list[Path],
+    panel_ids: list[str],
+    model: str,
+    characters: Any = (),
+    series_title: str = "",
+    episode_no: int = 0,
+    template: str | None = None,
+    temperature: float = 0.2,
+    prev_context_path: str | Path | None = None,
+) -> dict[str, PanelVisionInfo]:
+    """一次请求抽取 2~4 格（Patch v4.22，qwen3.7-plus 原生多图）。
+
+    请求体 = 1 份提示词 + 至多 1 张**前格 640px 上下文参考图** + N 张待抽
+    **1280px 主图**（顺序与 ``panel_ids`` 一一对应）。
+
+    返回 ``{panel_id: PanelVisionInfo}``：模型少返回 / 返回错的 panel_id 不会
+    出现在结果里，由调用方**逐格回退**补抽，确保 100% 不丢格。
+    """
+    if not paths or len(paths) != len(panel_ids):
+        raise VisionError("批量抽取参数不一致（图片数与面板 ID 数不等）")
+    prompt_template = (
+        template if template is not None else load_prompt_template(BATCH_PROMPT_FILENAME)
+    )
+    prev_id = Path(prev_context_path).stem if prev_context_path else ""
+    if prev_id:
+        prev_note = (
+            f"- 第 1 张图是**参考前格 `{prev_id}` 的缩略图**，只用来认人与延续上一格的"
+            f"说话人 / 动作，**禁止**把它的画面或台词写进下面任何一个面板对象。\n"
+            f"- 第 2~{len(paths) + 1} 张图依次对应待抽面板：{', '.join(panel_ids)}。"
+        )
+    else:
+        prev_note = (
+            f"- 本次**没有**参考前格；第 1~{len(paths)} 张图依次对应待抽面板："
+            f"{', '.join(panel_ids)}。"
+        )
+    prompt = render_prompt(
+        prompt_template,
+        {
+            "CHARACTERS": format_character_block(characters) or "（暂无已知角色）",
+            "SERIES_TITLE": series_title or "未知作品",
+            "EPISODE_NO": str(episode_no),
+            "TARGET_PANEL_IDS": ", ".join(panel_ids),
+            "PANEL_COUNT": str(len(panel_ids)),
+            "PREV_CONTEXT_NOTE": prev_note,
+        },
+    )
+    parts: list[ContentPart] = [ContentPart(type="text", text=prompt)]
+    if prev_context_path:
+        try:
+            parts.append(
+                ContentPart(
+                    type="image_url",
+                    image_url=encode_image_data_url(
+                        prev_context_path, max_edge=NEIGHBOR_MAX_EDGE
+                    ),
+                )
+            )
+        except Exception:  # pragma: no cover - 前格读不到就当没有，不阻断
+            pass
+    for path in paths:
+        parts.append(ContentPart(type="image_url", image_url=encode_image_data_url(path)))
+    message = ChatMessage(role="user", content=parts)
+    response = await _call_vision_chat(
+        client,
+        messages=[message],
+        model=model,
+        temperature=temperature,
+        max_tokens=max(2000, len(panel_ids) * VISION_BATCH_TOKENS_PER_PANEL),
+    )
+    data = parse_json_response(
+        _ensure_vision_content(response, model=model),
+        finish_reason=response.finish_reason,
+    )
+    if not isinstance(data, dict):
+        raise VisionError(f"模型返回的 JSON 结构异常：{type(data).__name__}")
+    panels = data.get("panels")
+    if not isinstance(panels, list) or not panels:
+        raise VisionError("模型返回的 panels 为空")
+    wanted = set(panel_ids)
+    returned_ids: list[str] = []
+    for item in panels:
+        if isinstance(item, dict):
+            returned_ids.append(str(item.get("panel_id") or "").strip())
+        else:
+            returned_ids.append("")
+    # 模型给的 panel_id 全部合法且不重复 → 按 id 归档（能容忍「只回了几格」）；
+    # 否则退回「按数组顺序对应」（提示词要求顺序严格一一对应）。
+    by_id = (
+        len(returned_ids) == len(set(returned_ids))
+        and all(pid in wanted for pid in returned_ids)
+    )
+    found: dict[str, PanelVisionInfo] = {}
+    for index, item in enumerate(panels):
+        if not isinstance(item, dict):
+            continue
+        if by_id:
+            panel_id = returned_ids[index]
+        elif index < len(panel_ids):
+            panel_id = panel_ids[index]
+        else:
+            continue
+        if panel_id in found:
+            continue
+        payload = dict(item)
+        payload["panel_id"] = panel_id
+        found[panel_id] = _panel_info_from_payload(payload, panel_id=panel_id)
+    return found
 
 
 async def extract_episode_vision(
@@ -796,6 +1066,8 @@ async def extract_episode_vision(
     on_panel_error: str = "raise",
     failures: list[dict[str, str]] | None = None,
     blank_ids: set[str] | None = None,
+    batch_size: int | None = None,
+    batch_template: str | None = None,
 ) -> VisionWindowOutput:
     """并发分析整话所有面板，返回合并结果。
 
@@ -809,6 +1081,12 @@ async def extract_episode_vision(
     Patch v4.19：为每格附带紧邻的**前一格 / 后一格**缩略图（上下文滑窗），
     用于跨格追踪说话人延续与动作因果；相邻是过渡空页时不跨空页取引用。
     邻格不新增 LLM 调用次数——每格仍然只调用模型一次。
+
+    Patch v4.22：原生多图模型（``qwen3.7-plus`` 等）走**顺序批窗抽取**——
+    连续 2~4 个普通格合成一次请求（1 份提示词 + 至多 1 张前格 640px 参考图
+    + N 张待抽 1280px 主图），请求次数约为逐格模式的 1/3~1/4。
+    断批规则：遇到过渡空页 / 超高竖长画格（要走纵向切片）就断开；
+    批次异常或模型少返回某几格时，**只对缺失的格子逐格回退**补抽，不丢格。
     """
     paths = list_panel_images(panels_dir)
     semaphore = asyncio.Semaphore(max(1, concurrency))
@@ -816,12 +1094,81 @@ async def extract_episode_vision(
     blanks = blank_ids or set()
     # Patch v4.19：为每格算出紧邻的前一格 / 后一格参考图（跨过渡空页不串格）。
     neighbors = _neighbor_paths(paths, blanks)
+    # Patch v4.22：多图模型按批窗抽取，单图模型保持逐格（行为与旧版完全一致）。
+    effective_batch = resolve_vision_batch_size(model, batch_size)
+    results: dict[str, PanelVisionInfo | None] = {}
 
-    async def worker(path: Path) -> PanelVisionInfo | None:
+    async def analyze_one(path: Path) -> PanelVisionInfo | None:
+        """单格抽取（失败处置与旧版一致）。"""
+        panel_id = panel_id_for(path)
+        prev_path, next_path = neighbors.get(panel_id, (None, None))
+        try:
+            return await analyze_panel(
+                client,
+                image_path=path,
+                panel_id=panel_id,
+                model=model,
+                characters=characters,
+                series_title=series_title,
+                episode_no=episode_no,
+                template=template,
+                prev_image_path=prev_path,
+                next_image_path=next_path,
+            )
+        except Exception as exc:
+            if on_panel_error != "skip":
+                raise
+            sink.append({"panel_id": panel_id, "error": str(exc)})
+            return None
+
+    async def analyze_group(group: list[Path]) -> None:
+        """处理一组面板：1 格走单格，2~4 格走批窗。"""
+        if len(group) == 1:
+            path = group[0]
+            async with semaphore:
+                results[panel_id_for(path)] = await analyze_one(path)
+            return
+        panel_ids = [panel_id_for(path) for path in group]
+        prev_path = neighbors.get(panel_ids[0], (None, None))[0]
+        found: dict[str, PanelVisionInfo] = {}
+        try:
+            async with semaphore:
+                found = await _analyze_panel_batch(
+                    client,
+                    paths=group,
+                    panel_ids=panel_ids,
+                    model=model,
+                    characters=characters,
+                    series_title=series_title,
+                    episode_no=episode_no,
+                    template=batch_template,
+                    prev_context_path=prev_path,
+                )
+        except Exception:
+            # 整批失败 → 逐格回退（单格再失败时按 on_panel_error 处置）。
+            if on_panel_error != "skip":
+                for path in group:
+                    async with semaphore:
+                        results[panel_id_for(path)] = await analyze_one(path)
+                return
+            found = {}
+        # 缺失的格子逐格回退补抽（模型只回了一部分 / 批次异常后的恢复）。
+        for path in group:
+            panel_id = panel_id_for(path)
+            if panel_id in found:
+                results[panel_id] = found[panel_id]
+                continue
+            async with semaphore:
+                results[panel_id] = await analyze_one(path)
+
+    # 分组：空镜直接出占位；超高画格独立成组（要纵向切片，不能进批窗）。
+    groups: list[list[Path]] = []
+    current: list[Path] = []
+    for path in paths:
         panel_id = panel_id_for(path)
         if panel_id in blanks:
             # 空镜：不需要也不应该花钱调模型
-            return PanelVisionInfo(
+            results[panel_id] = PanelVisionInfo(
                 panel_id=panel_id,
                 scene_summary="（空白过渡画面，无剧情内容）",
                 dialogues=[],
@@ -830,30 +1177,27 @@ async def extract_episode_vision(
                 is_transition_blank=True,
                 non_story_type="transition_blank",
             )
-        prev_path, next_path = neighbors.get(panel_id, (None, None))
-        async with semaphore:
-            try:
-                return await analyze_panel(
-                    client,
-                    image_path=path,
-                    panel_id=panel_id,
-                    model=model,
-                    characters=characters,
-                    series_title=series_title,
-                    episode_no=episode_no,
-                    template=template,
-                    prev_image_path=prev_path,
-                    next_image_path=next_path,
-                )
-            except Exception as exc:
-                if on_panel_error != "skip":
-                    raise
-                sink.append({"panel_id": panel_id, "error": str(exc)})
-                return None
+            continue
+        if effective_batch > 1 and _is_tall_panel(path):
+            if current:
+                groups.append(current)
+                current = []
+            groups.append([path])
+            continue
+        current.append(path)
+        if len(current) >= effective_batch:
+            groups.append(current)
+            current = []
+    if current:
+        groups.append(current)
 
-    results = await asyncio.gather(*(worker(path) for path in paths))
-    panels = [item for item in results if item is not None]
-    return VisionWindowOutput(panels=panels)
+    await asyncio.gather(*(analyze_group(group) for group in groups))
+    panels = [
+        results[panel_id_for(path)]
+        for path in paths
+        if panel_id_for(path) in results
+    ]
+    return VisionWindowOutput(panels=[item for item in panels if item is not None])
 
 
 def _strip_punct(text: str) -> str:
@@ -1031,6 +1375,29 @@ async def run_stage3(
     # Patch v4.0 Patch 18：暗黑高潮格护栏——落盘前把被误判成空页 / 纯字卡 /
     # 纯拟声格的高潮剧情格救回来（深黑底 + 红光剪影格最容易被整格剔除）。
     protect_dramatic_panels(output.panels)
+    # Patch v4.22：视觉抽取**全军覆没**时立刻中止，不再落盘一份空 vision。
+    #
+    # 以前的行为是「失败也照常落盘」：模型 ID 下线（比如百炼 404 Model not
+    # exist）会让整话面板全部抽取失败，磁盘上却只剩几张空白过渡页占位，
+    # 下游 Stage 4 拿着空候选池白跑三轮 LLM，最后报一个完全误导人的
+    # 「模型没有产出任何可用的解说句（beats 为空）」。更糟的是旧的那份
+    # 成功视觉结果会被这份空文件覆盖掉。
+    blanks = blank_panel_ids(panels_dir)
+    expected = sum(1 for path_ in list_panel_images(panels_dir) if panel_id_for(path_) not in blanks)
+    produced = sum(1 for panel in output.panels if panel.panel_id not in blanks)
+    if expected > 0 and produced == 0:
+        first_error = str(failures[0].get("error") or "未知原因") if failures else "未知原因"
+        # 失败明细照旧落盘，方便排查（但不覆盖 vision.json）。
+        if failures:
+            (target_dir / "vision_failures.json").write_text(
+                json.dumps(failures, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        raise VisionError(
+            f"视觉模型 {model} 抽取失败：{expected} 个面板全部失败（成功 0 个）。"
+            f"首个错误：{first_error}。"
+            "请检查视觉模型名称是否仍然可用（模型 ID 下线会返回 404 Model not exist，"
+            "无权限会返回 403 Access denied），改好后重新运行本阶段。"
+        )
     # Patch v3.0-6：先清掉上一轮的 vision.json，避免新旧 ID 并存时下游
     # 读到两套分镜（那正是「同一话播两遍」的根因之一）。
     for stale in (path, target_dir / "vision_failures.json"):

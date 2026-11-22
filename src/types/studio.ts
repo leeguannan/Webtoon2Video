@@ -283,6 +283,8 @@ export interface SeriesItem {
 export interface StudioConfig {
   bailianBaseUrl: string;
   visionModel: string;
+  /** Patch v4.22：识图（视觉抽取）模型下拉。 */
+  visionModelOptions?: string[];
   scriptModel: string;
   /** Patch v3.3 Patch 15：Stage 4A 说书体模型（qwen4-max / qwen3.8-max …）。 */
   storyModel?: string;
