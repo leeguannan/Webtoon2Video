@@ -6,7 +6,7 @@
 
 ## 测试跑法（最重要）
 
-后端共 **859** 条 pytest 用例，`pytest-xdist` 已装在 `backend/.venv`。
+后端共 **880** 条 pytest 用例，`pytest-xdist` 已装在 `backend/.venv`。
 **开发期默认只跑快档，交付前再跑一次全量。**
 
 ```bash
@@ -28,7 +28,7 @@ cd backend
   视频编码 `libx264` 为 0 次——这些调用测的正是「裁剪后真实时长」，砍掉会丢断言，故保留。
 - `--dist loadfile` 让同一文件的用例固定在一个 worker，module 级 fixture 不重复执行，
   全量档比默认 `--dist load` 快约 1/3（46s → 30s）。
-- 默认 `pytest`（不带 `-n`）行为不变：串行跑全部 859 条，约 1 分钟。
+- 默认 `pytest`（不带 `-n`）行为不变：串行跑全部 880 条，约 1 分钟。
 
 前端检查：
 

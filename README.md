@@ -15,7 +15,7 @@
 │   ├── src/providers/   # 百炼 LLM / TTS 等模型适配
 │   ├── src/web/         # FastAPI 服务与 SSE 任务编排
 │   ├── prompts/         # 4A 故事稿 / 4B 解说稿等提示词模板
-│   ├── tests/           # pytest 测试套件（859 条，分级跑法见 AGENTS.md）
+│   ├── tests/           # pytest 测试套件（880 条，分级跑法见 AGENTS.md）
 │   ├── assets/          # 运行时素材（如片尾版权页 dHash 黑名单模板）
 │   └── pyproject.toml
 ├── WEBTOON2VIDEO_DEV_SPEC.md   # 总开发规范（六条铁律与工作区拓扑）
@@ -54,7 +54,7 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 
-pytest                      # 全量测试（串行 859 条，约 1 分钟）
+pytest                      # 全量测试（串行 880 条，约 1 分钟）
 pytest -n auto -m "not slow" # 快速回归：跳过重型 ffmpeg，约 12 秒
 w2v --help                  # CLI：download / understand / run / export /
                             #       story-draft / narrate-from-story
