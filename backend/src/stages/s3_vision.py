@@ -17,7 +17,7 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from PIL import Image, ImageOps
 
@@ -48,6 +48,11 @@ TALL_PANEL_SLICE_HEIGHT = 1600
 TALL_PANEL_SLICE_OVERLAP = 250
 #: 末片高度小于该值时并入上一片，避免出现一条没内容的薄片。
 TALL_PANEL_SLICE_MIN_HEIGHT = 400
+
+#: Patch v4.19：邻格参考图的缩略边长（当前格主图仍是 1280px）。
+#: 邻格只是「上下文滑窗」，给 640px 足够模型看清说话人与动作延续，
+#: 又不至于把每格的请求体积翻倍。
+NEIGHBOR_MAX_EDGE = 640
 
 #: Patch v2.5-1：non_story_type 合法取值（与 schemas.PanelVisionInfo 对齐）。
 #: Patch v3.0-6：新增 ``sfx_only``——整格只有拟声词/气氛特效、没有人物动作与对白。
@@ -222,6 +227,107 @@ def panel_id_for(path: str | Path) -> str:
     两端 ID 从此同轨（详见 Patch v2.6 的命名统一）。
     """
     return Path(path).stem
+
+
+# --------------------------------------------------------------------------
+# Patch v4.19：邻格上下文滑窗
+# --------------------------------------------------------------------------
+#: 邻格标注里反复出现的核心约束（提示词与图片分片标注共用同一句）。
+NEIGHBOR_RULE_TEXT = (
+    "仅用于追踪说话人延续与动作因果，禁止将邻格画面或台词写入当前格 JSON。"
+)
+
+
+def _last_sentence(text: str) -> str:
+    """取最后一句（按中文/英文句末标点切分）。"""
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return ""
+    parts = [item.strip() for item in re.split(r"[。！？!?\n]+", cleaned) if item.strip()]
+    if not parts:
+        return cleaned
+    return parts[-1]
+
+
+def _neighbor_reference_label(kind: str, panel_id: str) -> str:
+    """邻格缩略图前面的文字标注（紧贴图片，避免模型张冠李戴）。"""
+    label = "前一格" if kind == "prev" else "后一格"
+    return (
+        f"【{label}参考图 · {panel_id}】下面这张缩略图是本格的{label}，"
+        f"{NEIGHBOR_RULE_TEXT}"
+    )
+
+
+def _neighbor_context_block(
+    *,
+    prev_panel_id: str = "",
+    next_panel_id: str = "",
+    extra: str = "",
+) -> str:
+    """渲染 ``{{NEIGHBOR_CONTEXT}}``：邻格参考说明（没有邻格时给兜底文案）。"""
+    lines: list[str] = ["【邻格参考（仅作上下文，不属于本格）】"]
+    if prev_panel_id:
+        lines.append(f"- 第 2 张图：前一格（{prev_panel_id}）的缩略图。")
+    if next_panel_id:
+        index = 3 if prev_panel_id else 2
+        lines.append(f"- 第 {index} 张图：后一格（{next_panel_id}）的缩略图。")
+    if prev_panel_id or next_panel_id:
+        lines.append(f"- 邻格{NEIGHBOR_RULE_TEXT}")
+    else:
+        lines.append(
+            "- 本格没有可用的邻格参考图（相邻是过渡空页，或本格是话首/话尾），"
+            "请只依据当前画面作答。"
+        )
+    if extra:
+        lines.append(extra)
+    return "\n".join(lines)
+
+
+def _neighbor_reference_parts(
+    prev_image_path: str | Path | None,
+    next_image_path: str | Path | None,
+) -> list[ContentPart]:
+    """邻格参考图的内容分片（文字标注 + 640px 缩略图）。
+
+    Patch v4.19：当前格主图永远是第 1 张图片，邻格缩略图追加在后面——
+    既不新增 LLM 调用次数，也不改变主图分辨率。
+    """
+    parts: list[ContentPart] = []
+    for kind, neighbor in (("prev", prev_image_path), ("next", next_image_path)):
+        if not neighbor:
+            continue
+        path = Path(neighbor)
+        try:
+            data_url = encode_image_data_url(path, max_edge=NEIGHBOR_MAX_EDGE)
+        except Exception:  # noqa: BLE001 - 邻格读失败不阻断本格抽取
+            continue
+        parts.append(
+            ContentPart(type="text", text=_neighbor_reference_label(kind, path.stem))
+        )
+        parts.append(ContentPart(type="image_url", image_url=data_url))
+    return parts
+
+
+def _neighbor_paths(
+    paths: Sequence[Path],
+    blanks: set[str],
+) -> dict[str, tuple[Path | None, Path | None]]:
+    """每格的（前一格路径, 后一格路径）。
+
+    Patch v4.19：**相邻是过渡空页时置空**，不跨空页取邻格——空页意味着
+    场景已经切换，跨过去会把上一段剧情的说话人带进本格。
+    """
+    ids = [panel_id_for(path) for path in paths]
+    result: dict[str, tuple[Path | None, Path | None]] = {}
+    for index, path in enumerate(paths):
+        prev_path: Path | None = None
+        next_path: Path | None = None
+        if index > 0 and ids[index - 1] not in blanks:
+            prev_path = paths[index - 1]
+        if index + 1 < len(paths) and ids[index + 1] not in blanks:
+            next_path = paths[index + 1]
+        result[ids[index]] = (prev_path, next_path)
+    return result
 
 
 @dataclass(frozen=True)
@@ -461,11 +567,29 @@ async def _analyze_tall_panel(
     episode_no: int = 0,
     template: str | None = None,
     temperature: float = 0.2,
+    prev_image_path: str | Path | None = None,
+    next_image_path: str | Path | None = None,
 ) -> PanelVisionInfo:
-    """超高画格：逐片喂模型，再把各片结果合并成同一 ``panel_id``。"""
+    """超高画格：逐片喂模型，再把各片结果合并成同一 ``panel_id``。
+
+    Patch v4.19：从第 2 片起，把上一片的**最后一句摘要**与**最后一位说话人**
+    一起带进提示词——同一格被纵向切开后，模型默认「每片都从零开始看」，
+    容易把同一个人认成不同角色、把连续动作断成两截。
+    """
     prompt_template = template if template is not None else load_prompt_template()
+    prev_id = Path(prev_image_path).stem if prev_image_path else ""
+    next_id = Path(next_image_path).stem if next_image_path else ""
+    neighbor_parts = _neighbor_reference_parts(prev_image_path, next_image_path)
     tile_payloads: list[tuple[PanelTile, dict[str, Any]]] = []
+    carry_summary = ""
+    carry_speaker = ""
     for tile in tiles:
+        extra = ""
+        if tile.index > 0:
+            extra = (
+                f"- 上一片（同一格第 {tile.index} 片）末尾摘要：{carry_summary or '（无）'}\n"
+                f"- 上一片最后一位说话人：{carry_speaker or '（无）'}"
+            )
         data_url = encode_pil_data_url(tile.image)
         prompt = render_prompt(
             prompt_template,
@@ -475,6 +599,11 @@ async def _analyze_tall_panel(
                 "SERIES_TITLE": series_title or "未知作品",
                 "EPISODE_NO": str(episode_no),
                 "PANEL_SHAPE": _tile_shape_text(tile),
+                "NEIGHBOR_CONTEXT": _neighbor_context_block(
+                    prev_panel_id=prev_id,
+                    next_panel_id=next_id,
+                    extra=extra,
+                ),
             },
         )
         message = ChatMessage(
@@ -482,6 +611,7 @@ async def _analyze_tall_panel(
             content=[
                 ContentPart(type="text", text=prompt),
                 ContentPart(type="image_url", image_url=data_url),
+                *neighbor_parts,
             ],
         )
         response = await client.chat(
@@ -492,6 +622,11 @@ async def _analyze_tall_panel(
             panel_id=panel_id,
         )
         tile_payloads.append((tile, payload))
+        # 下一片携带本片的「最后一句摘要 + 最后一位说话人」。
+        carry_summary = _last_sentence(str(payload.get("scene_summary") or ""))
+        dialogues = payload.get("dialogues") or []
+        last_dialogue = dialogues[-1] if dialogues else {}
+        carry_speaker = str(last_dialogue.get("speaker_guess") or "").strip()
 
     merged = _merge_tile_payloads(panel_id, tile_payloads)
     normalized = normalize_panel_payload(merged, panel_id=panel_id)
@@ -517,8 +652,15 @@ async def analyze_panel(
     episode_no: int = 0,
     template: str | None = None,
     temperature: float = 0.2,
+    prev_image_path: str | Path | None = None,
+    next_image_path: str | Path | None = None,
 ) -> PanelVisionInfo:
-    """分析单个面板。"""
+    """分析单个面板。
+
+    Patch v4.19：可选带上**紧邻的前一格 / 后一格**缩略图作为上下文滑窗。
+    第 1 张图片永远是当前格（1280px 主图），邻格缩略图（640px）追加在后面，
+    因此单格调用行为与既有单测保持完全兼容。
+    """
     path = Path(image_path)
     tiles = _slice_tall_panel(path)
     if tiles:
@@ -532,8 +674,12 @@ async def analyze_panel(
             episode_no=episode_no,
             template=template,
             temperature=temperature,
+            prev_image_path=prev_image_path,
+            next_image_path=next_image_path,
         )
     data_url = encode_image_data_url(path)
+    prev_id = Path(prev_image_path).stem if prev_image_path else ""
+    next_id = Path(next_image_path).stem if next_image_path else ""
     prompt = render_prompt(
         template if template is not None else load_prompt_template(),
         {
@@ -542,6 +688,10 @@ async def analyze_panel(
             "SERIES_TITLE": series_title or "未知作品",
             "EPISODE_NO": str(episode_no),
             "PANEL_SHAPE": describe_panel_shape(path),
+            "NEIGHBOR_CONTEXT": _neighbor_context_block(
+                prev_panel_id=prev_id,
+                next_panel_id=next_id,
+            ),
         },
     )
     message = ChatMessage(
@@ -549,6 +699,7 @@ async def analyze_panel(
         content=[
             ContentPart(type="text", text=prompt),
             ContentPart(type="image_url", image_url=data_url),
+            *_neighbor_reference_parts(prev_image_path, next_image_path),
         ],
     )
     response = await client.chat(
@@ -595,11 +746,17 @@ async def extract_episode_vision(
     Patch v3.0-6：``blank_ids`` 里的面板是 Stage 2 判定出的空镜（纯白/纯黑
     过渡页），**不调用视觉模型**，直接产出占位结果并在下游按
     ``is_transition_blank`` 过滤，避免「白屏空等」。
+
+    Patch v4.19：为每格附带紧邻的**前一格 / 后一格**缩略图（上下文滑窗），
+    用于跨格追踪说话人延续与动作因果；相邻是过渡空页时不跨空页取引用。
+    邻格不新增 LLM 调用次数——每格仍然只调用模型一次。
     """
     paths = list_panel_images(panels_dir)
     semaphore = asyncio.Semaphore(max(1, concurrency))
     sink: list[dict[str, str]] = failures if failures is not None else []
     blanks = blank_ids or set()
+    # Patch v4.19：为每格算出紧邻的前一格 / 后一格参考图（跨过渡空页不串格）。
+    neighbors = _neighbor_paths(paths, blanks)
 
     async def worker(path: Path) -> PanelVisionInfo | None:
         panel_id = panel_id_for(path)
@@ -614,6 +771,7 @@ async def extract_episode_vision(
                 is_transition_blank=True,
                 non_story_type="transition_blank",
             )
+        prev_path, next_path = neighbors.get(panel_id, (None, None))
         async with semaphore:
             try:
                 return await analyze_panel(
@@ -625,6 +783,8 @@ async def extract_episode_vision(
                     series_title=series_title,
                     episode_no=episode_no,
                     template=template,
+                    prev_image_path=prev_path,
+                    next_image_path=next_path,
                 )
             except Exception as exc:
                 if on_panel_error != "skip":

@@ -186,8 +186,12 @@ export const ConfigDictView: React.FC<ConfigDictViewProps> = ({
                 onChange={(e) => setDraft({ ...draft, visionModel: e.target.value })}
                 className="w-full px-3 py-2 text-xs font-mono-tabular bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
               >
-                <option value="qwen3-vl-plus">qwen3-vl-plus (推荐主力)</option>
-                <option value="qwen-vl-max">qwen-vl-max (密集小字增强)</option>
+                <option value="qwen3-vl-plus">qwen3-vl-plus (标准主力)</option>
+                <option value="qwen-vl-max">qwen-vl-max (密集小字/气泡归属推荐)</option>
+                {/* Patch v4.19：开放多模态模型对比（百炼 deepseek 多模态）。 */}
+                <option value="deepseek-v4.1-flash-1017">
+                  deepseek-v4.1-flash-1017 (百炼多模态 · 对比测试)
+                </option>
               </select>
             </div>
 

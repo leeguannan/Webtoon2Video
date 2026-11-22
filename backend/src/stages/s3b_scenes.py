@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from core.panel_ids import panel_sort_key
 from core.schemas import (
@@ -31,7 +31,8 @@ from core.schemas import (
     save_model,
 )
 from providers.image_utils import encode_pil_data_url, load_image
-from providers.llm_base import ChatMessage, ContentPart, LLMClient
+from providers.llm_base import ChatMessage, ContentPart, LLMClient, parse_json_response
+from stages.s3_vision import format_character_block, load_prompt_template, render_prompt
 
 #: 镜头编排清单的文件名（落在 ``04_script/`` 下）。
 STORYBOARD_FILENAME = "storyboard.json"
@@ -78,9 +79,17 @@ _LOCATION_BLOCKERS = frozenset(
     "走跑站坐躺看说笑哭拿推拉转抬低抱抓倒伸挥冲退进出扔踢咬点摇摸捧端举挥抓"
 )
 
-#: 整幕联看长条图的宽度与高度上限（规格：等宽 640px、总高 <= 3200px）。
-STRIP_WIDTH = 640
-MAX_STRIP_HEIGHT = 3200
+#: 整幕联看长条图的宽度与高度上限（规格：等宽 896px、总高 <= 3840px）。
+#: Patch v4.19：由 640/3200 提升到 896/3840——640px 竖排长条里角色五官已经糊成
+#: 色块，跨格因果（「最后站起来的是谁」）根本认不出来。
+STRIP_WIDTH = 896
+MAX_STRIP_HEIGHT = 3840
+
+#: Patch v4.19：语义切幕提示词模板名（``backend/prompts/scene_split.md``）。
+SCENE_SPLIT_PROMPT_FILENAME = "scene_split.md"
+#: Patch v4.19：语义切幕的幕数区间（规格：3~10 幕）。
+MIN_SEMANTIC_SCENES = 3
+MAX_SEMANTIC_SCENES = 10
 
 # --------------------------------------------------------------------------
 # Patch v4.7：按幕 BGM 情绪预设（五档）。
@@ -174,6 +183,30 @@ _RECAP_PROMPT = (
     "【配乐建议】一句话中文，写清主乐器、BPM 区间与氛围，并附 3~4 个英文搜歌关键词。\n"
     "只回答事实，不要文学化描写，不要写「画面中」这类元词汇。"
 )
+
+#: Patch v4.19：整幕复核时注入的 Layer 1 角色名单（角色本名 / 别名 / 外貌）。
+_RECAP_CHARACTER_BLOCK = (
+    "【本话已知角色名单（Layer 1）】\n"
+    "{characters}\n"
+    "**要求（Patch v4.19）**：总结跨格因果与关键原话归属时，**一律使用上面的角色本名**"
+    "指代人物（不要写「那个男人」「少女」「黑衣人」这类模糊称呼）；"
+    "关键原话必须写明归属到具体角色名下（例：恩彗：“……”）。"
+)
+
+
+def _recap_prompt(characters: Any = ()) -> str:
+    """整幕复核提示词（Patch v4.19：注入 Layer 1 角色本名/别名/外貌）。
+
+    没有角色名单时返回基础提示词（保持旧行为一字不差）。
+    """
+    block = format_character_block(characters).strip()
+    if not block:
+        return _RECAP_PROMPT
+    return (
+        _RECAP_PROMPT
+        + "\n\n"
+        + _RECAP_CHARACTER_BLOCK.format(characters=block)
+    )
 
 
 def storyboard_path_for(episode_dir: str | Path) -> Path:
@@ -422,6 +455,256 @@ def auto_build_storyboard(
 
 
 # --------------------------------------------------------------------------
+# Patch v4.19：语义切幕（LLM 通看整话摘要决定幕边界）
+# --------------------------------------------------------------------------
+def _usable_panel_sequence(vision: VisionWindowOutput) -> list[PanelVisionInfo]:
+    """按分镜顺序取出**进入镜头组**的有效面板。
+
+    与 :func:`auto_build_storyboard` 的口径完全一致（顺序 + 有效性判定），
+    保证「语义切幕」与「规则切幕」覆盖的是同一批格子。
+    """
+    return [
+        panel
+        for panel in sorted(vision.panels, key=lambda item: panel_sort_key(item.panel_id))
+        if _is_usable_panel(panel)
+    ]
+
+
+def _format_digest_line(panel: PanelVisionInfo) -> str:
+    """把一格分镜渲染成切幕摘要行。"""
+    parts = [f"- {panel.panel_id}"]
+    location = extract_location(panel.scene_summary)
+    if location:
+        parts.append(f"地点：{location}")
+    summary = (panel.scene_summary or "").strip()
+    if summary:
+        parts.append(f"摘要：{summary}")
+    bubbles: list[str] = []
+    for bubble in panel.dialogues:
+        text = (bubble.text or "").strip()
+        if not text:
+            continue
+        speaker = (bubble.speaker_guess or "").strip()
+        bubbles.append(f"{speaker}：“{text}”" if speaker else f"“{text}”")
+    if bubbles:
+        parts.append("对白：" + "；".join(bubbles))
+    return " | ".join(parts)
+
+
+def _build_panel_digest(vision: VisionWindowOutput) -> str:
+    """整话分镜摘要清单（供 LLM 判断幕边界）。
+
+    过渡空页渲染成分隔线，提示「这里是可能的场景切换点」，但**不进入**
+    任何一幕的 ``panel_ids``。
+    """
+    lines: list[str] = []
+    for panel in sorted(vision.panels, key=lambda item: panel_sort_key(item.panel_id)):
+        if _is_boundary_panel(panel):
+            lines.append(
+                f"──── 过渡空页（{panel.panel_id}）：这里是可能的场景分隔线 ────"
+            )
+            continue
+        if not _is_usable_panel(panel):
+            continue
+        lines.append(_format_digest_line(panel))
+    return "\n".join(lines)
+
+
+def _parse_scene_groups(content: str) -> list[dict[str, Any]] | None:
+    """解析 LLM 的切幕输出；格式不对返回 ``None``（交由调用方回退规则切幕）。"""
+    try:
+        payload = parse_json_response(content)
+    except Exception:  # noqa: BLE001 - 模型输出不合法属于「异常输出」
+        return None
+    if not isinstance(payload, dict):
+        return None
+    scenes = payload.get("scenes")
+    if not isinstance(scenes, list) or not scenes:
+        return None
+    groups: list[dict[str, Any]] = []
+    for item in scenes:
+        if not isinstance(item, dict):
+            return None
+        panel_ids = item.get("panel_ids")
+        if not isinstance(panel_ids, list):
+            return None
+        ids = [str(value).strip() for value in panel_ids if str(value).strip()]
+        if not ids:
+            return None
+        groups.append(
+            {
+                "panel_ids": ids,
+                "title": str(item.get("title") or "").strip(),
+                "location": str(item.get("location") or "").strip(),
+            }
+        )
+    return groups
+
+
+def _repair_scene_groups(
+    groups: Sequence[dict[str, Any]],
+    ordered_ids: Sequence[str],
+) -> list[dict[str, Any]] | None:
+    """把 LLM 给的分组**确定性修补**成连续、单调、无遗漏无重叠的区间。
+
+    修补规则（全部确定性，不依赖模型）：
+
+    1. 丢掉模型编造的 / 重复的 panel_id；
+    2. 按首个 panel 的出现顺序排列各组；
+    3. 与前一组重叠的部分裁掉；被前一组完全覆盖的整组丢弃；
+    4. 组与组之间漏掉的格子并入后一组；首尾漏掉的并入首组 / 末组。
+
+    返回修补后的分组；完全无法修补（模型一个有效格都没提）时返回 ``None``。
+    """
+    if not ordered_ids:
+        return None
+    index_of = {panel_id: index for index, panel_id in enumerate(ordered_ids)}
+
+    spans: list[tuple[int, int, dict[str, Any]]] = []
+    for group in groups:
+        indexes = [
+            index_of[panel_id]
+            for panel_id in group.get("panel_ids", [])
+            if panel_id in index_of
+        ]
+        if not indexes:
+            continue
+        spans.append((min(indexes), max(indexes), group))
+    if not spans:
+        return None
+
+    spans.sort(key=lambda item: (item[0], item[1]))
+
+    trimmed: list[tuple[int, int, dict[str, Any]]] = []
+    for start, end, group in spans:
+        if trimmed:
+            _, prev_end, _ = trimmed[-1]
+            if end <= prev_end:
+                # 被前一区间完全覆盖：整段并入前一区间，本组丢弃。
+                continue
+            if start <= prev_end:
+                start = prev_end + 1
+            if start > end:
+                continue
+        trimmed.append((start, end, group))
+    if not trimmed:
+        return None
+
+    # 补齐间隙：上一组末尾与本组开头之间漏掉的格子并入本组。
+    filled: list[tuple[int, int, dict[str, Any]]] = []
+    cursor = 0
+    for start, end, group in trimmed:
+        if start > cursor:
+            start = cursor
+        filled.append((start, end, group))
+        cursor = end + 1
+    if cursor < len(ordered_ids):
+        _, _, last_group = filled[-1]
+        filled[-1] = (filled[-1][0], len(ordered_ids) - 1, last_group)
+
+    return [
+        {
+            "panel_ids": list(ordered_ids[start : end + 1]),
+            "title": group.get("title", ""),
+            "location": group.get("location", ""),
+        }
+        for start, end, group in filled
+    ]
+
+
+async def semantic_build_storyboard(
+    client: LLMClient | None,
+    *,
+    episode_id: str,
+    vision: VisionWindowOutput,
+    model: str = "",
+    template: str | None = None,
+) -> EpisodeStoryboard:
+    """用 LLM 通看整话分镜摘要做**语义切幕**（Patch v4.19）。
+
+    * 严格按「真实地点切换 / 时间跳跃 / 闪回 / 冲突转换」切 3~10 幕，
+      **禁止在连续对话中间硬切**；
+    * 模型给的分组会做确定性区间校验与修补（可用格必须连续、单调、
+      无遗漏无重叠）；
+    * 模型不可用 / 输出异常 / 区间错乱到无法修补 / 幕数越界时，
+      **无感回退**到规则切幕 :func:`auto_build_storyboard`，流水线不中断。
+    """
+
+    def _fallback() -> EpisodeStoryboard:
+        return auto_build_storyboard(episode_id, vision)
+
+    if client is None or not model:
+        return _fallback()
+
+    usable = _usable_panel_sequence(vision)
+    if not usable:
+        return _fallback()
+    ordered_ids = [panel.panel_id for panel in usable]
+
+    try:
+        prompt_template = (
+            template
+            if template is not None
+            else load_prompt_template(SCENE_SPLIT_PROMPT_FILENAME)
+        )
+    except Exception as exc:  # noqa: BLE001 - 模板缺失也要无感回退
+        print(f"[s3b_scenes] 语义切幕提示词模板不可用，回退规则切幕：{exc}")
+        return _fallback()
+
+    prompt = render_prompt(
+        prompt_template,
+        {
+            "EPISODE_ID": episode_id,
+            "PANEL_DIGEST": _build_panel_digest(vision),
+            "MIN_SCENES": str(MIN_SEMANTIC_SCENES),
+            "MAX_SCENES": str(MAX_SEMANTIC_SCENES),
+        },
+    )
+    try:
+        response = await client.chat(
+            [
+                ChatMessage(
+                    role="user",
+                    content=[ContentPart(type="text", text=prompt)],
+                )
+            ],
+            model=model,
+            temperature=0.2,
+            max_tokens=2000,
+        )
+    except Exception as exc:  # noqa: BLE001 - 切幕失败不阻断流水线
+        print(f"[s3b_scenes] 语义切幕调用失败，回退规则切幕：{exc}")
+        return _fallback()
+
+    groups = _parse_scene_groups((response.content or "").strip())
+    if groups is None:
+        print("[s3b_scenes] 语义切幕输出无法解析，回退规则切幕")
+        return _fallback()
+
+    repaired = _repair_scene_groups(groups, ordered_ids)
+    if repaired is None:
+        print("[s3b_scenes] 语义切幕区间无法修补，回退规则切幕")
+        return _fallback()
+    if not (MIN_SEMANTIC_SCENES <= len(repaired) <= MAX_SEMANTIC_SCENES):
+        print(
+            f"[s3b_scenes] 语义切幕幕数越界（{len(repaired)} 幕），回退规则切幕"
+        )
+        return _fallback()
+
+    panels = {panel.panel_id: panel for panel in vision.panels}
+    scenes: list[StoryboardScene] = []
+    for index, group in enumerate(repaired, start=1):
+        panel_ids = list(group["panel_ids"])
+        scene = _build_scene(index, panel_ids, panels)
+        location = str(group.get("location") or "").strip() or scene.location
+        scene.location = location
+        scene.title = _scene_title(index, location)
+        scenes.append(scene)
+    storyboard = EpisodeStoryboard(episode_id=episode_id, source="auto", scenes=scenes)
+    return suggest_storyboard_bgm(storyboard, vision)
+
+
+# --------------------------------------------------------------------------
 # 整幕视觉联看复核
 # --------------------------------------------------------------------------
 def _panel_image_index(panels_dir: Path) -> dict[str, Path]:
@@ -616,13 +899,16 @@ async def enrich_storyboard_with_vision(
     model: str = "",
     force: bool = False,
     vision: VisionWindowOutput | None = None,
+    characters: Any = (),
 ) -> EpisodeStoryboard:
     """给每个镜头组做一次「整幕视觉联看」，把结果写进 ``scene.visual_recap``。
 
     * 只有传了 ``client``、``panels_dir`` 存在、该幕还没有 ``visual_recap``
       （或 ``force=True``）时才会调用模型；
-    * 该幕的面板图等宽缩至 640px 竖向拼成长条图（总高 <= 3200px），超出就拆
+    * 该幕的面板图等宽缩至 896px 竖向拼成长条图（总高 <= 3840px），超出就拆
       成多张分别提问；
+    * Patch v4.19：``characters`` 传入 Layer 1 角色名单（本名 / 别名 / 外貌），
+      提示词要求**用角色本名**总结跨格因果与关键原话归属；
     * 单幕异常一律捕获并回退为「拼接各格 scene_summary」，**绝不阻断流水线**。
     """
     if client is None or not model or panels_dir is None:
@@ -662,7 +948,9 @@ async def enrich_storyboard_with_vision(
                         scene, panel_map
                     )
                 continue
-            parts: list[ContentPart] = [ContentPart(type="text", text=_RECAP_PROMPT)]
+            parts: list[ContentPart] = [
+                ContentPart(type="text", text=_recap_prompt(characters))
+            ]
             for strip in strips:
                 parts.append(
                     ContentPart(type="image_url", image_url=encode_pil_data_url(strip))
@@ -741,6 +1029,47 @@ def load_or_build_storyboard(
             return existing
 
     storyboard = auto_build_storyboard(episode_id, vision)
+    if path is not None:
+        save_storyboard(storyboard, path)
+    return storyboard
+
+
+async def resolve_or_build_storyboard(
+    client: LLMClient | None,
+    *,
+    episode_id: str,
+    vision: VisionWindowOutput,
+    storyboard_path: str | Path | None,
+    model: str = "",
+    reset: bool = False,
+    template: str | None = None,
+) -> EpisodeStoryboard:
+    """加载或**语义构建**镜头编排清单（Patch v4.19）。
+
+    与同步版 :func:`load_or_build_storyboard` 的铁律完全一致：
+
+    * 磁盘已有且 ``source == "human"`` → **任何情况下都不覆写**（连 ``reset=True``
+      也不重建），人工编排永远优先；
+    * 磁盘已有且 ``reset=False`` → 直接返回既有编排，不重新切幕；
+    * 其余情况 → 走 :func:`semantic_build_storyboard`（LLM 语义切幕，失败时
+      内部已无感回退规则切幕）并落盘。
+    """
+    path = Path(storyboard_path) if storyboard_path is not None else None
+    existing = load_storyboard(path) if path is not None else None
+    if existing is not None:
+        if existing.source == "human":
+            # 人工编排保护：永远不覆写用户的镜头组。
+            return existing
+        if not reset:
+            return existing
+
+    storyboard = await semantic_build_storyboard(
+        client,
+        episode_id=episode_id,
+        vision=vision,
+        model=model,
+        template=template,
+    )
     if path is not None:
         save_storyboard(storyboard, path)
     return storyboard

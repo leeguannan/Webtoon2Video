@@ -2675,10 +2675,14 @@ async def write_episode_script(
             resolved_storyboard = storyboard
             scene_mode = True
         elif storyboard_path is not None:
-            resolved_storyboard = s3b_scenes.load_or_build_storyboard(
-                episode_id,
-                vision,
-                Path(storyboard_path),
+            # Patch v4.19：改走语义切幕（LLM 通看整话摘要定幕边界），
+            # 内部失败时无感回退规则切幕；人工编排依然绝不覆写。
+            resolved_storyboard = await s3b_scenes.resolve_or_build_storyboard(
+                client,
+                episode_id=episode_id,
+                vision=vision,
+                storyboard_path=Path(storyboard_path),
+                model=story_model or model,
                 reset=reset_storyboard,
             )
             scene_mode = True
@@ -2696,6 +2700,9 @@ async def write_episode_script(
                     model=vision_model,
                     force=False,
                     vision=vision,
+                    # Patch v4.19：注入 Layer 1 角色本名/别名/外貌，
+                    # 让整幕复核用真名总结跨格因果与关键原话归属。
+                    characters=getattr(context, "characters", ()) or (),
                 )
                 active_scenes = [
                     scene for scene in resolved_storyboard.scenes if scene.enabled
@@ -2885,9 +2892,29 @@ async def write_episode_script(
     scene_budgets: list[str] = []
     if scene_mode and active_scenes:
         chapters = list(story_draft.chapters or [])
-        # Patch v4.0 Patch 20.1：章幕数量不等时按「分镜区间重叠」配对，
-        # 避免按下标错位（详见 _pair_chapters_with_scenes）。
-        pairs = _pair_chapters_with_scenes(chapters, active_scenes, ordered_panel_ids)
+        if len(chapters) == len(active_scenes):
+            # Patch v4.19：章数与幕数一致 → 按序数直接 1:1 锁定，
+            # 并把每章的 panel_hint_range 钉死到对应幕的起止分镜。
+            # 旧路径靠「区间重叠」配对：只要某一章的区间端点有偏差，
+            # 末尾章节就会因为重叠度掉到 0 而被判成「没被任何幕选中」，
+            # 正文被并进末章——后续章节的正文整体错位。
+            pairs = {index: index for index in range(len(active_scenes))}
+            for index, scene in enumerate(active_scenes):
+                if not scene.panel_ids:
+                    continue
+                chapter = chapters[index]
+                chapters[index] = chapter.model_copy(
+                    update={
+                        "panel_hint_range": (
+                            scene.panel_ids[0],
+                            scene.panel_ids[-1],
+                        )
+                    }
+                )
+        else:
+            # Patch v4.0 Patch 20.1：章幕数量不等时按「分镜区间重叠」配对，
+            # 避免按下标错位（详见 _pair_chapters_with_scenes）。
+            pairs = _pair_chapters_with_scenes(chapters, active_scenes, ordered_panel_ids)
         used_chapters = set(pairs.values())
         unused = [
             index for index in range(len(chapters)) if index not in used_chapters
@@ -3428,16 +3455,19 @@ async def run_stage4(
         else target_dir / STORY_DRAFT_MD_FILENAME
     )
     # Patch v4.0 Patch 19：镜头组编排（缺失时自动聚类并落盘；人工编排原样保留）。
+    # Patch v4.19：改走语义切幕（LLM 通看整话摘要定幕边界，失败无感回退规则切幕）。
     resolved_storyboard = storyboard
     if storyboard_path is not None:
         from stages import s3b_scenes
 
         board_path = Path(storyboard_path)
         if resolved_storyboard is None and vision is not None:
-            resolved_storyboard = s3b_scenes.load_or_build_storyboard(
-                resolved_episode_id,
-                vision,
-                board_path,
+            resolved_storyboard = await s3b_scenes.resolve_or_build_storyboard(
+                client,
+                episode_id=resolved_episode_id,
+                vision=vision,
+                storyboard_path=board_path,
+                model=story_model or model,
                 reset=reset_storyboard,
             )
     storyboard_sink: list[EpisodeStoryboard] = []
