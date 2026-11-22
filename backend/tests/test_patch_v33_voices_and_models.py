@@ -222,12 +222,20 @@ def test_is_model_access_error_recognizes_unavailable_models() -> None:
 
 
 def test_fallback_candidates_follow_documented_chain() -> None:
+    # Patch v4.17：降级链以百炼 DeepSeek 起头（未开通该模型时按链退回 qwen 系）。
     assert s4_scriptwriter.MODEL_FALLBACK_CHAIN == (
+        "deepseek-v4.1-flash-1017",
         "qwen4-max",
         "qwen3.8-max",
         "qwen3.7-plus",
         "qwen-plus",
     )
+    assert s4_scriptwriter._fallback_candidates("deepseek-v4.1-flash-1017") == [
+        "qwen4-max",
+        "qwen3.8-max",
+        "qwen3.7-plus",
+        "qwen-plus",
+    ]
     assert s4_scriptwriter._fallback_candidates("qwen4-max") == [
         "qwen3.8-max",
         "qwen3.7-plus",

@@ -105,7 +105,12 @@ _NO_THINKING_KWARGS: dict[str, object] = {"enable_thinking": False}
 
 #: Patch v3.3 Patch 15：Stage 4 新旗舰模型未开通/无权限时的有序降级链。
 #: 配置的主模型在链中时取其后的候选；不在链中（自定义模型）时整条链都作为候选。
+#: Patch v4.17：把百炼 DeepSeek（deepseek-v4.1-flash-1017）放到链首——
+#: 它是控制台可选项里的高性价比主力，账号未开通该模型权限时按本链有序退回
+#: qwen4-max → qwen3.8-max → qwen3.7-plus → qwen-plus；链中其余模型的行为不变
+#: （主模型是 qwen 系时，候选依旧只取它之后的那些）。
 MODEL_FALLBACK_CHAIN: tuple[str, ...] = (
+    "deepseek-v4.1-flash-1017",
     "qwen4-max",
     "qwen3.8-max",
     "qwen3.7-plus",

@@ -1503,7 +1503,16 @@ def create_app(
         app.state.config_path = workspace_root / "config.yaml"
 
     def _reload_config() -> AppConfig:
-        """重新读取磁盘配置并刷新内存态（工作区根目录保持不变）。"""
+        """重新读取磁盘配置并刷新内存态（工作区根目录保持不变）。
+
+        Patch v4.17：热重载必须**同步给后台调度器与工作区视图**。
+        之前只更新 ``app.state.config``，而 ``JobRunner`` 在进程启动时把配置
+        拍了一份快照（``self.config``），后台任务每次取模型都读这份快照——
+        于是出现「界面显示新模型、后台仍用启动时的旧模型」，
+        改完配置必须重启后端才生效。
+        这里把新配置同时写回 ``job_runner.config`` 与 ``view.config``，
+        保存后下一个后台任务就会用上新模型，无需重启。
+        """
         path = app.state.config_path
         updated = app.state.config
         if path.is_file():
@@ -1515,6 +1524,9 @@ def create_app(
             update={"workspace": WorkspaceConfig(root=workspace_root)}
         )
         app.state.config = updated
+        # Patch v4.17：同步给后台调度器（模型选择）与工作区视图（音色/渲染设置）。
+        app.state.runner.config = updated
+        app.state.view.config = updated
         return updated
 
     # 静态资源：前端通过 /workspace/... 直接取图片、字幕与成片。
