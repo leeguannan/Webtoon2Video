@@ -2279,7 +2279,10 @@ def create_app(
         storyboard = s3b_scenes.load_storyboard(storyboard_path)
         if storyboard is None:
             # 首次打开：自动聚类并落盘，后续人工编辑与重置都基于这份文件。
+            # Patch v4.21：这是**规则切幕的占位编排**，标记出来，Stage 4 拿到
+            # 后会自动升级成语义切幕一次（前端预览不该把语义切幕绕过）。
             storyboard = s3b_scenes.auto_build_storyboard(episode_id, vision)
+            storyboard = storyboard.model_copy(update={"auto_strategy": "rule"})
             s3b_scenes.save_storyboard(storyboard, storyboard_path)
         # Patch v4.20：分镜页不列出纯文字卡（章节标题条 / 字幕条）——它们不是
         # 剧情画面，留在幕里只会被 Stage 6 渲成成片里用户没配过的一帧。
@@ -2324,8 +2327,12 @@ def create_app(
         if vision is None:
             raise HTTPException(status_code=404, detail="该话还没有 Stage 3 视觉结果")
         storyboard = s3b_scenes.auto_build_storyboard(episode_id, vision)
+        # Patch v4.21：重置同样产出规则切幕的占位编排，标记后 Stage 4 会升级一次。
+        storyboard = storyboard.model_copy(update={"auto_strategy": "rule"})
         storyboard_path = s3b_scenes.storyboard_path_for(episode_dir)
         s3b_scenes.save_storyboard(storyboard, storyboard_path)
+        # Patch v4.21：重置返回前与 GET 保持同一口径——不列出纯文字卡。
+        storyboard = s3b_scenes.strip_text_cards_from_storyboard(storyboard, vision)
         return _storyboard_payload(storyboard, episode_id, series_id, episode_no)
 
     @app.post("/api/episodes/{episode_id}/storyboard/generate")
@@ -2362,6 +2369,8 @@ def create_app(
             storyboard = s3b_scenes.load_storyboard(storyboard_path)
             if storyboard is None:
                 storyboard = s3b_scenes.auto_build_storyboard(episode_id, vision)
+                # Patch v4.21：同上，标记为规则切幕占位，等 Stage 4 升级。
+                storyboard = storyboard.model_copy(update={"auto_strategy": "rule"})
                 s3b_scenes.save_storyboard(storyboard, storyboard_path)
         try:
             job = await job_runner.submit_episode(

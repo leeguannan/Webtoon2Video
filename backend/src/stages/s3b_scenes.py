@@ -19,6 +19,7 @@ Patch v4.0 Patch 19「Scene-First 镜头组架构」。
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -648,6 +649,11 @@ async def semantic_build_storyboard(
       无遗漏无重叠）；
     * 模型不可用 / 输出异常 / 区间错乱到无法修补 / 幕数越界时，
       **无感回退**到规则切幕 :func:`auto_build_storyboard`，流水线不中断。
+    * Patch v4.21：调用走 Stage 4 的模型降级链（主模型未开通时自动换下一个
+      可用模型），并统一透传 ``enable_thinking=False``——百炼 qwen3 系默认
+      开长链思考，切幕这种结构化小任务不需要，开了反而容易撞 180s 超时。
+    * Patch v4.21：成功产出时标记 ``auto_strategy="semantic"``（规则切幕的
+      占位产物标记 ``"rule"``），Stage 4 据此判断是否还需要再切一次。
     """
 
     def _fallback() -> EpisodeStoryboard:
@@ -668,7 +674,10 @@ async def semantic_build_storyboard(
             else load_prompt_template(SCENE_SPLIT_PROMPT_FILENAME)
         )
     except Exception as exc:  # noqa: BLE001 - 模板缺失也要无感回退
-        print(f"[s3b_scenes] 语义切幕提示词模板不可用，回退规则切幕：{exc}")
+        print(
+            f"[s3b_scenes] 语义切幕提示词模板不可用，回退规则切幕：{exc}",
+            file=sys.stderr,
+        )
         return _fallback()
 
     prompt = render_prompt(
@@ -680,34 +689,44 @@ async def semantic_build_storyboard(
             "MAX_SCENES": str(MAX_SEMANTIC_SCENES),
         },
     )
-    try:
-        response = await client.chat(
+    # Patch v4.21：延迟导入，避免 s3b_scenes ↔ s4_scriptwriter 顶层循环导入。
+    from stages.s4_scriptwriter import _NO_THINKING_KWARGS, run_with_model_fallback
+
+    async def _call(model_name: str) -> Any:
+        return await client.chat(
             [
                 ChatMessage(
                     role="user",
                     content=[ContentPart(type="text", text=prompt)],
                 )
             ],
-            model=model,
+            model=model_name,
             temperature=0.2,
-            max_tokens=2000,
+            max_tokens=3500,
+            **_NO_THINKING_KWARGS,
+        )
+
+    try:
+        response = await run_with_model_fallback(
+            model, _call, label="Stage 3b 语义切幕"
         )
     except Exception as exc:  # noqa: BLE001 - 切幕失败不阻断流水线
-        print(f"[s3b_scenes] 语义切幕调用失败，回退规则切幕：{exc}")
+        print(f"[s3b_scenes] 语义切幕调用失败，回退规则切幕：{exc}", file=sys.stderr)
         return _fallback()
 
     groups = _parse_scene_groups((response.content or "").strip())
     if groups is None:
-        print("[s3b_scenes] 语义切幕输出无法解析，回退规则切幕")
+        print("[s3b_scenes] 语义切幕输出无法解析，回退规则切幕", file=sys.stderr)
         return _fallback()
 
     repaired = _repair_scene_groups(groups, ordered_ids)
     if repaired is None:
-        print("[s3b_scenes] 语义切幕区间无法修补，回退规则切幕")
+        print("[s3b_scenes] 语义切幕区间无法修补，回退规则切幕", file=sys.stderr)
         return _fallback()
     if not (MIN_SEMANTIC_SCENES <= len(repaired) <= MAX_SEMANTIC_SCENES):
         print(
-            f"[s3b_scenes] 语义切幕幕数越界（{len(repaired)} 幕），回退规则切幕"
+            f"[s3b_scenes] 语义切幕幕数越界（{len(repaired)} 幕），回退规则切幕",
+            file=sys.stderr,
         )
         return _fallback()
 
@@ -720,7 +739,16 @@ async def semantic_build_storyboard(
         scene.location = location
         scene.title = _scene_title(index, location)
         scenes.append(scene)
-    storyboard = EpisodeStoryboard(episode_id=episode_id, source="auto", scenes=scenes)
+    storyboard = EpisodeStoryboard(
+        episode_id=episode_id,
+        source="auto",
+        scenes=scenes,
+        auto_strategy="semantic",
+    )
+    print(
+        f"[s3b_scenes] 语义切幕完成：{len(scenes)} 幕（模型 {model}）",
+        file=sys.stderr,
+    )
     return suggest_storyboard_bgm(storyboard, vision)
 
 
@@ -1111,6 +1139,12 @@ async def resolve_or_build_storyboard(
     * 磁盘已有且 ``reset=False`` → 直接返回既有编排，不重新切幕；
     * 其余情况 → 走 :func:`semantic_build_storyboard`（LLM 语义切幕，失败时
       内部已无感回退规则切幕）并落盘。
+
+    Patch v4.21：**前端预览会先落一份规则切幕的占位编排**（``auto_strategy ==
+    "rule"``），那份编排不是最终形态。本函数遇到这种占位且本次有可用模型时，
+    会在 ``reset=False`` 下也自动升级执行一次语义切幕并落盘；升级成功后标记
+    ``auto_strategy="semantic"``，之后不再重复重切。``source == "human"`` 与
+    已经是 ``"semantic"`` 的编排照旧不碰模型、不覆写。
     """
     path = Path(storyboard_path) if storyboard_path is not None else None
     existing = load_storyboard(path) if path is not None else None
@@ -1119,6 +1153,18 @@ async def resolve_or_build_storyboard(
             # 人工编排保护：永远不覆写用户的镜头组。
             return existing
         if not reset:
+            # Patch v4.21：前端预览落盘的规则占位编排 → 自动升级成语义切幕一次。
+            if existing.auto_strategy == "rule" and client is not None and model:
+                upgraded = await semantic_build_storyboard(
+                    client,
+                    episode_id=episode_id,
+                    vision=vision,
+                    model=model,
+                    template=template,
+                )
+                if path is not None:
+                    save_storyboard(upgraded, path)
+                return strip_text_cards_from_storyboard(upgraded, vision)
             # Patch v4.20：既有编排里的纯文字卡剔掉（分镜页与成片口径一致）。
             return strip_text_cards_from_storyboard(existing, vision)
 

@@ -147,6 +147,12 @@ class EpisodeStoryboard(BaseModel):
     episode_id: str
     source: Literal["auto", "human"] = "auto"
     scenes: list[StoryboardScene] = Field(default_factory=list)
+    #: Patch v4.21：这份编排是**怎么切出来的**。
+    #:
+    #: * ``""``——旧文件或来源未知（保持默认，旧 storyboard.json 照常读）；
+    #: * ``"rule"``——规则切幕（前端预览首次落盘的占位），Stage 4 可自动升级一次；
+    #: * ``"semantic"``——LLM 语义切幕（已是最终形态，不再重复重切）。
+    auto_strategy: Literal["", "rule", "semantic"] = ""
 
 
 class CharacterProfile(BaseModel):
