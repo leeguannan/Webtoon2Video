@@ -42,10 +42,88 @@ from typing import Any
 from core.normalize import to_simplified_chinese
 
 __all__ = [
+    "CharacterCheckWarning",
     "CharacterNameCanonicalizer",
     "are_homophone_name_variants",
     "build_character_canonicalizer",
 ]
+
+
+# ----------------------------------------------------------------------
+# Patch v4.23：只读检查用的结构化告警
+# ----------------------------------------------------------------------
+#: 告警原因：别名写法（``南道振`` → ``道振``）。
+_REASON_ALIAS_VARIANT = "alias_variant"
+#: 告警原因：同音异写（``恩慧`` → ``恩彗``）。
+_REASON_HOMOPHONE_VARIANT = "homophone_variant"
+#: 告警原因：说话人不在作品角色表里。
+_REASON_UNREGISTERED_SPEAKER = "unregistered_speaker"
+
+#: 不参与角色名检查的通用说话人标记（Patch v4.23）。
+#:
+#: 旁白之外，流水线还会把 ``male`` / ``female`` 这类**性别槽位**写进
+#: ``speaker_role``（见 ``s4_scriptwriter._GENDER_BY_ROLE_SLOT``），它们不是
+#: 角色本名，拿去和作品角色表比对只会得到一堆误报。
+_GENERIC_ROLE_NAMES: frozenset[str] = frozenset(
+    {
+        "narrator",
+        "旁白",
+        "解说",
+        "独白",
+        "内心独白",
+        "male",
+        "male_lead",
+        "male_antagonist",
+        "female",
+        "female_lead",
+        "female_mature",
+        "unknown",
+        "未知",
+        "众人",
+        "群像",
+        "音效",
+        "sfx",
+    }
+)
+
+
+@dataclass(frozen=True)
+class CharacterCheckWarning:
+    """人工保存前的「角色名写法」告警（Patch v4.23）。
+
+    **只读**：本结构只是提示，绝不参与任何文本改写。字段与后端
+    ``POST /api/episodes/{id}/script/check-characters`` 的响应一一对应。
+    """
+
+    #: 所属解说句的 ID。
+    beat_id: str
+    #: 所属解说句在本话中的序号（0-based）。
+    beat_index: int
+    #: 出问题的字段：``speaker_role`` / ``narration_text`` / ``tts_text``。
+    field: str
+    #: 当前写法。
+    found_name: str
+    #: 建议的规范名；``None`` 表示没有建议（说话人未登记）。
+    suggested_canonical: str | None
+    #: 原因：``alias_variant`` / ``homophone_variant`` / ``unregistered_speaker``。
+    reason: str
+    #: 给人看的一句话说明。
+    message: str
+    #: 上下文片段（出错位置前后各若干字）。
+    snippet: str
+
+    def to_dict(self) -> dict[str, Any]:
+        """转成可直接 JSON 序列化的字典。"""
+        return {
+            "beat_id": self.beat_id,
+            "beat_index": self.beat_index,
+            "field": self.field,
+            "found_name": self.found_name,
+            "suggested_canonical": self.suggested_canonical,
+            "reason": self.reason,
+            "message": self.message,
+            "snippet": self.snippet,
+        }
 
 
 # ----------------------------------------------------------------------
@@ -393,6 +471,135 @@ class CharacterNameCanonicalizer:
             result["character_updates"] = new_updates
 
         return result
+
+    # -- 只读检查（Patch v4.23） --------------------------------------
+    def inspect_script_beats(self, beats: Sequence[Any]) -> list[CharacterCheckWarning]:
+        """只读检查一批解说句里的角色名写法（Patch v4.23）。
+
+        **不修改任何文本**：只产出告警，让前端弹确认框由用户决定要不要
+        统一成规范名。Stage 4 的 AI 生成阶段仍然照旧自动归一
+        （:meth:`canonicalize_script_dict`），这里只管人工编辑这一段。
+
+        检查范围：
+
+        * ``speaker_role``：写法不是规范名 → 报 ``alias_variant`` /
+          ``homophone_variant``；写法不在作品角色表里 → 报
+          ``unregistered_speaker``（没有建议名）。
+        * ``narration_text`` / ``tts_text``：按 ``text_rules`` 扫描，
+          复用 :func:`_protected_spans` 排除「小恩小惠」这类惯用词搭配，
+          并按位置去重，同一处只报一次。
+        """
+        warnings: list[CharacterCheckWarning] = []
+        for index, beat in enumerate(beats or []):
+            beat_id = str(getattr(beat, "beat_id", "") or f"b{index + 1}")
+            warnings.extend(self._inspect_speaker_role(beat, index, beat_id))
+            for field_name in ("narration_text", "tts_text"):
+                warnings.extend(self._inspect_text_field(beat, index, beat_id, field_name))
+        return warnings
+
+    def _inspect_speaker_role(
+        self, beat: Any, index: int, beat_id: str
+    ) -> list[CharacterCheckWarning]:
+        """检查一句的 ``speaker_role``（只读）。"""
+        role = str(getattr(beat, "speaker_role", "") or "").strip()
+        if not role:
+            return []
+        lowered = role.lower()
+        if lowered in _GENERIC_ROLE_NAMES:
+            return []
+        canonical = self.canonicalize_role(role)
+        if canonical != role:
+            reason = (
+                _REASON_HOMOPHONE_VARIANT
+                if are_homophone_name_variants(role, canonical)
+                else _REASON_ALIAS_VARIANT
+            )
+            return [
+                CharacterCheckWarning(
+                    beat_id=beat_id,
+                    beat_index=index,
+                    field="speaker_role",
+                    found_name=role,
+                    suggested_canonical=canonical,
+                    reason=reason,
+                    message=(
+                        f"第 {index + 1} 句的说话人写作「{role}」，"
+                        f"本作品的角色规范名是「{canonical}」。"
+                    ),
+                    snippet=role,
+                )
+            ]
+        if self.canonical_names and role not in self.canonical_names:
+            return [
+                CharacterCheckWarning(
+                    beat_id=beat_id,
+                    beat_index=index,
+                    field="speaker_role",
+                    found_name=role,
+                    suggested_canonical=None,
+                    reason=_REASON_UNREGISTERED_SPEAKER,
+                    message=(
+                        f"第 {index + 1} 句的说话人「{role}」不在本作品的角色表里，"
+                        "配不出专属音色。"
+                    ),
+                    snippet=role,
+                )
+            ]
+        return []
+
+    def _inspect_text_field(
+        self, beat: Any, index: int, beat_id: str, field_name: str
+    ) -> list[CharacterCheckWarning]:
+        """检查一句的正文（字幕原文 / 送音文本）里的角色名写法（只读）。"""
+        text = str(getattr(beat, field_name, "") or "")
+        if not text:
+            return []
+        warnings: list[CharacterCheckWarning] = []
+        claimed: list[tuple[int, int]] = []
+        for variant, canonical in self.text_rules:
+            if not variant or variant == canonical or variant not in text:
+                continue
+            protected = _protected_spans(text, variant)
+            for match in re.finditer(re.escape(variant), text):
+                span = match.span()
+                if _overlaps(span, protected):
+                    continue
+                if _overlaps(span, claimed):
+                    continue
+                claimed.append(span)
+                reason = (
+                    _REASON_HOMOPHONE_VARIANT
+                    if are_homophone_name_variants(variant, canonical)
+                    else _REASON_ALIAS_VARIANT
+                )
+                warnings.append(
+                    CharacterCheckWarning(
+                        beat_id=beat_id,
+                        beat_index=index,
+                        field=field_name,
+                        found_name=variant,
+                        suggested_canonical=canonical,
+                        reason=reason,
+                        message=(
+                            f"第 {index + 1} 句的"
+                            f"{'字幕原文' if field_name == 'narration_text' else '送音文本'}"
+                            f"里写了「{variant}」，规范名是「{canonical}」。"
+                        ),
+                        snippet=self._context_snippet(text, span),
+                    )
+                )
+        return warnings
+
+    @staticmethod
+    def _context_snippet(
+        text: str, span: tuple[int, int], *, width: int = 12
+    ) -> str:
+        """截出错位置前后各若干字作为上下文。"""
+        start = max(0, span[0] - width)
+        end = min(len(text), span[1] + width)
+        prefix = "…" if start > 0 else ""
+        suffix = "…" if end < len(text) else ""
+        return f"{prefix}{text[start:end]}{suffix}"
 
     # -- 提示词 -------------------------------------------------------
     def prompt_lock_block(self) -> str:

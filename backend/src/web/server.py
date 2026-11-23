@@ -387,6 +387,16 @@ class ScriptUpdateRequest(BaseModel):
     beats: list[dict[str, Any]] = Field(default_factory=list)
     from_stage: str | None = None
     mode: str = "full_video"
+    #: Patch v4.23：人工保存**默认不**强制恢复角色名（用户改的写法原样落盘）；
+    #: 只有显式打开这个开关才按规范名归一。
+    auto_unify_characters: bool = False
+
+
+class CharacterCheckRequest(BaseModel):
+    """``POST /api/episodes/{ep_id}/script/check-characters`` 请求体（Patch v4.23）。"""
+
+    #: 待检查的草稿句子；缺省时检查已落盘的 ``script.json``。
+    beats: list[dict[str, Any]] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -617,6 +627,44 @@ def _to_simplified_beat(beat: ScriptBeat) -> ScriptBeat:
     return beat.model_copy(update=updates)
 
 
+def _episode_canonicalizer(
+    series_dir: Path,
+    beats: Sequence[ScriptBeat],
+    *,
+    include_role_names_as_candidates: bool = True,
+) -> Any:
+    """构建本话的角色名归一器（Patch v4.23：归一与只读检查共用一套口径）。
+
+    规范名优先级：作品级专属音色 > 已有 StoryBible > 本话出现频次更高者。
+
+    ``include_role_names_as_candidates=False``（**只读检查**用）：不把用户
+    自己写的说话人名字当成新候选名——否则「不在作品角色表里」这件事永远
+    判不出来（用户写什么，什么就成了规范名）。同时把角色名并进正文池，
+    让「恩慧」这类同音写法依然能被认出来。
+    """
+    from stages.s4_scriptwriter import build_episode_canonicalizer
+
+    characters = s5_tts.load_bible_characters(series_dir)
+    roles = [beat.speaker_role for beat in beats if beat.speaker_role]
+    texts = [
+        text
+        for beat in beats
+        for text in (beat.narration_text, beat.tts_text or "")
+        if text
+    ]
+    if include_role_names_as_candidates:
+        extra_names: list[str] = list(roles)
+    else:
+        extra_names = []
+        texts = texts + list(roles)
+    return build_episode_canonicalizer(
+        series_dir,
+        characters,
+        extra_names=extra_names,
+        extra_texts=texts,
+    )
+
+
 def _canonicalize_script_beats(
     series_dir: Path, beats: list[ScriptBeat]
 ) -> list[ScriptBeat]:
@@ -631,20 +679,7 @@ def _canonicalize_script_beats(
     if not beats:
         return beats
     try:
-        from stages.s4_scriptwriter import build_episode_canonicalizer
-
-        characters = s5_tts.load_bible_characters(series_dir)
-        canonicalizer = build_episode_canonicalizer(
-            series_dir,
-            characters,
-            extra_names=[beat.speaker_role for beat in beats if beat.speaker_role],
-            extra_texts=[
-                text
-                for beat in beats
-                for text in (beat.narration_text, beat.tts_text or "")
-                if text
-            ],
-        )
+        canonicalizer = _episode_canonicalizer(series_dir, beats)
         payload = canonicalizer.canonicalize_script_dict(
             {"beats": [beat.model_dump(mode="json") for beat in beats]}
         )
@@ -655,6 +690,61 @@ def _canonicalize_script_beats(
     except Exception as exc:  # noqa: BLE001 - 角色名归一失败不应阻断保存
         print(f"[server] 角色名归一失败，保留原文：{exc}", file=sys.stderr)
         return beats
+
+
+def _inspect_character_warnings(
+    series_dir: Path, beats: Sequence[ScriptBeat]
+) -> list[dict[str, Any]]:
+    """只读检查一批句子的角色名写法（Patch v4.23）。
+
+    **不改写任何文本**，只返回结构化告警。检查失败不阻断保存（返回空列表）。
+    """
+    if not beats:
+        return []
+    try:
+        canonicalizer = _episode_canonicalizer(
+            series_dir, beats, include_role_names_as_candidates=False
+        )
+        return [
+            warning.to_dict()
+            for warning in canonicalizer.inspect_script_beats(list(beats))
+        ]
+    except Exception as exc:  # noqa: BLE001 - 检查失败不应阻断保存
+        print(f"[server] 角色名检查失败，跳过提醒：{exc}", file=sys.stderr)
+        return []
+
+
+def _merge_beats_for_check(
+    existing: list[ScriptBeat], incoming: list[dict[str, Any]]
+) -> list[ScriptBeat]:
+    """检查用的宽松合并（Patch v4.23）。
+
+    正常路径与 PUT 完全一致（继承前端没回传的只读字段）；前端草稿缺字段导致
+    校验失败时，退化为「只取检查关心的字段」，不让预检接口因为一条草稿报错。
+    """
+    try:
+        return _merge_script_beats(existing, incoming)
+    except ValidationError:
+        by_id = {beat.beat_id: beat for beat in existing}
+        merged: list[ScriptBeat] = []
+        for index, item in enumerate(incoming):
+            if not isinstance(item, dict):
+                continue
+            raw = dict(item)
+            old = by_id.get(str(raw.get("beat_id") or ""))
+            base = old.model_dump() if old is not None else {}
+            for key, value in raw.items():
+                if value is not None or key not in base:
+                    base[key] = value
+            base.setdefault("beat_id", f"b{index + 1}")
+            base.setdefault("narration_text", "（待填写）")
+            base.setdefault("target_panel_ids", ["panel_001"])
+            try:
+                merged.append(ScriptBeat.model_validate(base))
+            except ValidationError:
+                continue
+        return merged
+
 
 
 class PanelFlagRequest(BaseModel):
@@ -1978,9 +2068,11 @@ def create_app(
         beats = _merge_script_beats(script.beats, payload.beats)
         # Patch v4.13：人工保存也强制简体中文（字幕与送音文本一起转）。
         beats = [_to_simplified_beat(beat) for beat in beats]
-        # Patch v4.16：人工保存也统一角色名写法（同音错字归一，
-        # 例如把「恩慧」「恩惠」统一成规范名「恩彗」）。
-        beats = _canonicalize_script_beats(view.registry.series_dir(series_id), beats)
+        series_dir = view.registry.series_dir(series_id)
+        # Patch v4.23：人工保存**默认原样落盘**——用户写的「未来的丈夫」不该
+        # 被悄悄改回角色本名。只有显式打开 auto_unify_characters 才归一。
+        if payload.auto_unify_characters:
+            beats = _canonicalize_script_beats(series_dir, beats)
         script = script.model_copy(update={"beats": beats})
         save_model(script, script_path)
         # Patch v4.6：人工调整停顿后同步进 audio_manifest，只重跑 S6→S7 即生效。
@@ -1990,7 +2082,13 @@ def create_app(
             from stages.s4_scriptwriter import render_readable_script
 
             readable.write_text(render_readable_script(script), encoding="utf-8")
-        result: dict[str, Any] = {"script": script.model_dump(), "job": None}
+        # Patch v4.23：附上「角色名写法」只读检查结果，前端据此温和提示。
+        character_warnings = _inspect_character_warnings(series_dir, script.beats)
+        result: dict[str, Any] = {
+            "script": script.model_dump(),
+            "job": None,
+            "character_warnings": character_warnings,
+        }
         if payload.from_stage:
             job = await job_runner.submit_episode(
                 series_id,
@@ -2000,6 +2098,36 @@ def create_app(
             )
             result["job"] = job
         return result
+
+    @app.post("/api/episodes/{episode_id}/script/check-characters")
+    async def check_script_characters(
+        episode_id: str, payload: CharacterCheckRequest
+    ) -> dict[str, Any]:
+        """只读检查剧本里的角色名写法（Patch v4.23）。
+
+        **不落盘、不改写**：只返回结构化告警，前端据此弹应用内确认框，
+        由用户决定「原样保存」还是「统一成规范名」。
+        """
+        located = view.find_episode(episode_id)
+        if located is None:
+            raise HTTPException(status_code=404, detail=f"找不到话次：{episode_id}")
+        series_id, episode_no = located
+        script_path = (
+            view.episode_dir(series_id, episode_no) / "04_script" / "script.json"
+        )
+        if not script_path.is_file():
+            raise HTTPException(status_code=404, detail="该话还没有 Stage 4 剧本")
+        script = load_model(NarrationScript, script_path)
+        if payload.beats:
+            beats = _merge_beats_for_check(script.beats, payload.beats)
+        else:
+            beats = list(script.beats)
+        beats = [_to_simplified_beat(beat) for beat in beats]
+        warnings = _inspect_character_warnings(
+            view.registry.series_dir(series_id), beats
+        )
+        return {"has_warnings": bool(warnings), "warnings": warnings}
+
 
     @app.post("/api/episodes/{episode_id}/script/auto-pacing")
     async def auto_pace_episode_script(episode_id: str) -> dict[str, Any]:

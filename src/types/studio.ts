@@ -103,6 +103,59 @@ export interface VoiceSpec {
   speed: number;
 }
 
+// ---------------------------------------------------------------------------
+// Patch v4.23：人工保存前的角色名写法检查
+// ---------------------------------------------------------------------------
+/** 角色名写法的告警原因。 */
+export type CharacterWarningReason =
+  /** 别名写法（例如「南道振」应写成「道振」）。 */
+  | 'alias_variant'
+  /** 同音异写（例如「恩慧」应写成「恩彗」）。 */
+  | 'homophone_variant'
+  /** 说话人不在作品角色表里，没有建议名。 */
+  | 'unregistered_speaker';
+
+/** 一条角色名写法告警（与后端 CharacterCheckWarning 一一对应）。 */
+export interface CharacterCheckWarning {
+  /** 所属解说句的 ID。 */
+  beat_id: string;
+  /** 所属解说句在本话中的序号（0-based）。 */
+  beat_index: number;
+  /** 出问题的字段。 */
+  field: 'speaker_role' | 'narration_text' | 'tts_text';
+  /** 当前写法。 */
+  found_name: string;
+  /** 建议的规范名；null 表示没有建议。 */
+  suggested_canonical: string | null;
+  /** 告警原因。 */
+  reason: CharacterWarningReason;
+  /** 给人看的一句话说明。 */
+  message: string;
+  /** 上下文片段（出错位置前后各若干字）。 */
+  snippet: string;
+}
+
+/** POST /script/check-characters 的响应。 */
+export interface CharacterCheckResponse {
+  has_warnings: boolean;
+  warnings: CharacterCheckWarning[];
+}
+
+/** PUT /script 的响应（Patch v4.23 起带角色名告警）。 */
+export interface ScriptUpdateResponse {
+  script: { beats: ScriptBeat[] } & Record<string, unknown>;
+  job: Record<string, unknown> | null;
+  character_warnings: CharacterCheckWarning[];
+}
+
+/** 前端保存解说稿后的结果（用于刷新本地数据与温和提示）。 */
+export interface ScriptSaveOutcome {
+  /** 是否落盘成功。 */
+  ok: boolean;
+  /** 后端返回的角色名写法告警（默认保存时通常为空）。 */
+  warnings: CharacterCheckWarning[];
+}
+
 /** 作品级配音设置（讲解者 / 通用男声 / 通用女声 / 角色专属音色）。 */
 export interface SeriesTtsConfig {
   narrator: VoiceSpec;

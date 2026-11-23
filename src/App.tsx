@@ -21,6 +21,7 @@ import type {
   ArcSummary,
   AutoPacingResponse,
   BeatRegenerateTTSResponse,
+  CharacterCheckResponse,
   CharacterProfile,
   EpisodeCleanupResponse,
   EpisodeDigest,
@@ -31,6 +32,8 @@ import type {
   PronunciationRule,
   RunMode,
   ScriptBeat,
+  ScriptSaveOutcome,
+  ScriptUpdateResponse,
   SeriesCleanupResponse,
   SeriesItem,
   StageId,
@@ -1093,38 +1096,48 @@ export default function App() {
   /**
    * 保存解说稿。
    *
-   * 返回是否落盘成功：审核台据此决定要不要清掉「有未保存改动」标记，
+   * 返回落盘结果：审核台据此决定要不要清掉「有未保存改动」标记，
    * 保存失败时必须保留草稿与标记，别让用户以为改好了其实没存上。
+   *
+   * Patch v4.23：默认**不**强制恢复角色名（用户改的写法原样落盘），
+   * 只有 autoUnifyCharacters=true 才让后端按规范名归一。
    */
   const handleUpdateBeats = async (
     episodeId: string,
     beats: ScriptBeat[],
-    triggerFromStage5: boolean
-  ): Promise<boolean> => {
+    triggerFromStage5: boolean,
+    autoUnifyCharacters = false
+  ): Promise<ScriptSaveOutcome> => {
     try {
-      await apiFetch(`/episodes/${encodeURIComponent(episodeId)}/script`, {
-        method: 'PUT',
-        body: JSON.stringify({
-          beats,
-          from_stage: triggerFromStage5 ? 's5_tts' : undefined,
-          mode: 'full_video',
-        }),
-      });
+      const res = await apiFetch<ScriptUpdateResponse>(
+        `/episodes/${encodeURIComponent(episodeId)}/script`,
+        {
+          method: 'PUT',
+          body: JSON.stringify({
+            beats,
+            from_stage: triggerFromStage5 ? 's5_tts' : undefined,
+            mode: 'full_video',
+            auto_unify_characters: autoUnifyCharacters,
+          }),
+        }
+      );
+      // Patch v4.23：以**后端返回的** beats 为准（可能经过简体化 / 归一）。
+      const savedBeats = (res?.script?.beats as ScriptBeat[]) ?? beats;
       patchEpisode(episodeId, (ep) => ({
         ...ep,
-        beats,
+        beats: savedBeats,
         logs: [
           ...ep.logs,
-          `[人工审核] 已保存 ${beats.length} 条解说与多音字纠偏配置`,
+          `[人工审核] 已保存 ${savedBeats.length} 条解说与多音字纠偏配置`,
         ],
       }));
       showToast(
         triggerFromStage5 ? '已保存脚本修改，并从 Stage 5 重新出片' : '已保存脚本修改'
       );
-      return true;
+      return { ok: true, warnings: res?.character_warnings ?? [] };
     } catch (err) {
       reportError('保存脚本失败', err);
-      return false;
+      return { ok: false, warnings: [] };
     }
   };
 
@@ -1132,18 +1145,45 @@ export default function App() {
   const handleAutoSaveBeats = async (
     episodeId: string,
     beats: ScriptBeat[]
-  ) => {
-    await apiFetch(`/episodes/${encodeURIComponent(episodeId)}/script`, {
-      method: 'PUT',
-      body: JSON.stringify({
-        beats,
-        mode: 'full_video',
-      }),
-    });
+  ): Promise<ScriptSaveOutcome> => {
+    const res = await apiFetch<ScriptUpdateResponse>(
+      `/episodes/${encodeURIComponent(episodeId)}/script`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({
+          beats,
+          mode: 'full_video',
+          // Patch v4.23：弹窗里的逐字微调一律原样落盘，不做角色名归一。
+          auto_unify_characters: false,
+        }),
+      }
+    );
+    const savedBeats = (res?.script?.beats as ScriptBeat[]) ?? beats;
     patchEpisode(episodeId, (ep) => ({
       ...ep,
-      beats,
+      beats: savedBeats,
     }));
+    return { ok: true, warnings: res?.character_warnings ?? [] };
+  };
+
+  /**
+   * Patch v4.23：保存前的角色名写法**只读**检查。
+   *
+   * 后端不改写任何文本，只回传结构化告警；前端据此弹应用内确认框，
+   * 让用户决定「仍按我的修改保存」还是「统一成规范名再保存」。
+   */
+  const handleCheckCharacters = async (
+    episodeId: string,
+    beats: ScriptBeat[]
+  ): Promise<CharacterCheckResponse> => {
+    const res = await apiFetch<CharacterCheckResponse>(
+      `/episodes/${encodeURIComponent(episodeId)}/script/check-characters`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ beats }),
+      }
+    );
+    return res ?? { has_warnings: false, warnings: [] };
   };
 
   /**
@@ -1745,6 +1785,7 @@ export default function App() {
               onTogglePanelBlank={handleTogglePanelBlank}
               onUpdateBeats={handleUpdateBeats}
               onAutoSaveBeats={handleAutoSaveBeats}
+              onCheckCharacters={handleCheckCharacters}
               onAutoPacing={handleAutoPacing}
               onUpdateEpisodeRenderOptions={handleUpdateEpisodeRenderOptions}
               onExportEpisode={handleExportEpisode}

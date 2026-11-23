@@ -28,12 +28,15 @@ import type {
   BeatRegenerateTTSResponse,
   BgmLibraryResponse,
   CameraMotion,
+  CharacterCheckResponse,
+  CharacterCheckWarning,
   EpisodeItem,
   EpisodeRenderOptions,
   EpisodeStoryboard,
   OutroMode,
   PronunciationRule,
   ScriptBeat,
+  ScriptSaveOutcome,
   SeriesTtsConfigResponse,
   StageId,
   StoryboardScene,
@@ -61,16 +64,29 @@ interface EpisodeStudioViewProps {
   ) => Promise<void> | void;
   onTogglePanelBlank: (episodeId: string, panelId: string) => void;
   /**
-   * 保存解说稿。返回是否落盘成功（审核台据此决定是否清掉「未保存改动」标记）。
+   * 保存解说稿。返回落盘结果（审核台据此决定是否清掉「未保存改动」标记）。
    * triggerFromStage5=true 表示保存后顺带从 Stage 5 重跑配音与出片。
+   * autoUnifyCharacters=true 表示按规范名归一角色名（Patch v4.23；默认不归一）。
    */
   onUpdateBeats: (
     episodeId: string,
     beats: ScriptBeat[],
-    triggerFromStage5: boolean
-  ) => Promise<boolean> | boolean;
+    triggerFromStage5: boolean,
+    autoUnifyCharacters?: boolean
+  ) => Promise<ScriptSaveOutcome> | ScriptSaveOutcome;
   /** 分镜大图弹窗里的字幕原文自动保存（不触发重跑配音）。缺省时退化为本地草稿保存。 */
-  onAutoSaveBeats?: (episodeId: string, beats: ScriptBeat[]) => Promise<void>;
+  onAutoSaveBeats?: (
+    episodeId: string,
+    beats: ScriptBeat[]
+  ) => Promise<ScriptSaveOutcome | void>;
+  /**
+   * Patch v4.23：保存前的角色名写法**只读**检查（后端不改写任何文本）。
+   * 缺省时跳过预检，直接保存。
+   */
+  onCheckCharacters?: (
+    episodeId: string,
+    beats: ScriptBeat[]
+  ) => Promise<CharacterCheckResponse | null>;
   /** Patch v4.6：一键叙事节奏留白（后端改写 pause_after_ms 并同步 audio_manifest）。 */
   onAutoPacing?: (episodeId: string) => Promise<AutoPacingResponse | null>;
   /** Patch v4.5：保存本话封页/结尾片包选项（写入 render_options.json，仅重跑 S7 生效）。 */
@@ -102,6 +118,39 @@ const EPISODE_OUTRO_OPTIONS: Array<{ value: OutroMode; label: string }> = [
   { value: 'final', label: '完结' },
   { value: 'none', label: '不加结尾' },
 ];
+
+/**
+ * Patch v4.23：角色名写法告警的确认弹窗状态。
+ *
+ * 用户点了「保存解说稿」「保存并从 Stage 5 重跑」或带脏草稿点「从此步重跑」时，
+ * 先做一次**只读**检查；发现写法不一致就停下来，让用户在三个选项里选。
+ */
+interface CharacterPrompt {
+  /** 后端返回的告警明细。 */
+  warnings: CharacterCheckWarning[];
+  /** 触发检查时的草稿快照（保存时用它，避免弹窗期间改动错位）。 */
+  beats: ScriptBeat[];
+  /** 保存后是否顺带从 Stage 5 重跑配音。 */
+  triggerFromStage5: boolean;
+  /** 保存完成后的后续动作（例如继续「从此步重跑」）。 */
+  onDone?: () => void;
+  /** 弹窗里的保存动作是否进行中。 */
+  busy: boolean;
+}
+
+/** 告警字段的中文名（弹窗里显示）。 */
+const CHARACTER_FIELD_LABELS: Record<string, string> = {
+  speaker_role: '说话人',
+  narration_text: '字幕原文',
+  tts_text: '送音文本',
+};
+
+/** 告警原因的中文说明（弹窗里显示）。 */
+const CHARACTER_REASON_LABELS: Record<string, string> = {
+  alias_variant: '别名写法',
+  homophone_variant: '同音异写',
+  unregistered_speaker: '未登记的角色',
+};
 
 type StudioTab = 'panels' | 'storyboard' | 'script' | 'timeline' | 'preview';
 
@@ -211,6 +260,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   onTogglePanelBlank,
   onUpdateBeats,
   onAutoSaveBeats,
+  onCheckCharacters,
   onAutoPacing,
   onUpdateEpisodeRenderOptions,
   onExportEpisode,
@@ -454,6 +504,8 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   const [savingBeats, setSavingBeats] = useState(false);
   /** 表格保存失败或校验失败时的提示文案。 */
   const [saveHint, setSaveHint] = useState('');
+  /** Patch v4.23：角色名写法告警的确认弹窗（null = 不显示）。 */
+  const [charPrompt, setCharPrompt] = useState<CharacterPrompt | null>(null);
   const [playingBeatId, setPlayingBeatId] = useState<string | null>(null);
   /** 作品级配音设置（角色清单 + 各角色音色），用于「本句配音」的角色下拉。 */
   const [seriesTts, setSeriesTts] = useState<SeriesTtsConfigResponse | null>(null);
@@ -1046,6 +1098,9 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   /**
    * 把待保存的草稿写回后端；没有待保存内容就不发请求。
    * 返回是否保存成功（失败时保留弹窗，让用户看到错误并可重试）。
+   *
+   * Patch v4.23：大图弹窗里的逐字微调**一律原样落盘**，不做角色名归一；
+   * 后端回传的角色名告警只做温和提示，不阻断输入。
    */
   const flushSave = useCallback(async (): Promise<boolean> => {
     const pending = pendingRef.current;
@@ -1056,12 +1111,20 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     const beats = draftBeatsRef.current;
     setSaveStatus('saving');
     try {
+      let warnings: CharacterCheckWarning[] = [];
       if (!onAutoSaveBeats) {
         // 没有独立通道时退化为普通保存（不触发重跑配音）
-        const ok = await onUpdateBeats(episodeId, beats, false);
-        if (ok === false) throw new Error('保存失败，请检查后端服务后重试');
+        const outcome = await onUpdateBeats(episodeId, beats, false);
+        if (!outcome || outcome.ok === false) {
+          throw new Error('保存失败，请检查后端服务后重试');
+        }
+        warnings = outcome.warnings ?? [];
       } else {
-        await onAutoSaveBeats(episodeId, beats);
+        const outcome = await onAutoSaveBeats(episodeId, beats);
+        if (outcome && outcome.ok === false) {
+          throw new Error('保存失败，请检查后端服务后重试');
+        }
+        warnings = outcome?.warnings ?? [];
       }
       pendingRef.current = null;
       tableDirtyRef.current = false;
@@ -1069,6 +1132,11 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
       setTableDirty(false);
       setSaveStatus('saved');
       setSaveMessage(new Date().toLocaleTimeString('zh-CN', { hour12: false }));
+      if (warnings.length > 0) {
+        setSaveHint(
+          `已保存，但有 ${warnings.length} 处角色名写法与规范名不一致（点「保存解说稿」可查看详情）。`
+        );
+      }
       return true;
     } catch (err) {
       setSaveStatus('error');
@@ -1230,11 +1298,79 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   };
 
   /**
+   * Patch v4.23：角色名写法的**只读**预检。
+   *
+   * 后端不改写任何文本，只回传告警；预检失败（网络异常等）不阻断保存。
+   */
+  const checkCharacters = useCallback(
+    async (beats: ScriptBeat[]): Promise<CharacterCheckWarning[]> => {
+      if (!onCheckCharacters) return [];
+      try {
+        const res = await onCheckCharacters(episode.episode_id, beats);
+        return res?.warnings ?? [];
+      } catch {
+        // 预检只是提醒，检查不了就直接保存。
+        return [];
+      }
+    },
+    [episode.episode_id, onCheckCharacters]
+  );
+
+  /**
+   * 真正落盘（不含角色名预检）。
+   *
+   * autoUnifyCharacters=false：原样保存用户写的角色名（Patch v4.23 默认）；
+   * autoUnifyCharacters=true ：按作品规范名归一后再落盘。
+   */
+  const persistBeats = useCallback(
+    async (
+      beats: ScriptBeat[],
+      triggerFromStage5: boolean,
+      autoUnifyCharacters: boolean
+    ): Promise<boolean> => {
+      setSavingBeats(true);
+      try {
+        const outcome = await onUpdateBeats(
+          episode.episode_id,
+          beats,
+          triggerFromStage5,
+          autoUnifyCharacters
+        );
+        if (!outcome || outcome.ok === false) {
+          setSaveHint('保存失败：后端拒绝了这次保存，草稿仍保留在本地，请检查后重试。');
+          return false;
+        }
+        tableDirtyRef.current = false;
+        tableDirtyEpisodeRef.current = '';
+        setTableDirty(false);
+        pendingRef.current = null;
+        if ((outcome.warnings ?? []).length > 0) {
+          setSaveHint(
+            `已保存，但有 ${outcome.warnings.length} 处角色名写法与规范名不一致（点「保存解说稿」可查看详情）。`
+          );
+        }
+        return true;
+      } catch (err) {
+        setSaveHint(
+          `保存失败：${err instanceof Error ? err.message : String(err)}`
+        );
+        return false;
+      } finally {
+        setSavingBeats(false);
+      }
+    },
+    [episode.episode_id, onUpdateBeats]
+  );
+
+  /**
    * 保存解说稿。
    *
    * triggerFromStage5=false：只落盘剧本（不重跑配音）；
    * triggerFromStage5=true ：落盘后顺带从 Stage 5 重跑配音与出片。
    * 保存失败时保留草稿与「未保存改动」标记，别让用户以为已经存上了。
+   *
+   * Patch v4.23：落盘前先做一次角色名写法的**只读**检查；发现不一致就弹
+   * 应用内确认框，由用户决定「原样保存」还是「统一成规范名」。
    */
   const handleSaveBeats = async (triggerFromStage5: boolean) => {
     const beats = draftBeatsRef.current;
@@ -1246,20 +1382,43 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
       return;
     }
     setSaveHint('');
-    setSavingBeats(true);
-    try {
-      const ok = await onUpdateBeats(episode.episode_id, beats, triggerFromStage5);
-      if (ok === false) {
-        setSaveHint('保存失败：后端拒绝了这次保存，草稿仍保留在本地，请检查后重试。');
-        return;
-      }
-      tableDirtyRef.current = false;
-      tableDirtyEpisodeRef.current = '';
-      setTableDirty(false);
-      pendingRef.current = null;
-    } finally {
-      setSavingBeats(false);
+    const warnings = await checkCharacters(beats);
+    if (warnings.length > 0) {
+      setCharPrompt({
+        warnings,
+        beats,
+        triggerFromStage5,
+        busy: false,
+      });
+      return;
     }
+    await persistBeats(beats, triggerFromStage5, false);
+  };
+
+  /** Patch v4.23：确认框「仍按我的修改保存（放行）」——原样落盘，不归一。 */
+  const handleCharPromptSaveAsIs = async () => {
+    const prompt = charPrompt;
+    if (!prompt || prompt.busy) return;
+    setCharPrompt({ ...prompt, busy: true });
+    const ok = await persistBeats(prompt.beats, prompt.triggerFromStage5, false);
+    setCharPrompt(null);
+    if (ok) prompt.onDone?.();
+  };
+
+  /** Patch v4.23：确认框「按建议统一为规范名并保存」——后端归一后落盘。 */
+  const handleCharPromptUnify = async () => {
+    const prompt = charPrompt;
+    if (!prompt || prompt.busy) return;
+    setCharPrompt({ ...prompt, busy: true });
+    const ok = await persistBeats(prompt.beats, prompt.triggerFromStage5, true);
+    setCharPrompt(null);
+    if (ok) prompt.onDone?.();
+  };
+
+  /** Patch v4.23：确认框「返回继续修改」——不保存，保留草稿。 */
+  const handleCharPromptCancel = () => {
+    if (!charPrompt || charPrompt.busy) return;
+    setCharPrompt(null);
   };
 
   /**
@@ -1294,53 +1453,12 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   }, [episode.beats]);
 
   /**
-   * Patch v4.8：统一接管步骤条上的「从此步重跑」。
+   * Patch v4.8：真正发起「从此步重跑」（③④ 两步）。
    *
-   * 三道保护：
-   * 1. 有未保存草稿时，先校验并自动落盘（同步 audio_manifest），失败即中止；
-   * 2. 草稿改过送音内容却想从 S6/S7 跑 → 内联横幅让用户选「从 S5 重跑」还是「仍从当前阶段跑」；
-   * 3. 停顿被改过却想跳过 S6 → 自动把起点升级成 S6（0 TTS 成本），并说明原因。
+   * 拆出来是为了让 Patch v4.23 的角色名确认弹窗可以在用户确认后接着跑。
    */
-  const handleStageRerunClick = useCallback(
-    async (stageId: StageId) => {
-      if (rerunningStage) return;
-
-      // ① 草稿是否影响配音（必须在自动保存之前比较：保存后两边就一致了）。
-      const voiceChanged = hasVoiceRelevantDraftChanges();
-      const dirty = tableDirtyRef.current || pendingRef.current !== null;
-
-      // ② 目标阶段为 S5/S6/S7 且有未保存草稿 → 先自动落盘。
-      if (dirty && (stageId === 's5_tts' || stageId === 's6_timeline' || stageId === 's7_renderer')) {
-        const beats = draftBeatsRef.current;
-        const invalid = beats.find((b) => (b.narration_text ?? '').trim().length < 2);
-        if (invalid) {
-          setSaveHint(
-            `「${invalid.beat_id}」的字幕原文为空或不足 2 字，后端会拒收整批，请先补齐再重跑。`
-          );
-          return;
-        }
-        setSaveHint('');
-        setSavingBeats(true);
-        try {
-          const ok = await onUpdateBeats(episode.episode_id, beats, false);
-          if (ok === false) {
-            setSaveHint('保存失败：后端拒绝了这次保存，已中止重跑，草稿仍保留在本地。');
-            return;
-          }
-          tableDirtyRef.current = false;
-          tableDirtyEpisodeRef.current = '';
-          setTableDirty(false);
-          pendingRef.current = null;
-        } catch (err) {
-          setSaveHint(
-            `保存失败，已中止重跑：${err instanceof Error ? err.message : String(err)}`
-          );
-          return;
-        } finally {
-          setSavingBeats(false);
-        }
-      }
-
+  const runStageRerun = useCallback(
+    async (stageId: StageId, voiceChanged: boolean) => {
       // ③ 停顿改过却要跳过 S6 → 自动升级起点，保证新停顿进入成片。
       let targetStage = stageId;
       if (stageId === 's7_renderer' && needsTimelineRebuild) {
@@ -1370,13 +1488,67 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         setRerunningStage(null);
       }
     },
+    [episode.episode_id, needsTimelineRebuild, onRerunFromStage]
+  );
+
+  /**
+   * Patch v4.8：统一接管步骤条上的「从此步重跑」。
+   *
+   * 三道保护：
+   * 1. 有未保存草稿时，先校验并自动落盘（同步 audio_manifest），失败即中止；
+   * 2. 草稿改过送音内容却想从 S6/S7 跑 → 内联横幅让用户选「从 S5 重跑」还是「仍从当前阶段跑」；
+   * 3. 停顿被改过却想跳过 S6 → 自动把起点升级成 S6（0 TTS 成本），并说明原因。
+   *
+   * Patch v4.23：落盘前先做角色名写法的**只读**检查，有告警就弹确认框。
+   */
+  const handleStageRerunClick = useCallback(
+    async (stageId: StageId) => {
+      if (rerunningStage) return;
+
+      // ① 草稿是否影响配音（必须在自动保存之前比较：保存后两边就一致了）。
+      const voiceChanged = hasVoiceRelevantDraftChanges();
+      const dirty = tableDirtyRef.current || pendingRef.current !== null;
+
+      // ② 目标阶段为 S5/S6/S7 且有未保存草稿 → 先自动落盘。
+      if (dirty && (stageId === 's5_tts' || stageId === 's6_timeline' || stageId === 's7_renderer')) {
+        const beats = draftBeatsRef.current;
+        const invalid = beats.find((b) => (b.narration_text ?? '').trim().length < 2);
+        if (invalid) {
+          setSaveHint(
+            `「${invalid.beat_id}」的字幕原文为空或不足 2 字，后端会拒收整批，请先补齐再重跑。`
+          );
+          return;
+        }
+        setSaveHint('');
+        // Patch v4.23：先只读检查角色名写法，有告警就停下来让用户确认。
+        const warnings = await checkCharacters(beats);
+        if (warnings.length > 0) {
+          setCharPrompt({
+            warnings,
+            beats,
+            triggerFromStage5: false,
+            busy: false,
+            onDone: () => {
+              void runStageRerun(stageId, voiceChanged);
+            },
+          });
+          return;
+        }
+        const ok = await persistBeats(beats, false, false);
+        if (!ok) {
+          setSaveHint('保存失败：后端拒绝了这次保存，已中止重跑，草稿仍保留在本地。');
+          return;
+        }
+      }
+
+      await runStageRerun(stageId, voiceChanged);
+    },
     [
-      episode.episode_id,
+      checkCharacters,
       hasVoiceRelevantDraftChanges,
-      needsTimelineRebuild,
-      onRerunFromStage,
-      onUpdateBeats,
+      persistBeats,
       rerunningStage,
+      runStageRerun,
     ]
   );
 
@@ -3415,6 +3587,108 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
               >
                 {regenerateBusy && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
                 重配并从 S6 重新出片
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Patch v4.23：角色名写法告警的应用内确认弹窗（禁用 window.confirm / window.alert）。 */}
+      {charPrompt && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-[1px] p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-label="角色名写法确认"
+          onClick={() => {
+            if (!charPrompt.busy) setCharPrompt(null);
+          }}
+        >
+          <div
+            className="w-full max-w-2xl max-h-[85vh] flex flex-col rounded-xl border border-slate-200 bg-white shadow-xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-start gap-2 border-b border-slate-100 px-4 py-3">
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600" />
+              <div className="flex-1 space-y-1">
+                <p className="text-sm font-semibold text-slate-900">
+                  这批解说里有 {charPrompt.warnings.length} 处角色名写法与规范名不一致
+                </p>
+                <p className="text-[11px] leading-4 text-slate-500">
+                  你的修改不会被自动改写。选择「仍按我的修改保存」原样落盘；
+                  选择「按建议统一为规范名并保存」才会把下面这些写法替换成规范名。
+                </p>
+              </div>
+            </div>
+            <div className="flex-1 overflow-y-auto space-y-2 px-4 py-3 text-xs text-slate-700">
+              {charPrompt.warnings.map((warning, index) => (
+                <div
+                  key={`${warning.beat_id}-${warning.field}-${warning.found_name}-${index}`}
+                  className="rounded-lg bg-slate-50 px-2.5 py-2"
+                >
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                    <span className="font-medium text-slate-800">
+                      第 {warning.beat_index + 1} 句（{warning.beat_id}）
+                    </span>
+                    <span className="text-[11px] text-slate-500">
+                      {CHARACTER_FIELD_LABELS[warning.field] ?? warning.field}
+                    </span>
+                    <span className="text-[11px] text-slate-500">
+                      {CHARACTER_REASON_LABELS[warning.reason] ?? warning.reason}
+                    </span>
+                  </div>
+                  <div className="mt-1 flex flex-wrap items-center gap-2">
+                    <span className="rounded bg-white px-1.5 py-0.5 font-mono-tabular text-slate-700 ring-1 ring-slate-200">
+                      {warning.found_name}
+                    </span>
+                    {warning.suggested_canonical ? (
+                      <>
+                        <span className="text-slate-400">→</span>
+                        <span className="rounded bg-blue-50 px-1.5 py-0.5 font-mono-tabular text-blue-700 ring-1 ring-blue-200">
+                          {warning.suggested_canonical}
+                        </span>
+                      </>
+                    ) : (
+                      <span className="text-[11px] text-slate-500">（没有建议名）</span>
+                    )}
+                  </div>
+                  {warning.snippet && (
+                    <div className="mt-1 break-words text-[11px] leading-4 text-slate-500">
+                      上下文：{warning.snippet}
+                    </div>
+                  )}
+                  <div className="mt-1 text-[11px] leading-4 text-slate-500">
+                    {warning.message}
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="flex flex-wrap items-center justify-end gap-2 border-t border-slate-100 px-4 py-3">
+              <button
+                type="button"
+                disabled={charPrompt.busy}
+                onClick={handleCharPromptCancel}
+                className="px-3 py-1.5 text-xs font-medium text-slate-600 bg-white border border-slate-200 rounded hover:bg-slate-50 transition-colors cursor-pointer disabled:opacity-50"
+              >
+                返回继续修改
+              </button>
+              <button
+                type="button"
+                disabled={charPrompt.busy}
+                onClick={() => void handleCharPromptSaveAsIs()}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded hover:bg-slate-50 transition-colors cursor-pointer disabled:opacity-50"
+              >
+                {charPrompt.busy && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                仍按我的修改保存
+              </button>
+              <button
+                type="button"
+                disabled={charPrompt.busy}
+                onClick={() => void handleCharPromptUnify()}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-blue-600 rounded hover:bg-blue-700 transition-colors cursor-pointer disabled:opacity-50"
+              >
+                {charPrompt.busy && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                按建议统一为规范名并保存
               </button>
             </div>
           </div>

@@ -396,8 +396,8 @@ def test_put_script_keeps_relation_word(tmp_path: Path) -> None:
     assert saved.beats[0].narration_text == "真没想到我会亲眼看见我未来的丈夫被告白的场面。"
 
 
-def test_put_script_still_unifies_person_name_variant(tmp_path: Path) -> None:
-    """人名变体照旧归一（别把「南道振」也放过）。"""
+def test_put_script_keeps_person_name_variant_by_default(tmp_path: Path) -> None:
+    """Patch v4.23：人名变体默认原样保留（只给告警），不再强制改回规范名。"""
     series_id, series_dir, config = _register(tmp_path)
     bible = StoryBibleV2(
         series_id=series_id,
@@ -421,6 +421,57 @@ def test_put_script_still_unifies_person_name_variant(tmp_path: Path) -> None:
     response = api.put(
         f"/api/episodes/{series_id}_ep_001/script",
         json={
+            "beats": [
+                {
+                    "beat_id": "b10",
+                    "narration_text": "南道振走进病房。",
+                    "speaker_role": "道振",
+                    "target_panel_ids": ["p_001"],
+                    "pause_after_ms": 200,
+                }
+            ]
+        },
+    )
+    assert response.status_code == 200
+    saved = load_model(
+        NarrationScript, series_dir / "episodes" / "ep_001" / "04_script" / "script.json"
+    )
+    assert saved.beats[0].narration_text == "南道振走进病房。"
+    assert saved.beats[0].speaker_role == "道振"
+    # 只读告警：提示写法与规范名不一致，并给出建议。
+    warnings = response.json().get("character_warnings") or []
+    assert any(
+        w["reason"] == "alias_variant" and w["suggested_canonical"] == "道振"
+        for w in warnings
+    ), warnings
+
+
+def test_put_script_unifies_person_name_variant_when_requested(tmp_path: Path) -> None:
+    """显式要求 auto_unify_characters=True 时，人名变体照旧归一。"""
+    series_id, series_dir, config = _register(tmp_path)
+    bible = StoryBibleV2(
+        series_id=series_id,
+        series_title="测试漫画",
+        characters=[
+            CharacterProfile(
+                name="道振",
+                aliases=["丈夫", "南道振"],
+                visual_traits="黑发男性",
+                current_status="平静",
+                first_seen_ep=1,
+                last_seen_ep=1,
+            )
+        ],
+    )
+    save_model(bible, series_dir / "story_bible.json")
+    _write_script(series_dir, [_beat("b10", "南道振走进病房。")])
+
+    runner = JobRunner(config, tts_factory=lambda: None)
+    api = TestClient(create_app(config, runner=runner))
+    response = api.put(
+        f"/api/episodes/{series_id}_ep_001/script",
+        json={
+            "auto_unify_characters": True,
             "beats": [
                 {
                     "beat_id": "b10",

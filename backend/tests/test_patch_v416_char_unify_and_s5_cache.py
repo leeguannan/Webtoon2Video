@@ -692,11 +692,13 @@ async def test_reset_api_clears_audio_cache(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# D. Web API：人工保存也统一角色名
+# D. Web API：人工保存的角色名处理
 # ---------------------------------------------------------------------------
+# Patch v4.23：人工保存**不再强制**把角色名改回规范名——默认原样落盘，
+# 只在响应里回传只读告警；只有显式要求（auto_unify_characters=True）才归一。
 @pytest.mark.anyio
-async def test_put_script_unifies_character_names(tmp_path: Path) -> None:
-    """人工保存剧本时，同音异写的角色名自动归一。"""
+async def test_put_script_keeps_character_names_by_default(tmp_path: Path) -> None:
+    """人工保存时同音异写的角色名原样保留，并在响应里给出只读告警。"""
     series_id, series_dir, config = _register(tmp_path)
     bible = StoryBibleV2(
         series_id=series_id,
@@ -729,6 +731,60 @@ async def test_put_script_unifies_character_names(tmp_path: Path) -> None:
                     "pause_after_ms": 200,
                 }
             ]
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    # Patch v4.23：默认原样落盘，不再强制改回规范名。
+    saved = load_model(
+        NarrationScript, series_dir / "episodes" / "ep_001" / "04_script" / "script.json"
+    )
+    assert saved.beats[0].speaker_role == "恩慧"
+    assert saved.beats[0].narration_text == "恩慧推门而入，雨水顺着伞骨滑落。"
+    # 但要给出只读告警，提示写法与规范名不一致。
+    warnings = payload.get("character_warnings") or []
+    assert warnings, "同音异写应当产生只读告警"
+    reasons = {w["reason"] for w in warnings}
+    assert "homophone_variant" in reasons
+    assert any(w["suggested_canonical"] == "恩彗" for w in warnings)
+
+
+@pytest.mark.anyio
+async def test_put_script_unifies_character_names_when_requested(tmp_path: Path) -> None:
+    """显式要求 auto_unify_characters=True 时，人工保存照旧归一角色名。"""
+    series_id, series_dir, config = _register(tmp_path)
+    bible = StoryBibleV2(
+        series_id=series_id,
+        series_title="测试漫画",
+        characters=[
+            CharacterProfile(
+                name="恩彗",
+                aliases=[],
+                visual_traits="黑发橙眼",
+                current_status="平静",
+                first_seen_ep=1,
+                last_seen_ep=1,
+            )
+        ],
+    )
+    save_model(bible, series_dir / "story_bible.json")
+    _write_script(series_dir, [_beat("b1", "银行行长推门而入。")])
+
+    runner = JobRunner(config, tts_factory=lambda: FakeTTS())
+    api = TestClient(create_app(config, runner=runner))
+    response = api.put(
+        f"/api/episodes/{series_id}_ep_001/script",
+        json={
+            "auto_unify_characters": True,
+            "beats": [
+                {
+                    "beat_id": "b1",
+                    "narration_text": "恩慧推门而入，雨水顺着伞骨滑落。",
+                    "speaker_role": "恩慧",
+                    "target_panel_ids": ["panel_001"],
+                    "pause_after_ms": 200,
+                }
+            ],
         },
     )
     assert response.status_code == 200
