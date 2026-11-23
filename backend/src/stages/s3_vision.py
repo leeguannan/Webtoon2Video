@@ -315,6 +315,52 @@ def blank_panel_ids(panels_dir: str | Path) -> set[str]:
     }
 
 
+# --------------------------------------------------------------------------
+# Patch v4.23：超扁窄条（出版方水印条 / 画格缝隙）不是漫画画面
+# --------------------------------------------------------------------------
+#: 超扁窄条的最大高度（像素）。与 Stage 2 ``THIN_STRIP_MAX_HEIGHT_PX`` 对齐。
+ULTRA_THIN_PANEL_MAX_HEIGHT_PX = 150
+#: 超扁窄条的最小宽高比。与 Stage 2 ``THIN_STRIP_MIN_ASPECT_RATIO`` 对齐。
+ULTRA_THIN_PANEL_MIN_ASPECT_RATIO = 7.5
+
+
+def is_ultra_thin_panel_geometry(width: int, height: int) -> bool:
+    """几何判据：这块面板是不是「超扁窄条」（出版方水印条 / 画格缝隙）。
+
+    实测 wt_5081 第 5 话：``p_088`` 是 690×61 的出版方水印白条（只有
+    "IAFDAM MEDIA" 角标）。Stage 2 之所以没把它判成装饰条，是因为水印
+    logo 把 Canny 边缘密度顶高（0.0353 ≥ 0.015），而近乎全白又触发了
+    「含文字」的豁免——于是它被当成普通分镜，一路混进分镜编排，在 b80 与
+    b81 之间渲染成整整一帧灰底画面。
+
+    这里**只看几何不看像素**：水印条的高度与宽高比本身就是「不是漫画画面」
+    的可靠信号，不该依赖像素内容判断。
+    """
+    if width <= 0 or height <= 0:
+        return False
+    if height > ULTRA_THIN_PANEL_MAX_HEIGHT_PX:
+        return False
+    return (width / height) >= ULTRA_THIN_PANEL_MIN_ASPECT_RATIO
+
+
+def ultra_thin_panel_ids(panels_dir: str | Path) -> set[str]:
+    """``panels.json`` 里属于「超扁窄条」的 panel_id 集合。
+
+    读不到清单 / 尺寸缺失时返回空集合——宁可放过，也不要因为旧产物格式
+    变化把整话判废。
+    """
+    result: set[str] = set()
+    for panel_id, item in load_panels_manifest(panels_dir).items():
+        try:
+            width = int(item.get("width") or 0)
+            height = int(item.get("height") or 0)
+        except (TypeError, ValueError):
+            continue
+        if is_ultra_thin_panel_geometry(width, height):
+            result.add(panel_id)
+    return result
+
+
 def panel_id_for(path: str | Path) -> str:
     """面板编号 = 文件名主干（如 ``p_001``）。
 
@@ -1087,11 +1133,14 @@ async def extract_episode_vision(
     + N 张待抽 1280px 主图），请求次数约为逐格模式的 1/3~1/4。
     断批规则：遇到过渡空页 / 超高竖长画格（要走纵向切片）就断开；
     批次异常或模型少返回某几格时，**只对缺失的格子逐格回退**补抽，不丢格。
+
+    Patch v4.23：出版方水印条这类**超扁窄条**直接当空镜处理（不烧 VLM），
+    否则它会被多图批窗「串味」成相邻格的翻版，一路混进成片。
     """
     paths = list_panel_images(panels_dir)
     semaphore = asyncio.Semaphore(max(1, concurrency))
     sink: list[dict[str, str]] = failures if failures is not None else []
-    blanks = blank_ids or set()
+    blanks = set(blank_ids or set()) | ultra_thin_panel_ids(panels_dir)
     # Patch v4.19：为每格算出紧邻的前一格 / 后一格参考图（跨过渡空页不串格）。
     neighbors = _neighbor_paths(paths, blanks)
     # Patch v4.22：多图模型按批窗抽取，单图模型保持逐格（行为与旧版完全一致）。
@@ -1382,7 +1431,7 @@ async def run_stage3(
     # 下游 Stage 4 拿着空候选池白跑三轮 LLM，最后报一个完全误导人的
     # 「模型没有产出任何可用的解说句（beats 为空）」。更糟的是旧的那份
     # 成功视觉结果会被这份空文件覆盖掉。
-    blanks = blank_panel_ids(panels_dir)
+    blanks = blank_panel_ids(panels_dir) | ultra_thin_panel_ids(panels_dir)
     expected = sum(1 for path_ in list_panel_images(panels_dir) if panel_id_for(path_) not in blanks)
     produced = sum(1 for panel in output.panels if panel.panel_id not in blanks)
     if expected > 0 and produced == 0:

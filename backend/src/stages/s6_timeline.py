@@ -922,6 +922,30 @@ def build_timeline_from_workspace(
             file=sys.stderr,
         )
 
+    # Patch v4.23：出版方水印条 / 画格缝隙这类**超扁窄条**永远不进成片。
+    #
+    # 实测 wt_5081 第 5 话：``p_088`` 是 690×61 的出版方水印白条（只有
+    # "IAFDAM MEDIA" 角标）。Stage 2 的装饰条判据因为水印 logo 顶高边缘密度
+    # 而漏判，Stage 3 的多图批窗又把它串味成了相邻格的翻版，于是它混进
+    # b80 的分镜列表，在 b80 与 b81 之间渲染成整整一帧灰底画面。这里按
+    # **几何**兜底：旧脚本重跑时间轴也不会再多出那一帧。
+    try:
+        from stages.s3_vision import is_ultra_thin_panel_geometry
+    except Exception:  # noqa: BLE001 - 判据读不到就不过滤
+        is_ultra_thin_panel_geometry = None  # type: ignore[assignment]
+    if is_ultra_thin_panel_geometry is not None:
+        ultra_thin_ids = {
+            panel.panel_id
+            for panel in panels
+            if is_ultra_thin_panel_geometry(panel.width, panel.height)
+        }
+        if ultra_thin_ids:
+            panels = [panel for panel in panels if panel.panel_id not in ultra_thin_ids]
+            print(
+                f"[s6_timeline] 剔除超扁窄条面板：{sorted(ultra_thin_ids)}",
+                file=sys.stderr,
+            )
+
     focus_regions = load_focus_regions(series_dir, episode_no)
     # Patch v3.1 Patch 11 B3：画面音效描述（sfx_cue 缺失时的兜底来源）。
     panel_sfx_map = load_panel_sfx_lists(series_dir, episode_no)
