@@ -156,6 +156,31 @@ export interface ScriptSaveOutcome {
   warnings: CharacterCheckWarning[];
 }
 
+// ---------------------------------------------------------------------------
+// Patch v4.25：把角色名写法同步回作品角色档案
+// ---------------------------------------------------------------------------
+/**
+ * 角色档案同步动作（与后端 ``sync_character_updates`` 的 ``action`` 一一对应）。
+ *
+ * - `add_alias`：把 found_name 记为 target_canonical 的合法别名（以后不再提醒）。
+ * - `promote_canonical`：把 found_name 提升为规范名，原 target_canonical 降为别名。
+ * - `register_character`：把 found_name 登记进作品角色档案（新建角色）。
+ */
+export type CharacterSyncAction =
+  | 'add_alias'
+  | 'promote_canonical'
+  | 'register_character';
+
+/** 一条角色档案同步指令（PUT /script 请求体 sync_character_updates 的一项）。 */
+export interface CharacterSyncUpdate {
+  /** 要执行的动作。 */
+  action: CharacterSyncAction;
+  /** 用户当前写的角色名。 */
+  found_name: string;
+  /** 作品里的规范名；登记新角色时为 null。 */
+  target_canonical?: string | null;
+}
+
 /** 作品级配音设置（讲解者 / 通用男声 / 通用女声 / 角色专属音色）。 */
 export interface SeriesTtsConfig {
   narrator: VoiceSpec;

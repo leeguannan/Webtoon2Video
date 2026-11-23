@@ -43,6 +43,12 @@ interface PanelZoomModalProps {
   onChangeRole: (beatId: string, role: string) => void;
   /** Patch v4.4：改本句语速（传 null = 清空微调，恢复角色默认语速）。 */
   onChangeSpeed: (beatId: string, speed: number | null) => void;
+  /**
+   * Patch v4.25：弹窗内的「立即保存」回调。
+   *
+   * 返回 true 表示保存成功。缺省时快捷键不生效（编辑仍然会在切格 / 关闭时自动保存）。
+   */
+  onQuickSave?: () => Promise<boolean>;
 }
 
 const SAVE_STATUS_TEXT: Record<SaveStatus, string> = {
@@ -81,6 +87,7 @@ export const PanelZoomModal: React.FC<PanelZoomModalProps> = ({
   onChangeNarration,
   onChangeRole,
   onChangeSpeed,
+  onQuickSave,
 }) => {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const { playingKey, preview, stop } = useVoicePreview();
@@ -124,6 +131,42 @@ export const PanelZoomModal: React.FC<PanelZoomModalProps> = ({
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [open, index, beats, onClose, onSelectBeat]);
+
+  /**
+   * Patch v4.25：弹窗内快捷键。
+   *
+   * - Cmd/Ctrl+S      → 原地立即保存
+   * - Cmd/Ctrl+Enter  → 保存当前格并跳到下一句（最后一句只保存，不跳）
+   *
+   * Cmd/Ctrl+Enter 在 textarea 里本来是「换行」，这里必须拦掉；
+   * 保存期间不允许重复触发。
+   */
+  const quickSavingRef = useRef(false);
+  useEffect(() => {
+    if (!open || !onQuickSave) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!event.metaKey && !event.ctrlKey) return;
+      if (event.altKey) return;
+      const key = event.key.toLowerCase();
+      if (key !== 's' && key !== 'enter') return;
+      event.preventDefault();
+      if (quickSavingRef.current) return;
+      quickSavingRef.current = true;
+      void (async () => {
+        try {
+          const ok = await onQuickSave();
+          if (!ok) return;
+          if (key === 'enter' && index >= 0 && index < beats.length - 1) {
+            onSelectBeat(beats[index + 1].beat_id);
+          }
+        } finally {
+          quickSavingRef.current = false;
+        }
+      })();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [open, onQuickSave, index, beats, onSelectBeat]);
 
   if (!open || !beat) return null;
 
@@ -388,6 +431,8 @@ export const PanelZoomModal: React.FC<PanelZoomModalProps> = ({
 
             <p className="text-[11px] text-slate-400 leading-relaxed">
               快捷键：Esc 关闭 · ←/→ 翻格（焦点在输入框内时为移动光标）
+              <br />
+              Cmd/Ctrl+S 立即保存 · Cmd/Ctrl+Enter 保存并跳到下一句（焦点在字幕框内也生效）
               <br />
               修改字幕原文、配音角色、语速后，在切换分镜或关闭弹窗时自动保存，不会触发重新配音；如需重出配音请回审核台点「保存并从 Stage 5 重跑配音」。
             </p>

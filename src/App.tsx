@@ -23,6 +23,7 @@ import type {
   BeatRegenerateTTSResponse,
   CharacterCheckResponse,
   CharacterProfile,
+  CharacterSyncUpdate,
   EpisodeCleanupResponse,
   EpisodeDigest,
   EpisodeItem,
@@ -1101,12 +1102,17 @@ export default function App() {
    *
    * Patch v4.23：默认**不**强制恢复角色名（用户改的写法原样落盘），
    * 只有 autoUnifyCharacters=true 才让后端按规范名归一。
+   *
+   * Patch v4.25：新增可选参数 syncCharacterUpdates —— 用户在告警弹窗里勾选的
+   * 「把这次写法同步进作品角色档案」动作，原样透传给后端的
+   * `sync_character_updates` 字段，由后端去改 story_bible.json / series_config.yaml。
    */
   const handleUpdateBeats = async (
     episodeId: string,
     beats: ScriptBeat[],
     triggerFromStage5: boolean,
-    autoUnifyCharacters = false
+    autoUnifyCharacters = false,
+    syncCharacterUpdates?: CharacterSyncUpdate[]
   ): Promise<ScriptSaveOutcome> => {
     try {
       const res = await apiFetch<ScriptUpdateResponse>(
@@ -1118,6 +1124,8 @@ export default function App() {
             from_stage: triggerFromStage5 ? 's5_tts' : undefined,
             mode: 'full_video',
             auto_unify_characters: autoUnifyCharacters,
+            // Patch v4.25：角色档案同步指令（空数组＝不改档案）。
+            sync_character_updates: syncCharacterUpdates ?? [],
           }),
         }
       );

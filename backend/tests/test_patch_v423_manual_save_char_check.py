@@ -231,13 +231,30 @@ def test_inspect_checks_tts_text_field() -> None:
     )
     beat = _beat(
         "b1",
-        "恩慧推门而入。",
+        "雨点砸在窗台上。",
         tts_text="恩慧推门而入。",
         speaker_role="恩慧",
     )
     warnings = canonicalizer.inspect_script_beats([beat])
     fields = {w.field for w in warnings}
     assert "tts_text" in fields, warnings
+
+
+def test_inspect_skips_tts_text_when_same_as_narration() -> None:
+    """Patch v4.25：送音文本与字幕原文去空白后相同时不重复报同一处。"""
+    canonicalizer = _canonicalizer(
+        characters=[_character("恩彗")],
+        names=["恩慧"],
+        texts=["恩慧推门而入。"],
+    )
+    beat = _beat(
+        "b1",
+        "恩慧推门而入。",
+        tts_text="恩慧推门而入。",
+        speaker_role="恩慧",
+    )
+    warnings = canonicalizer.inspect_script_beats([beat])
+    assert {w.field for w in warnings} == {"speaker_role", "narration_text"}
 
 
 def test_inspect_does_not_mutate_beats() -> None:

@@ -493,8 +493,14 @@ class CharacterNameCanonicalizer:
         for index, beat in enumerate(beats or []):
             beat_id = str(getattr(beat, "beat_id", "") or f"b{index + 1}")
             warnings.extend(self._inspect_speaker_role(beat, index, beat_id))
-            for field_name in ("narration_text", "tts_text"):
-                warnings.extend(self._inspect_text_field(beat, index, beat_id, field_name))
+            narration = str(getattr(beat, "narration_text", "") or "")
+            tts = str(getattr(beat, "tts_text", "") or "")
+            # Patch v4.25：送音文本与字幕原文去空白后完全相同时，
+            # 同一处角色名写法只报一次（否则同一句会被报两条重复告警）。
+            same_text = bool(tts) and "".join(tts.split()) == "".join(narration.split())
+            warnings.extend(self._inspect_text_field(beat, index, beat_id, "narration_text"))
+            if not same_text:
+                warnings.extend(self._inspect_text_field(beat, index, beat_id, "tts_text"))
         return warnings
 
     def _inspect_speaker_role(
@@ -507,11 +513,15 @@ class CharacterNameCanonicalizer:
         lowered = role.lower()
         if lowered in _GENERIC_ROLE_NAMES:
             return []
-        canonical = self.canonicalize_role(role)
-        if canonical != role:
+        # Patch v4.25：比对前先把角色名转成简体（**只用于比对**，不改原字段）。
+        # 角色表里存的都是简体名，用户若在说话人栏里写了繁体（如「復仇」），
+        # 直接比对会误判成「未登记的角色」。
+        simplified = to_simplified_chinese(role)
+        canonical = self.canonicalize_role(simplified)
+        if canonical != simplified:
             reason = (
                 _REASON_HOMOPHONE_VARIANT
-                if are_homophone_name_variants(role, canonical)
+                if are_homophone_name_variants(simplified, canonical)
                 else _REASON_ALIAS_VARIANT
             )
             return [
@@ -529,7 +539,7 @@ class CharacterNameCanonicalizer:
                     snippet=role,
                 )
             ]
-        if self.canonical_names and role not in self.canonical_names:
+        if self.canonical_names and simplified not in self.canonical_names:
             return [
                 CharacterCheckWarning(
                     beat_id=beat_id,

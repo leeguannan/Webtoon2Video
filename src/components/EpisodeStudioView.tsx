@@ -2,6 +2,8 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Archive,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Clock,
   Download,
   Eye,
@@ -30,10 +32,13 @@ import type {
   CameraMotion,
   CharacterCheckResponse,
   CharacterCheckWarning,
+  CharacterSyncAction,
+  CharacterSyncUpdate,
   EpisodeItem,
   EpisodeRenderOptions,
   EpisodeStoryboard,
   OutroMode,
+  PanelItem,
   PronunciationRule,
   ScriptBeat,
   ScriptSaveOutcome,
@@ -67,12 +72,15 @@ interface EpisodeStudioViewProps {
    * 保存解说稿。返回落盘结果（审核台据此决定是否清掉「未保存改动」标记）。
    * triggerFromStage5=true 表示保存后顺带从 Stage 5 重跑配音与出片。
    * autoUnifyCharacters=true 表示按规范名归一角色名（Patch v4.23；默认不归一）。
+   * syncCharacterUpdates 是 Patch v4.25 的可选「角色档案同步」清单；
+   * 不传（或空数组）表示只放行这一次保存，不改作品角色档案。
    */
   onUpdateBeats: (
     episodeId: string,
     beats: ScriptBeat[],
     triggerFromStage5: boolean,
-    autoUnifyCharacters?: boolean
+    autoUnifyCharacters?: boolean,
+    syncCharacterUpdates?: CharacterSyncUpdate[]
   ) => Promise<ScriptSaveOutcome> | ScriptSaveOutcome;
   /** 分镜大图弹窗里的字幕原文自动保存（不触发重跑配音）。缺省时退化为本地草稿保存。 */
   onAutoSaveBeats?: (
@@ -150,6 +158,84 @@ const CHARACTER_REASON_LABELS: Record<string, string> = {
   alias_variant: '别名写法',
   homophone_variant: '同音异写',
   unregistered_speaker: '未登记的角色',
+};
+
+/**
+ * Patch v4.25：把角色名告警聚合成「一次档案同步」的粒度。
+ *
+ * 后端 `sync_character_updates` 是按 (found_name, target_canonical) 落地的，
+ * 所以同一个写法在几句里重复出现时，弹窗里只给一个选项组。
+ */
+interface CharacterSyncGroup {
+  /** 聚合键：found_name + '\u0000' + suggested_canonical。 */
+  key: string;
+  /** 用户实际写出来的角色名。 */
+  found_name: string;
+  /** 后端建议的规范名（未登记角色没有建议名）。 */
+  suggested_canonical: string | null;
+  /** 归一后的告警原因（同一组内取第一条）。 */
+  reason: string;
+  /** 涉及的第几句（弹窗里做提示用）。 */
+  beatIds: string[];
+  /** 本组允许的档案同步动作。 */
+  actions: CharacterSyncAction[];
+}
+
+/** Patch v4.25：档案同步动作的中文名（弹窗里显示）。 */
+const CHARACTER_SYNC_ACTION_LABELS: Record<CharacterSyncAction, string> = {
+  promote_canonical: '记为规范名（原名降为别名）',
+  add_alias: '记为合法别名（不再提醒）',
+  register_character: '登记进作品角色档案',
+};
+
+/** Patch v4.25：某条告警允许的档案同步动作。 */
+const characterSyncActionsFor = (
+  reason: string,
+  suggestedCanonical: string | null
+): CharacterSyncAction[] => {
+  if (reason === 'unregistered_speaker') return ['register_character'];
+  if (reason === 'alias_variant' || reason === 'homophone_variant') {
+    // 没有规范名就没法「降级原名 / 挂到规范名下」，只能放行不改档案。
+    if (!suggestedCanonical) return [];
+    return ['promote_canonical', 'add_alias'];
+  }
+  return [];
+};
+
+/**
+ * Patch v4.25：按 (found_name, suggested_canonical) 聚合告警。
+ *
+ * 同一组里出现多种原因时，取并集（未登记角色只会是 register_character）。
+ */
+const buildCharacterSyncGroups = (
+  warnings: CharacterCheckWarning[]
+): CharacterSyncGroup[] => {
+  const groups = new Map<string, CharacterSyncGroup>();
+  warnings.forEach((warning) => {
+    const found = (warning.found_name ?? '').trim();
+    if (!found) return;
+    const suggested = warning.suggested_canonical ?? null;
+    const key = `${found}\u0000${suggested ?? ''}`;
+    const existing = groups.get(key);
+    if (existing) {
+      if (!existing.beatIds.includes(warning.beat_id)) {
+        existing.beatIds.push(warning.beat_id);
+      }
+      characterSyncActionsFor(warning.reason, suggested).forEach((action) => {
+        if (!existing.actions.includes(action)) existing.actions.push(action);
+      });
+      return;
+    }
+    groups.set(key, {
+      key,
+      found_name: found,
+      suggested_canonical: suggested,
+      reason: warning.reason,
+      beatIds: [warning.beat_id],
+      actions: characterSyncActionsFor(warning.reason, suggested),
+    });
+  });
+  return Array.from(groups.values());
 };
 
 type StudioTab = 'panels' | 'storyboard' | 'script' | 'timeline' | 'preview';
@@ -249,6 +335,675 @@ const MOTION_LABELS: Record<CameraMotion, string> = {
   shake: 'SHAKE 震动',
   static: 'STATIC 静止',
 };
+
+// ---------------------------------------------------------------------------
+// Patch v4.25：分镜缩略图 / 角色解析工具 / 审核表行组件
+// ---------------------------------------------------------------------------
+
+/**
+ * Patch v4.25：分镜缩略图 URL。
+ *
+ * 后端提供 `GET /api/episodes/{id}/panels/{filename}?w=<像素>` 缩略图接口（返回 JPEG），
+ * 这里在原图 URL 上追加 / 替换 `w` 查询参数：原图 URL 没有 `?` 时用 `?w=`，
+ * 有 `?` 时用 `&w=`；已经带 `w=` 的直接替换，避免出现 `?w=140&w=180` 这种重复键。
+ *
+ * 大图预览与分镜放大弹窗（PanelZoomModal）继续用原图 URL，不走缩略图。
+ */
+export const panelThumbUrl = (url: string, width: number): string => {
+  if (!url) return url;
+  if (/[?&]w=\d+/.test(url)) {
+    return url.replace(/([?&])w=\d+/, `$1w=${width}`);
+  }
+  return `${url}${url.includes('?') ? '&' : '?'}w=${width}`;
+};
+
+/**
+ * Patch v4.25：角色 → 性别（从组件体内提到模块级，供审核表行组件复用）。
+ *
+ * 改角色时必须同步 speaker_gender：Stage 4 留下的性别属于**原来那个角色**
+ * （男角色改成女角色后仍是 male），不跟着改就会用错音色的兜底槽位。
+ */
+const genderForRoleOf = (
+  role: string,
+  seriesTts: SeriesTtsConfigResponse | null
+): 'male' | 'female' | 'unknown' => {
+  const lowered = role.trim().toLowerCase();
+  if (!lowered) return 'unknown';
+  if (lowered === 'male' || lowered.startsWith('male_')) return 'male';
+  if (lowered === 'female' || lowered.startsWith('female_')) return 'female';
+  const character = (seriesTts?.characters ?? []).find((c) =>
+    [c.name, ...(c.aliases ?? [])].some(
+      (key) => key.trim().toLowerCase() === lowered
+    )
+  );
+  const gender = (character?.gender ?? '').toLowerCase();
+  return gender === 'male' || gender === 'female' ? gender : 'unknown';
+};
+
+/**
+ * Patch v4.25：说话人候选（模块级版本，参数化以便审核表行组件复用）。
+ *
+ * 只让用户选**角色**，音色由角色自动带出（讲解者 / 通用男声 / 通用女声 / 角色专属），
+ * 避免在一堆音色 ID 里挑花眼。
+ */
+const roleOptionsForBeat = (
+  beat: ScriptBeat,
+  seriesTts: SeriesTtsConfigResponse | null,
+  roleNames: string[]
+): RoleOption[] => {
+  const currentRole = (beat.speaker_role ?? '').trim();
+  const options: RoleOption[] = [];
+  if (
+    currentRole &&
+    !['narrator', 'male', 'female'].includes(currentRole) &&
+    !roleNames.includes(currentRole)
+  ) {
+    options.push({
+      value: currentRole,
+      label: `当前角色 ${currentRole}（旧槽位）`,
+    });
+  }
+  options.push({ value: '', label: '不指定（按性别兜底）' });
+  options.push({ value: 'narrator', label: '讲解者（旁白）' });
+  options.push({ value: 'male', label: '通用男声' });
+  options.push({ value: 'female', label: '通用女声' });
+  roleNames.forEach((name) => {
+    options.push({
+      value: name,
+      label: seriesTts?.character_voices?.[name]
+        ? name
+        : `${name}（未单独配置音色）`,
+    });
+  });
+  return options;
+};
+
+/**
+ * Patch v4.25：按当前 ``speaker_role`` 从作品级 TTS 配置算出角色默认语速（模块级版本）。
+ */
+const roleSpeedForBeatOf = (
+  beat: ScriptBeat,
+  seriesTts: SeriesTtsConfigResponse | null
+): number => {
+  const fallback =
+    beat.resolved_voice?.role_speed ?? beat.resolved_voice?.speed ?? 1.15;
+  if (!seriesTts) return fallback;
+  const role = (beat.speaker_role ?? '').trim();
+  if (!role) return fallback;
+  if (role === 'narrator' || role === '旁白' || role === '解说') {
+    return seriesTts.narrator.speed;
+  }
+  const cast = seriesTts.character_voices[role];
+  if (cast) return cast.speed;
+  if (role === 'male') return seriesTts.default_male.speed;
+  if (role === 'female') return seriesTts.default_female.speed;
+  return fallback;
+};
+
+/**
+ * Patch v4.25：一条 beat 的「本句配音」说明（模块级版本）。
+ *
+ * 后端已给出权威结果（``resolved_voice``，与 Stage 5 同一套解析）；这里再按当前
+ * 下拉选择做一次**本地预览**，改角色后能立刻看到会换成谁，保存重跑后以服务端为准。
+ */
+const beatVoiceInfoOf = (
+  beat: ScriptBeat,
+  seriesTts: SeriesTtsConfigResponse | null,
+  roleNames: string[]
+): {
+  label: string;
+  voice: string;
+  pending: boolean;
+  hint: string;
+  speed: number;
+  roleSpeed: number;
+  speedOverridden: boolean;
+} => {
+  const roleSpeed = roleSpeedForBeatOf(beat, seriesTts);
+  const speedOverridden = beat.speed_override != null;
+  const speed = speedOverridden ? (beat.speed_override as number) : roleSpeed;
+  const speedFields = { speed, roleSpeed, speedOverridden };
+  // Patch v4.2：逐句指定音色（voice_override）优先级最高，与后端 s5_tts 解析保持一致。
+  const override = (beat.voice_override ?? '').trim();
+  if (override) {
+    return {
+      label: '指定音色',
+      voice: override,
+      pending: false,
+      hint: '已逐句指定音色，改选角色可恢复按角色解析',
+      ...speedFields,
+    };
+  }
+  const resolved = beat.resolved_voice;
+  const role = (beat.speaker_role ?? '').trim();
+  const base = {
+    label: resolved?.label ?? '待解析',
+    voice: resolved?.voice ?? '—',
+    pending: false,
+    hint: '',
+    ...speedFields,
+  };
+  if (!seriesTts) return base;
+  if (!role) {
+    return {
+      label: '不指定 · 按性别兜底',
+      voice: base.voice,
+      pending: !!resolved,
+      hint: '按角色性别选通用男声 / 通用女声',
+      ...speedFields,
+    };
+  }
+  if (role === 'narrator' || role === '旁白' || role === '解说') {
+    return {
+      label: '讲解者（旁白）',
+      voice: seriesTts.narrator.voice,
+      pending: false,
+      hint: '',
+      ...speedFields,
+    };
+  }
+  const cast = seriesTts.character_voices[role];
+  if (cast) {
+    return {
+      label: `角色专属 · ${role}`,
+      voice: cast.voice,
+      pending: false,
+      hint: '',
+      ...speedFields,
+    };
+  }
+  if (role === 'male') {
+    return {
+      label: '通用男声',
+      voice: seriesTts.default_male.voice,
+      pending: false,
+      hint: '',
+      ...speedFields,
+    };
+  }
+  if (role === 'female') {
+    return {
+      label: '通用女声',
+      voice: seriesTts.default_female.voice,
+      pending: false,
+      hint: '',
+      ...speedFields,
+    };
+  }
+  if (roleNames.includes(role)) {
+    // 作品角色表里有这个角色，但没单独配音色 → Stage 5 按性别兜底。
+    return {
+      label: `角色 ${role} · 按性别兜底`,
+      voice: base.voice,
+      pending: false,
+      hint: '该角色未单独配置音色，可改选通用男声 / 通用女声',
+      ...speedFields,
+    };
+  }
+  // 旧槽位角色（male_antagonist 之类）：按后端给出的性别落到作品级通用槽位。
+  if (resolved?.gender === 'male') {
+    return {
+      label: '通用男声',
+      voice: seriesTts.default_male.voice,
+      pending: false,
+      hint: '旧槽位角色，改选角色名可切到专属音色',
+      ...speedFields,
+    };
+  }
+  if (resolved?.gender === 'female') {
+    return {
+      label: '通用女声',
+      voice: seriesTts.default_female.voice,
+      pending: false,
+      hint: '旧槽位角色，改选角色名可切到专属音色',
+      ...speedFields,
+    };
+  }
+  return { ...base, hint: '旧槽位角色，改选角色名可切到专属音色' };
+};
+
+/**
+ * Patch v4.25：改说话人角色时要同步落的字段（模块级版本）。
+ *
+ * a) speaker_gender 始终跟着角色走，选回「不指定」（空串）时重置为 unknown；
+ * b) 清掉历史逐句音色 voice_override，恢复按角色解析，避免界面角色与实际音色不一致；
+ * c) 一并清空单句语速微调 speed_override，让新角色自带的默认语速自动生效。
+ */
+const speakerRolePatchOf = (
+  beat: ScriptBeat,
+  nextRole: string,
+  seriesTts: SeriesTtsConfigResponse | null
+): Partial<ScriptBeat> => {
+  const patch: Partial<ScriptBeat> = {
+    speaker_role: nextRole,
+    speaker_gender: nextRole ? genderForRoleOf(nextRole, seriesTts) : 'unknown',
+    speed_override: null,
+  };
+  if ((beat.voice_override ?? '').trim()) patch.voice_override = '';
+  return patch;
+};
+
+/**
+ * Patch v4.25：空幕列表常量。
+ *
+ * `sceneStoryboard?.scenes ?? []` 每次渲染都会造一个新数组，会让依赖它的
+ * useMemo（幕选项、脏标记）每次都重算；这里给一个稳定的空数组兜底。
+ */
+const EMPTY_SCENES: StoryboardScene[] = [];
+
+/**
+ * Patch v4.25：审核表「一行」的 props。
+ *
+ * 所有回调都由父组件用 useCallback 提供（引用稳定），其余派生值在行内按 beat
+ * 自身的引用做 useMemo 缓存 —— 没被编辑的 beat 对象引用不变，派生值就不会重算。
+ */
+interface ScriptBeatRowProps {
+  beat: ScriptBeat;
+  panel?: PanelItem;
+  panelOptions: Array<{ value: string; label: string }>;
+  sceneOptions: Array<{ value: string; label: string }>;
+  rules: PronunciationRule[];
+  ttsModel: string;
+  seriesTts: SeriesTtsConfigResponse | null;
+  roleNames: string[];
+  regenerateEnabled: boolean;
+  playingBeatId: string | null;
+  tagPickerOpen: boolean;
+  ttsTextareaRefs: React.MutableRefObject<Record<string, HTMLTextAreaElement | null>>;
+  ttsSelections: React.MutableRefObject<
+    Record<string, { start: number; end: number }>
+  >;
+  onChangeText: (
+    beatId: string,
+    key: 'narration_text' | 'tts_text',
+    value: string
+  ) => void;
+  onChangeRole: (beatId: string, role: string) => void;
+  onNudgeSpeed: (beatId: string, delta: number) => void;
+  onResetSpeed: (beatId: string) => void;
+  onChangeMotion: (beatId: string, motion: CameraMotion) => void;
+  onChangePause: (beatId: string, ms: number) => void;
+  onChangePanel: (beatId: string, panelId: string) => void;
+  onChangeScene: (beatId: string, sceneId: string | null) => void;
+  onToggleTagPicker: (beatId: string) => void;
+  onPickTag: (beatId: string, snippet: string) => void;
+  onPreview: (beatId: string) => void;
+  onRegenerate: (beatId: string) => void;
+  onInsert: (beatId: string) => void;
+  onDelete: (beatId: string) => void;
+  onZoom: (beatId: string) => void;
+}
+
+/**
+ * Patch v4.25：审核表的一行（独立 memo 子组件）。
+ *
+ * 一话 200~300 分镜时整表重绘会明显卡顿，因此把「一行」拆成独立组件：
+ * 编辑其中一句时，只有那一行会因为 beat 引用变化而重绘，其余行直接复用。
+ */
+const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProps) {
+  const {
+    beat,
+    panel,
+    panelOptions,
+    sceneOptions,
+    rules,
+    ttsModel,
+    seriesTts,
+    roleNames,
+    regenerateEnabled,
+    playingBeatId,
+    tagPickerOpen,
+    ttsTextareaRefs,
+    ttsSelections,
+    onChangeText,
+    onChangeRole,
+    onNudgeSpeed,
+    onResetSpeed,
+    onChangeMotion,
+    onChangePause,
+    onChangePanel,
+    onChangeScene,
+    onToggleTagPicker,
+    onPickTag,
+    onPreview,
+    onRegenerate,
+    onInsert,
+    onDelete,
+    onZoom,
+  } = props;
+
+  const roleOptions = useMemo(
+    () => roleOptionsForBeat(beat, seriesTts, roleNames),
+    [beat, seriesTts, roleNames]
+  );
+  const voiceInfo = useMemo(
+    () => beatVoiceInfoOf(beat, seriesTts, roleNames),
+    [beat, seriesTts, roleNames]
+  );
+  const { spokenText, matchedRules } = useMemo(
+    () => resolveSpokenText(beat, rules),
+    [beat, rules]
+  );
+
+  // Patch v4.25：送音文本框的 ref 与选区记忆用 useCallback 固定下来，
+  // 避免每次渲染都换 ref 回调导致 DOM ref 被反复置空。
+  const setTextareaRef = useCallback(
+    (el: HTMLTextAreaElement | null) => {
+      ttsTextareaRefs.current[beat.beat_id] = el;
+    },
+    [beat.beat_id, ttsTextareaRefs]
+  );
+  const rememberSelection = useCallback(
+    (el: HTMLTextAreaElement) => {
+      ttsSelections.current[beat.beat_id] = {
+        start: el.selectionStart,
+        end: el.selectionEnd,
+      };
+    },
+    [beat.beat_id, ttsSelections]
+  );
+
+  const charLen = beat.narration_text.trim().length;
+  const isLengthWarn = charLen < 8 || charLen > 30;
+
+  return (
+    <tr className="hover:bg-slate-50/50">
+      <td className="py-3.5 pl-5 pr-2">
+        <div className="space-y-1.5">
+          <div className="font-mono-tabular font-semibold text-slate-700">
+            {beat.beat_id}
+          </div>
+          {panel && (
+            <button
+              type="button"
+              onClick={() => onZoom(beat.beat_id)}
+              title="放大查看分镜并编辑字幕原文"
+              aria-label={`放大查看 ${panel.panel_id} 并编辑字幕原文`}
+              className="block w-12 h-16 rounded border border-slate-200 overflow-hidden hover:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/40 cursor-pointer transition-colors"
+            >
+              <img
+                src={panelThumbUrl(panel.image_url, 140)}
+                alt={panel.panel_id}
+                referrerPolicy="no-referrer"
+                loading="lazy"
+                decoding="async"
+                className="w-12 h-16 object-cover"
+              />
+            </button>
+          )}
+          <select
+            value={beat.target_panel_ids[0]}
+            onChange={(e) => onChangePanel(beat.beat_id, e.target.value)}
+            className="w-16 px-1 py-0.5 text-[11px] font-mono-tabular bg-white border border-slate-200 rounded"
+          >
+            {panelOptions.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+          {/* Patch v4.13：归属幕与分镜解耦，这里单独指定这一句讲哪一幕。 */}
+          {sceneOptions.length > 0 && (
+            <select
+              value={beat.scene_id ?? ''}
+              onChange={(e) =>
+                onChangeScene(
+                  beat.beat_id,
+                  e.target.value === '' ? null : e.target.value
+                )
+              }
+              title="这一句归属哪一幕（留空＝按分镜自动回退）"
+              aria-label={`${beat.beat_id} 归属幕`}
+              className="w-24 px-1 py-0.5 text-[11px] bg-white border border-slate-200 rounded"
+            >
+              <option value="">自动</option>
+              {sceneOptions.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+      </td>
+
+      <td className="py-3.5 px-3">
+        <textarea
+          rows={2}
+          value={beat.narration_text}
+          onChange={(e) => onChangeText(beat.beat_id, 'narration_text', e.target.value)}
+          className="w-full p-2 text-xs text-slate-900 bg-white border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600 resize-none"
+        />
+        <div className="flex items-center justify-between mt-1 text-[11px] font-mono-tabular">
+          <span className={isLengthWarn ? 'text-amber-600' : 'text-slate-400'}>
+            {charLen} 字（建议 10–28 字）
+          </span>
+          <span className="text-slate-400">
+            时长 {(beat.audio_duration_ms / 1000).toFixed(2)}s
+          </span>
+        </div>
+      </td>
+
+      <td className="py-3.5 px-3">
+        <div className="relative">
+          <div className="mb-1 flex items-center justify-between gap-2">
+            <span className="text-[10px] text-slate-400">
+              标签只写送音文本，字幕不受影响
+            </span>
+            {/* Patch v4.14：语气词 / 句中停顿标签浮层入口。 */}
+            <button
+              type="button"
+              onClick={() => onToggleTagPicker(beat.beat_id)}
+              aria-label={`${beat.beat_id} 插入语气或停顿标签`}
+              title="插入 MiniMax 语气词（如 (laughs)）或句中停顿（如 <#0.5#>）"
+              className="rounded-md border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-600 hover:border-blue-400 hover:text-blue-700 transition-colors"
+            >
+              + 语气 / 停顿标签
+            </button>
+          </div>
+          <textarea
+            rows={2}
+            value={beat.tts_text}
+            ref={setTextareaRef}
+            onSelect={(e) => rememberSelection(e.currentTarget)}
+            onClick={(e) => rememberSelection(e.currentTarget)}
+            onKeyUp={(e) => rememberSelection(e.currentTarget)}
+            onBlur={(e) => rememberSelection(e.currentTarget)}
+            onChange={(e) => onChangeText(beat.beat_id, 'tts_text', e.target.value)}
+            placeholder="留空则自动继承字幕 + 词典替换；填写时必须是整句送音文本..."
+            className="w-full p-2 text-xs text-slate-800 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600 resize-none"
+          />
+          {tagPickerOpen && (
+            <div data-tts-tag-popover className="absolute right-0 top-full z-40 mt-1">
+              <TtsTagPicker
+                value={beat.tts_text ?? ''}
+                selection={ttsSelections.current[beat.beat_id] ?? null}
+                ttsModel={ttsModel}
+                onPick={(snippet) => onPickTag(beat.beat_id, snippet)}
+                onClose={() => onToggleTagPicker(beat.beat_id)}
+              />
+            </div>
+          )}
+        </div>
+        <div className="mt-1 text-[11px] text-slate-500 leading-snug">
+          {matchedRules.length > 0 ? (
+            <span className="text-blue-700">
+              词典命中：{matchedRules.map((r) => `${r.source}→${r.replacement}`).join('、')}
+              {' · '}实际送音：{spokenText}
+            </span>
+          ) : (
+            <span className="text-slate-400">无词典替换 · 直接按字幕语义合成</span>
+          )}
+        </div>
+      </td>
+
+      <td className="py-3.5 px-3">
+        {/* Patch v4.18：移除情绪指令输入框——情绪指令不再由前端设置，
+            合成侧固定使用后端契约里的默认/继承值。 */}
+        <div className="text-[11px] font-mono-tabular text-slate-400">
+          {ttsModel}
+        </div>
+        {/* Patch v3.4：显示「本句配音」（角色 + 音色），并可就地改角色。 */}
+        <div className="mt-1.5 space-y-1">
+          <div className="text-[11px] leading-snug text-slate-600">
+            本句配音：{voiceInfo.label} · {voiceInfo.voice} ·{' '}
+            {voiceInfo.speed.toFixed(2)}x
+            {voiceInfo.pending && (
+              <span className="text-amber-600">（保存重跑后生效）</span>
+            )}
+            {voiceInfo.speedOverridden && (
+              <span className="text-slate-400">
+                （已微调，默认 {voiceInfo.roleSpeed.toFixed(2)}x）
+              </span>
+            )}
+          </div>
+          <select
+            value={beat.speaker_role ?? ''}
+            onChange={(e) => onChangeRole(beat.beat_id, e.target.value)}
+            aria-label={`${beat.beat_id} 配音角色`}
+            className="w-full px-2 py-1 text-[11px] bg-white border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
+          >
+            {roleOptions.map((option) => (
+              <option key={option.value || '__none__'} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+          {voiceInfo.hint && (
+            <div className="text-[10px] leading-snug text-slate-400">
+              {voiceInfo.hint}
+            </div>
+          )}
+          {/* Patch v4.13：表格行紧凑语速微调（-/+ 步进 + 数字 + 恢复默认）。 */}
+          <div className="flex items-center gap-1 text-[11px] font-mono-tabular">
+            <span className="text-slate-400">语速</span>
+            <button
+              type="button"
+              onClick={() => onNudgeSpeed(beat.beat_id, -0.02)}
+              aria-label={`${beat.beat_id} 语速降低`}
+              className="w-5 h-5 rounded border border-slate-200 bg-white text-slate-600 leading-none hover:border-slate-400 hover:text-slate-900"
+            >
+              −
+            </button>
+            <span
+              className={`w-12 text-center ${
+                voiceInfo.speedOverridden
+                  ? 'text-blue-700 font-semibold'
+                  : 'text-slate-500'
+              }`}
+              title={
+                voiceInfo.speedOverridden
+                  ? `已逐句微调，角色默认 ${voiceInfo.roleSpeed.toFixed(2)}x`
+                  : `跟随角色默认 ${voiceInfo.roleSpeed.toFixed(2)}x`
+              }
+            >
+              {voiceInfo.speed.toFixed(2)}x
+            </span>
+            <button
+              type="button"
+              onClick={() => onNudgeSpeed(beat.beat_id, 0.02)}
+              aria-label={`${beat.beat_id} 语速提高`}
+              className="w-5 h-5 rounded border border-slate-200 bg-white text-slate-600 leading-none hover:border-slate-400 hover:text-slate-900"
+            >
+              +
+            </button>
+            {voiceInfo.speedOverridden && (
+              <button
+                type="button"
+                onClick={() => onResetSpeed(beat.beat_id)}
+                aria-label={`${beat.beat_id} 语速恢复默认`}
+                title="恢复为角色默认语速"
+                className="rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-500 hover:border-slate-400 hover:text-slate-800"
+              >
+                恢复默认
+              </button>
+            )}
+          </div>
+        </div>
+      </td>
+
+      <td className="py-3.5 px-3 space-y-2">
+        <select
+          value={beat.motion}
+          onChange={(e) =>
+            onChangeMotion(beat.beat_id, e.target.value as CameraMotion)
+          }
+          className="w-full px-2 py-1.5 text-[11px] font-mono-tabular bg-white border border-slate-200 rounded-lg"
+        >
+          {Object.entries(MOTION_LABELS).map(([val, label]) => (
+            <option key={val} value={val}>
+              {label}
+            </option>
+          ))}
+        </select>
+
+        <div className="flex items-center gap-1.5">
+          <span className="text-[11px] text-slate-500 whitespace-nowrap">停顿ms</span>
+          <input
+            type="number"
+            step={50}
+            min={0}
+            max={2000}
+            value={beat.pause_after_ms}
+            onChange={(e) =>
+              onChangePause(
+                beat.beat_id,
+                // Patch v4.8：整数 + 0~2000ms 钳位，避免越界值让时间轴算崩。
+                Math.max(0, Math.min(2000, Math.round(Number(e.target.value) || 0)))
+              )
+            }
+            className="w-full px-2 py-1 text-[11px] font-mono-tabular bg-white border border-slate-200 rounded"
+          />
+        </div>
+      </td>
+
+      <td className="py-3.5 pl-3 pr-5 text-right">
+        <div className="flex items-center justify-end gap-1.5">
+          <button
+            type="button"
+            onClick={() => onPreview(beat.beat_id)}
+            className={`inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border text-[11px] font-medium whitespace-nowrap shrink-0 cursor-pointer transition-colors ${
+              playingBeatId === beat.beat_id
+                ? 'border-blue-600 bg-blue-50 text-blue-700'
+                : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+            }`}
+          >
+            <Volume2 className="w-3.5 h-3.5" />
+            {playingBeatId === beat.beat_id ? '试听中' : '试听'}
+          </button>
+          {regenerateEnabled && (
+            <button
+              type="button"
+              onClick={() => onRegenerate(beat.beat_id)}
+              title="只重新合成这一句的配音，其它句子不受影响"
+              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border text-[11px] font-medium whitespace-nowrap shrink-0 cursor-pointer transition-colors border-slate-200 bg-white text-slate-700 hover:bg-amber-50 hover:border-amber-300 hover:text-amber-700"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              重配
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => onInsert(beat.beat_id)}
+            title="在本格之后插入一条解说句"
+            aria-label={`在 ${beat.beat_id} 之后插入解说句`}
+            className="p-1.5 text-slate-400 hover:text-blue-600 cursor-pointer"
+          >
+            <Plus className="w-3.5 h-3.5" />
+          </button>
+          <button
+            type="button"
+            onClick={() => onDelete(beat.beat_id)}
+            aria-label={`删除 ${beat.beat_id}`}
+            className="p-1.5 text-slate-400 hover:text-red-600 cursor-pointer"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      </td>
+    </tr>
+  );
+});
 
 export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   episode,
@@ -464,7 +1219,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   const [showFocusOverlay, setShowFocusOverlay] = useState(true);
   const [draftBeats, setDraftBeats] = useState<ScriptBeat[]>(episode.beats);
   /** Patch v4.13：本话的镜头组（幕），供「归属幕」下拉选择。 */
-  const storyboardScenes = sceneStoryboard?.scenes ?? [];
+  const storyboardScenes = sceneStoryboard?.scenes ?? EMPTY_SCENES;
   /** Patch v4.7：解说句按 storyboard 启用幕归组，未命中分镜进末尾兜底组。 */
   const beatSceneGroups = useMemo(() => {
     const scenes = (sceneStoryboard?.scenes ?? []).filter(
@@ -500,12 +1255,32 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   }, [sceneStoryboard, draftBeats]);
   /** 表格内是否有未落盘的改动（改字 / 改角色 / 增删句）。 */
   const [tableDirty, setTableDirty] = useState(false);
+  /**
+   * Patch v4.25：哪些幕在审核表里处于展开状态。
+   *
+   * 默认空集 = **全部幕默认折叠**（一话 200~300 分镜时全表渲染太重）；
+   * 折叠态不挂载 `<table>` / `<tr>` DOM，只渲染一行幕头部。
+   */
+  const [expandedSceneKeys, setExpandedSceneKeys] = useState<Set<string>>(
+    () => new Set<string>()
+  );
   /** 保存中状态，避免重复点击。 */
   const [savingBeats, setSavingBeats] = useState(false);
+  /** Patch v4.25：角色名预检进行中（预检期间禁用保存按钮，避免双击重复提交）。 */
+  const [characterCheckBusy, setCharacterCheckBusy] = useState(false);
   /** 表格保存失败或校验失败时的提示文案。 */
   const [saveHint, setSaveHint] = useState('');
   /** Patch v4.23：角色名写法告警的确认弹窗（null = 不显示）。 */
   const [charPrompt, setCharPrompt] = useState<CharacterPrompt | null>(null);
+  /**
+   * Patch v4.25：角色档案同步选项。
+   *
+   * key = (found_name, suggested_canonical) 聚合键；value = 用户勾选的同步动作。
+   * 缺省（没有 key）表示「仅本次放行，不改档案」——这是默认行为。
+   */
+  const [charSyncChoices, setCharSyncChoices] = useState<
+    Record<string, CharacterSyncAction>
+  >({});
   const [playingBeatId, setPlayingBeatId] = useState<string | null>(null);
   /** 作品级配音设置（角色清单 + 各角色音色），用于「本句配音」的角色下拉。 */
   const [seriesTts, setSeriesTts] = useState<SeriesTtsConfigResponse | null>(null);
@@ -604,10 +1379,24 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     setNeedsTimelineRebuild(false);
     setPendingRerunChoice(null);
     setRerunNotice('');
+    // Patch v4.25：换话次时幕的折叠状态重置为「全部折叠」。
+    setExpandedSceneKeys(new Set<string>());
   }, [episode.episode_id]);
 
   // Patch v3.4：拉作品级配音设置——审核台要显示「本句配音用哪个角色 / 哪个音色」，
   // 并允许就地改角色（改完保存并重跑 Stage 5 生效）。
+  /** Patch v4.25：同步完角色档案后要重新拉一次，让「本句配音」下拉立刻反映新档案。 */
+  const reloadSeriesTts = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/series/${encodeURIComponent(seriesId)}/tts-config`);
+      if (!res.ok) return;
+      const data = (await res.json()) as SeriesTtsConfigResponse;
+      setSeriesTts(data);
+    } catch {
+      // 拉不到就退回「只显示后端已解析结果」的降级模式，不影响审核台其他功能。
+    }
+  }, [seriesId]);
+
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
@@ -664,19 +1453,8 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
    * 改角色时必须同步 speaker_gender：Stage 4 留下的性别属于**原来那个角色**
    * （男角色改成女角色后仍是 male），不跟着改就会用错音色的兜底槽位。
    */
-  const genderForRole = (role: string): 'male' | 'female' | 'unknown' => {
-    const lowered = role.trim().toLowerCase();
-    if (!lowered) return 'unknown';
-    if (lowered === 'male' || lowered.startsWith('male_')) return 'male';
-    if (lowered === 'female' || lowered.startsWith('female_')) return 'female';
-    const character = (seriesTts?.characters ?? []).find((c) =>
-      [c.name, ...(c.aliases ?? [])].some(
-        (key) => key.trim().toLowerCase() === lowered
-      )
-    );
-    const gender = (character?.gender ?? '').toLowerCase();
-    return gender === 'male' || gender === 'female' ? gender : 'unknown';
-  };
+  const genderForRole = (role: string): 'male' | 'female' | 'unknown' =>
+    genderForRoleOf(role, seriesTts);
 
   /**
    * 改说话人角色时要同步落的字段（表格行内 select 与分镜弹窗共用同一套规则）：
@@ -687,15 +1465,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   const speakerRolePatch = (
     beat: ScriptBeat,
     nextRole: string
-  ): Partial<ScriptBeat> => {
-    const patch: Partial<ScriptBeat> = {
-      speaker_role: nextRole,
-      speaker_gender: nextRole ? genderForRole(nextRole) : 'unknown',
-      speed_override: null,
-    };
-    if ((beat.voice_override ?? '').trim()) patch.voice_override = '';
-    return patch;
-  };
+  ): Partial<ScriptBeat> => speakerRolePatchOf(beat, nextRole, seriesTts);
 
   /**
    * 说话人候选（审核台表格与分镜弹窗共用同一份）。
@@ -704,33 +1474,8 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
    * 避免在一堆音色 ID 里挑花眼。当前角色可能是旧槽位代号（如 male_antagonist），
    * 不在候选里时补一条，免得下拉显示空白、用户看不出这一句到底是谁在念。
    */
-  const roleOptionsFor = (beat: ScriptBeat): RoleOption[] => {
-    const currentRole = (beat.speaker_role ?? '').trim();
-    const options: RoleOption[] = [];
-    if (
-      currentRole &&
-      !['narrator', 'male', 'female'].includes(currentRole) &&
-      !roleNames.includes(currentRole)
-    ) {
-      options.push({
-        value: currentRole,
-        label: `当前角色 ${currentRole}（旧槽位）`,
-      });
-    }
-    options.push({ value: '', label: '不指定（按性别兜底）' });
-    options.push({ value: 'narrator', label: '讲解者（旁白）' });
-    options.push({ value: 'male', label: '通用男声' });
-    options.push({ value: 'female', label: '通用女声' });
-    roleNames.forEach((name) => {
-      options.push({
-        value: name,
-        label: seriesTts?.character_voices?.[name]
-          ? name
-          : `${name}（未单独配置音色）`,
-      });
-    });
-    return options;
-  };
+  const roleOptionsFor = (beat: ScriptBeat): RoleOption[] =>
+    roleOptionsForBeat(beat, seriesTts, roleNames);
 
   /**
    * Patch v4.4：按当前 ``speaker_role`` 从作品级 TTS 配置算出角色默认语速。
@@ -738,21 +1483,8 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
    * 讲解者 / 角色专属 / 通用男女声各取对应槽位的 ``speed``；本地配置找不到时，
    * 依次回落后端下发的 ``role_speed``、当前生效 ``speed``，最后兜底 1.15。
    */
-  const roleSpeedForBeat = (beat: ScriptBeat): number => {
-    const fallback =
-      beat.resolved_voice?.role_speed ?? beat.resolved_voice?.speed ?? 1.15;
-    if (!seriesTts) return fallback;
-    const role = (beat.speaker_role ?? '').trim();
-    if (!role) return fallback;
-    if (role === 'narrator' || role === '旁白' || role === '解说') {
-      return seriesTts.narrator.speed;
-    }
-    const cast = seriesTts.character_voices[role];
-    if (cast) return cast.speed;
-    if (role === 'male') return seriesTts.default_male.speed;
-    if (role === 'female') return seriesTts.default_female.speed;
-    return fallback;
-  };
+  const roleSpeedForBeat = (beat: ScriptBeat): number =>
+    roleSpeedForBeatOf(beat, seriesTts);
 
   /**
    * 一条 beat 的「本句配音」说明。
@@ -763,125 +1495,91 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
    * Patch v4.4：返回值同时携带语速三件套——``roleSpeed``（角色默认语速）、
    * ``speed``（当前生效语速，微调后等于 ``speed_override``）、``speedOverridden``。
    */
-  const beatVoiceInfo = (
-    beat: ScriptBeat
-  ): {
-    label: string;
-    voice: string;
-    pending: boolean;
-    hint: string;
-    speed: number;
-    roleSpeed: number;
-    speedOverridden: boolean;
-  } => {
-    const roleSpeed = roleSpeedForBeat(beat);
-    const speedOverridden = beat.speed_override != null;
-    const speed = speedOverridden
-      ? (beat.speed_override as number)
-      : roleSpeed;
-    const speedFields = { speed, roleSpeed, speedOverridden };
-    // Patch v4.2：逐句指定音色（voice_override）优先级最高，与后端 s5_tts 解析保持一致。
-    const override = (beat.voice_override ?? '').trim();
-    if (override) {
-      return {
-        label: '指定音色',
-        voice: override,
-        pending: false,
-        hint: '已逐句指定音色，改选角色可恢复按角色解析',
-        ...speedFields,
-      };
-    }
-    const resolved = beat.resolved_voice;
-    const role = (beat.speaker_role ?? '').trim();
-    const base = {
-      label: resolved?.label ?? '待解析',
-      voice: resolved?.voice ?? '—',
-      pending: false,
-      hint: '',
-      ...speedFields,
-    };
-    if (!seriesTts) return base;
-    if (!role) {
-      return {
-        label: '不指定 · 按性别兜底',
-        voice: base.voice,
-        pending: !!resolved,
-        hint: '按角色性别选通用男声 / 通用女声',
-        ...speedFields,
-      };
-    }
-    if (role === 'narrator' || role === '旁白' || role === '解说') {
-      return {
-        label: '讲解者（旁白）',
-        voice: seriesTts.narrator.voice,
-        pending: false,
-        hint: '',
-        ...speedFields,
-      };
-    }
-    const cast = seriesTts.character_voices[role];
-    if (cast) {
-      return {
-        label: `角色专属 · ${role}`,
-        voice: cast.voice,
-        pending: false,
-        hint: '',
-        ...speedFields,
-      };
-    }
-    if (role === 'male') {
-      return {
-        label: '通用男声',
-        voice: seriesTts.default_male.voice,
-        pending: false,
-        hint: '',
-        ...speedFields,
-      };
-    }
-    if (role === 'female') {
-      return {
-        label: '通用女声',
-        voice: seriesTts.default_female.voice,
-        pending: false,
-        hint: '',
-        ...speedFields,
-      };
-    }
-    if (roleNames.includes(role)) {
-      // 作品角色表里有这个角色，但没单独配音色 → Stage 5 按性别兜底。
-      return {
-        label: `角色 ${role} · 按性别兜底`,
-        voice: base.voice,
-        pending: false,
-        hint: '该角色未单独配置音色，可改选通用男声 / 通用女声',
-        ...speedFields,
-      };
-    }
-    // 旧槽位角色（male_antagonist 之类）：按后端给出的性别落到作品级通用槽位。
-    if (resolved?.gender === 'male') {
-      return {
-        label: '通用男声',
-        voice: seriesTts.default_male.voice,
-        pending: false,
-        hint: '旧槽位角色，改选角色名可切到专属音色',
-        ...speedFields,
-      };
-    }
-    if (resolved?.gender === 'female') {
-      return {
-        label: '通用女声',
-        voice: seriesTts.default_female.voice,
-        pending: false,
-        hint: '旧槽位角色，改选角色名可切到专属音色',
-        ...speedFields,
-      };
-    }
-    return { ...base, hint: '旧槽位角色，改选角色名可切到专属音色' };
-  };
+  const beatVoiceInfo = (beat: ScriptBeat) =>
+    beatVoiceInfoOf(beat, seriesTts, roleNames);
+
+  /**
+   * Patch v4.25：分镜 ID → 分镜 的查找表。
+   *
+   * 原来审核表每一行都在 `episode.panels.find(...)` 里线性扫一遍（O(N×M)），
+   * 一话 200~300 分镜时整表要扫 6 万次；改成 Map 之后每行只查一次哈希。
+   */
+  const panelMap = useMemo(() => {
+    const map = new Map<string, PanelItem>();
+    episode.panels.forEach((panel) => map.set(panel.panel_id, panel));
+    return map;
+  }, [episode.panels]);
+
+  /** Patch v4.25：分镜下拉的选项数组预计算（引用稳定，编辑单句不会重建整表）。 */
+  const panelOptions = useMemo(
+    () =>
+      episode.panels.map((panel) => ({
+        value: panel.panel_id,
+        label: panel.panel_id,
+      })),
+    [episode.panels]
+  );
+
+  /** Patch v4.25：归属幕下拉的选项数组预计算（引用稳定）。 */
+  const sceneOptions = useMemo(
+    () =>
+      storyboardScenes.map((scene) => ({
+        value: scene.scene_id,
+        label: `${scene.scene_index}. ${scene.title || scene.scene_id}`,
+      })),
+    [storyboardScenes]
+  );
+
+  /**
+   * Patch v4.25：某条 beat 属于哪一幕（与 ``beatSceneGroups`` 同一口径）。
+   *
+   * 优先用 beat.scene_id；没写就按它指向的分镜反查幕；都没有则落到「未归幕」兜底组。
+   */
+  const sceneKeyOfBeat = useCallback(
+    (beat: ScriptBeat, scenes: StoryboardScene[]): string => {
+      if (scenes.length === 0) return '__all__';
+      const explicit = (beat.scene_id ?? '').trim();
+      if (explicit && scenes.some((scene) => scene.scene_id === explicit)) {
+        return explicit;
+      }
+      const panelId = beat.target_panel_ids[0];
+      const matched = scenes.find((scene) => scene.panel_ids.includes(panelId));
+      return matched ? matched.scene_id : '__orphan__';
+    },
+    []
+  );
+
+  /**
+   * Patch v4.25：哪些幕里还有没落盘的草稿改动。
+   *
+   * 折叠态的幕头部要显示一个「未保存」小圆点，提示用户这一幕改了还没存。
+   * 判定口径与 ``hasDraftChanges`` 一致：只比对用户可编辑字段，
+   * 后端派生的 audio_duration_ms / resolved_voice 不算改动。
+   */
+  const dirtySceneKeys = useMemo(() => {
+    const savedMap = new Map(episode.beats.map((beat) => [beat.beat_id, beat]));
+    const draftIds = new Set(draftBeats.map((beat) => beat.beat_id));
+    const scenes = storyboardScenes.filter((scene) => scene.enabled !== false);
+    const keys = new Set<string>();
+    draftBeats.forEach((beat) => {
+      const other = savedMap.get(beat.beat_id);
+      const changed =
+        !other ||
+        DRAFT_EDITABLE_FIELDS.some(
+          (field) => normDraftField(beat[field]) !== normDraftField(other[field])
+        );
+      if (changed) keys.add(sceneKeyOfBeat(beat, scenes));
+    });
+    // 被删掉的句子要在它原来那一幕上留下脏标记。
+    episode.beats.forEach((beat) => {
+      if (!draftIds.has(beat.beat_id)) keys.add(sceneKeyOfBeat(beat, scenes));
+    });
+    return keys;
+  }, [draftBeats, episode.beats, storyboardScenes, sceneKeyOfBeat]);
 
   const activePanel = useMemo(
-    () => episode.panels.find((p) => p.panel_id === selectedPanelId) ?? episode.panels[0],
-    [episode.panels, selectedPanelId]
+    () => panelMap.get(selectedPanelId) ?? episode.panels[0],
+    [panelMap, episode.panels, selectedPanelId]
   );
 
   // Compute simulated Audio-First timeline from draftBeats
@@ -893,9 +1591,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
       const totalBeatMs = beat.audio_duration_ms + beat.pause_after_ms;
       const endMs = startMs + totalBeatMs;
       cursor = endMs;
-      const panel =
-        episode.panels.find((p) => p.panel_id === beat.target_panel_ids[0]) ??
-        episode.panels[0];
+      const panel = panelMap.get(beat.target_panel_ids[0]) ?? episode.panels[0];
       return {
         beat,
         panel,
@@ -905,7 +1601,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         totalBeatMs,
       };
     });
-  }, [draftBeats, episode.panels]);
+  }, [draftBeats, panelMap, episode.panels]);
 
   const totalSimDurationMs = useMemo(
     () =>
@@ -969,23 +1665,25 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
    *
    * 统一以 draftBeatsRef 为单一数据源：ref 与 state 必须同步更新，
    * 否则「表格改字 → 再开弹窗改字」会拿旧的 ref 当基线，把表格的改动整份覆盖掉。
+   *
+   * Patch v4.25：改成 useCallback，审核表每一行（memo 子组件）才能拿到引用稳定的回调，
+   * 编辑一句时其余行不会被连带重绘。
    */
-  const updateBeatField = <K extends keyof ScriptBeat>(
-    beatId: string,
-    key: K,
-    value: ScriptBeat[K]
-  ) => {
-    const next = draftBeatsRef.current.map((b) =>
-      b.beat_id === beatId ? { ...b, [key]: value } : b
-    );
-    draftBeatsRef.current = next;
-    setDraftBeats(next);
-    // Patch v4.8：改了句间停顿就必须重建时间轴，否则从 S7 重跑会吃到旧停顿。
-    if (key === 'pause_after_ms') {
-      setNeedsTimelineRebuild(true);
-    }
-    markTableDirty();
-  };
+  const updateBeatField = useCallback(
+    <K extends keyof ScriptBeat>(beatId: string, key: K, value: ScriptBeat[K]) => {
+      const next = draftBeatsRef.current.map((b) =>
+        b.beat_id === beatId ? { ...b, [key]: value } : b
+      );
+      draftBeatsRef.current = next;
+      setDraftBeats(next);
+      // Patch v4.8：改了句间停顿就必须重建时间轴，否则从 S7 重跑会吃到旧停顿。
+      if (key === 'pause_after_ms') {
+        setNeedsTimelineRebuild(true);
+      }
+      markTableDirty();
+    },
+    [markTableDirty]
+  );
 
   /**
    * Patch v4.13：表格行里的紧凑语速微调（-/+ 步进）。
@@ -997,6 +1695,17 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     const next = Math.min(2, Math.max(0.5, Math.round((base + delta) * 100) / 100));
     updateBeatField(beat.beat_id, 'speed_override', next);
   };
+
+  /** 插入标签后还焦，并把光标停在插入内容正后方。 */
+  const focusAfterTag = useCallback((beatId: string, caret: number) => {
+    requestAnimationFrame(() => {
+      const el = ttsTextareaRefs.current[beatId];
+      if (!el) return;
+      el.focus();
+      const pos = Math.max(0, Math.min(caret, el.value.length));
+      el.setSelectionRange(pos, pos);
+    });
+  }, []);
 
   /**
    * Patch v4.14：把选中的语气词 / 停顿标签写进这句的送音文本。
@@ -1010,7 +1719,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
    * - 送音文本非空 → 按最近选区替换（无选区则按光标处插入）；
    * - 相邻已有停顿标签 → 替换掉旧的那个，避免连用（后端也会合并，这里先一步收敛）。
    */
-  const insertTtsTag = (beat: ScriptBeat, snippet: string) => {
+  const insertTtsTag = useCallback((beat: ScriptBeat, snippet: string) => {
     const isPauseTag = /^<#/.test(snippet);
     const current = beat.tts_text ?? '';
     const trimmed = current.trim();
@@ -1069,18 +1778,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     const next = `${head}${snippet}${tail}`;
     updateBeatField(beat.beat_id, 'tts_text', next);
     focusAfterTag(beat.beat_id, head.length + snippet.length);
-  };
-
-  /** 插入标签后还焦，并把光标停在插入内容正后方。 */
-  const focusAfterTag = (beatId: string, caret: number) => {
-    requestAnimationFrame(() => {
-      const el = ttsTextareaRefs.current[beatId];
-      if (!el) return;
-      el.focus();
-      const pos = Math.max(0, Math.min(caret, el.value.length));
-      el.setSelectionRange(pos, pos);
-    });
-  };
+  }, [updateBeatField, focusAfterTag]);
 
   /** 浮层打开时，点面板外部即关闭（Esc 由 TtsTagPicker 内部处理）。 */
   useEffect(() => {
@@ -1136,6 +1834,10 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         setSaveHint(
           `已保存，但有 ${warnings.length} 处角色名写法与规范名不一致（点「保存解说稿」可查看详情）。`
         );
+      } else {
+        // Patch v4.25：这次没有角色名告警，就把上一轮遗留的告警条清掉，
+        // 免得用户以为还有没处理的写法问题。
+        setSaveHint((prev) => (prev.includes('角色名写法') ? '' : prev));
       }
       return true;
     } catch (err) {
@@ -1238,7 +1940,34 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     return candidate;
   };
 
-  const handleAddBeat = () => {
+  /**
+   * Patch v4.25：展开指定的一幕（新增 / 插入解说句后自动展开所在幕）。
+   */
+  const expandSceneKey = useCallback((key: string) => {
+    setExpandedSceneKeys((prev) => (prev.has(key) ? prev : new Set(prev).add(key)));
+  }, []);
+
+  /** Patch v4.25：展开 / 收起一幕（幕头部点击）。 */
+  const toggleScene = useCallback((key: string) => {
+    setExpandedSceneKeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+
+  /** Patch v4.25：展开全部幕。 */
+  const expandAllScenes = useCallback(() => {
+    setExpandedSceneKeys(new Set(beatSceneGroups.map((group) => group.key)));
+  }, [beatSceneGroups]);
+
+  /** Patch v4.25：全部折叠。 */
+  const collapseAllScenes = useCallback(() => {
+    setExpandedSceneKeys(new Set<string>());
+  }, []);
+
+  const handleAddBeat = useCallback(() => {
     const prev = draftBeatsRef.current;
     const firstPanel = episode.panels[0]?.panel_id ?? 'p_001';
     const newBeat: ScriptBeat = {
@@ -1255,7 +1984,20 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     draftBeatsRef.current = next;
     setDraftBeats(next);
     markTableDirty();
-  };
+    // Patch v4.25：新句落在哪一幕就自动展开哪一幕，别让用户自己找。
+    expandSceneKey(
+      sceneKeyOfBeat(
+        newBeat,
+        storyboardScenes.filter((scene) => scene.enabled !== false)
+      )
+    );
+  }, [
+    episode.panels,
+    markTableDirty,
+    storyboardScenes,
+    sceneKeyOfBeat,
+    expandSceneKey,
+  ]);
 
   /**
    * 在指定 beat 之后插入一条新解说句（Patch v3.4）。
@@ -1264,7 +2006,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
    * 情绪指令 / 运镜 / 停顿 / 说话角色沿用当前句，避免插进去就变味。
    * 新句尚未合成，时长记 0；落盘需要点「保存并从 Stage 5 重跑配音」。
    */
-  const handleInsertBeat = (afterBeatId: string) => {
+  const handleInsertBeat = useCallback((afterBeatId: string) => {
     const prev = draftBeatsRef.current;
     const index = prev.findIndex((b) => b.beat_id === afterBeatId);
     if (index < 0) return;
@@ -1288,14 +2030,26 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     draftBeatsRef.current = nextBeats;
     setDraftBeats(nextBeats);
     markTableDirty();
-  };
+    // Patch v4.25：插入后自动展开新句所在的那一幕。
+    expandSceneKey(
+      sceneKeyOfBeat(
+        newBeat,
+        storyboardScenes.filter((scene) => scene.enabled !== false)
+      )
+    );
+  }, [
+    markTableDirty,
+    storyboardScenes,
+    sceneKeyOfBeat,
+    expandSceneKey,
+  ]);
 
-  const handleDeleteBeat = (beatId: string) => {
+  const handleDeleteBeat = useCallback((beatId: string) => {
     const next = draftBeatsRef.current.filter((b) => b.beat_id !== beatId);
     draftBeatsRef.current = next;
     setDraftBeats(next);
     markTableDirty();
-  };
+  }, [markTableDirty]);
 
   /**
    * Patch v4.23：角色名写法的**只读**预检。
@@ -1305,12 +2059,16 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   const checkCharacters = useCallback(
     async (beats: ScriptBeat[]): Promise<CharacterCheckWarning[]> => {
       if (!onCheckCharacters) return [];
+      // Patch v4.25：预检期间锁住保存入口，避免用户连点造成重复提交。
+      setCharacterCheckBusy(true);
       try {
         const res = await onCheckCharacters(episode.episode_id, beats);
         return res?.warnings ?? [];
       } catch {
         // 预检只是提醒，检查不了就直接保存。
         return [];
+      } finally {
+        setCharacterCheckBusy(false);
       }
     },
     [episode.episode_id, onCheckCharacters]
@@ -1326,7 +2084,8 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     async (
       beats: ScriptBeat[],
       triggerFromStage5: boolean,
-      autoUnifyCharacters: boolean
+      autoUnifyCharacters: boolean,
+      syncCharacterUpdates?: CharacterSyncUpdate[]
     ): Promise<boolean> => {
       setSavingBeats(true);
       try {
@@ -1334,7 +2093,8 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
           episode.episode_id,
           beats,
           triggerFromStage5,
-          autoUnifyCharacters
+          autoUnifyCharacters,
+          syncCharacterUpdates
         );
         if (!outcome || outcome.ok === false) {
           setSaveHint('保存失败：后端拒绝了这次保存，草稿仍保留在本地，请检查后重试。');
@@ -1347,6 +2107,11 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         if ((outcome.warnings ?? []).length > 0) {
           setSaveHint(
             `已保存，但有 ${outcome.warnings.length} 处角色名写法与规范名不一致（点「保存解说稿」可查看详情）。`
+          );
+        } else {
+          // Patch v4.25：这次没有角色名告警，就把上一轮遗留的告警条清掉。
+          setSaveHint((prev) =>
+            prev.includes('角色名写法') ? '' : prev
           );
         }
         return true;
@@ -1372,7 +2137,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
    * Patch v4.23：落盘前先做一次角色名写法的**只读**检查；发现不一致就弹
    * 应用内确认框，由用户决定「原样保存」还是「统一成规范名」。
    */
-  const handleSaveBeats = async (triggerFromStage5: boolean) => {
+  const handleSaveBeats = useCallback(async (triggerFromStage5: boolean) => {
     const beats = draftBeatsRef.current;
     const invalid = beats.find((b) => (b.narration_text ?? '').trim().length < 2);
     if (invalid) {
@@ -1384,6 +2149,8 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     setSaveHint('');
     const warnings = await checkCharacters(beats);
     if (warnings.length > 0) {
+      // Patch v4.25：每次弹窗都从「不改档案」开始。
+      setCharSyncChoices({});
       setCharPrompt({
         warnings,
         beats,
@@ -1393,16 +2160,52 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
       return;
     }
     await persistBeats(beats, triggerFromStage5, false);
-  };
+  }, [checkCharacters, persistBeats]);
 
-  /** Patch v4.23：确认框「仍按我的修改保存（放行）」——原样落盘，不归一。 */
+  /**
+   * Patch v4.25：把弹窗里勾选的档案同步选项翻译成后端契约。
+   *
+   * 没有勾选的分组表示「仅本次放行，不改档案」，不会出现在请求体里。
+   */
+  const collectSyncUpdates = useCallback(
+    (warnings: CharacterCheckWarning[]): CharacterSyncUpdate[] => {
+      const updates: CharacterSyncUpdate[] = [];
+      buildCharacterSyncGroups(warnings).forEach((group) => {
+        const action = charSyncChoices[group.key];
+        if (!action || !group.actions.includes(action)) return;
+        updates.push({
+          action,
+          found_name: group.found_name,
+          target_canonical: group.suggested_canonical,
+        });
+      });
+      return updates;
+    },
+    [charSyncChoices]
+  );
+
+  /** Patch v4.23 + v4.25：确认框「仍按我的修改保存（放行）」——原样落盘，不归一。 */
   const handleCharPromptSaveAsIs = async () => {
     const prompt = charPrompt;
     if (!prompt || prompt.busy) return;
     setCharPrompt({ ...prompt, busy: true });
-    const ok = await persistBeats(prompt.beats, prompt.triggerFromStage5, false);
+    const syncUpdates = collectSyncUpdates(prompt.warnings);
+    const ok = await persistBeats(
+      prompt.beats,
+      prompt.triggerFromStage5,
+      false,
+      syncUpdates
+    );
     setCharPrompt(null);
-    if (ok) prompt.onDone?.();
+    setCharSyncChoices({});
+    if (ok) {
+      // Patch v4.25：真的改了作品角色档案，重新拉一次 TTS 配置，
+      // 让「本句配音」下拉立刻反映新的规范名/别名。
+      if (syncUpdates.length > 0) {
+        await reloadSeriesTts();
+      }
+      prompt.onDone?.();
+    }
   };
 
   /** Patch v4.23：确认框「按建议统一为规范名并保存」——后端归一后落盘。 */
@@ -1412,6 +2215,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     setCharPrompt({ ...prompt, busy: true });
     const ok = await persistBeats(prompt.beats, prompt.triggerFromStage5, true);
     setCharPrompt(null);
+    setCharSyncChoices({});
     if (ok) prompt.onDone?.();
   };
 
@@ -1523,6 +2327,8 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         // Patch v4.23：先只读检查角色名写法，有告警就停下来让用户确认。
         const warnings = await checkCharacters(beats);
         if (warnings.length > 0) {
+          // Patch v4.25：每次弹窗都从「不改档案」开始。
+          setCharSyncChoices({});
           setCharPrompt({
             warnings,
             beats,
@@ -1595,6 +2401,49 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     return () => window.removeEventListener('beforeunload', handler);
   }, [tableDirty]);
 
+  /**
+   * Patch v4.25：审核台快捷键。
+   *
+   * - Cmd/Ctrl+S      → 保存解说稿
+   * - Cmd/Ctrl+Shift+S→ 保存并从 Stage 5 重跑配音
+   * - Esc             → 关掉角色名写法确认弹窗
+   *
+   * 焦点在输入框里也要拦（否则 Cmd+S 会变成浏览器「保存网页」）；
+   * 有应用内弹窗遮挡、或正在保存 / 预检时不抢快捷键。
+   * 大图弹窗（PanelZoomModal）自己处理 Cmd/Ctrl+S，这里要让开，避免保存两次。
+   */
+  useEffect(() => {
+    if (activeTab !== 'script') return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      const key = event.key.toLowerCase();
+      if ((event.metaKey || event.ctrlKey) && !event.altKey && key === 's') {
+        if (zoomBeatId) return;
+        event.preventDefault();
+        if (charPrompt || regenerateTarget || resetTarget || cleanupConfirm) return;
+        if (savingBeats || characterCheckBusy) return;
+        void handleSaveBeats(event.shiftKey);
+        return;
+      }
+      if (key === 'escape' && charPrompt && !charPrompt.busy) {
+        event.preventDefault();
+        setCharPrompt(null);
+        setCharSyncChoices({});
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [
+    activeTab,
+    charPrompt,
+    regenerateTarget,
+    resetTarget,
+    cleanupConfirm,
+    savingBeats,
+    characterCheckBusy,
+    zoomBeatId,
+    handleSaveBeats,
+  ]);
+
   /** Patch v4.12：本话是否已有真实配音（S5 完成即可按 beat_id 回源 WAV）。 */
   const isTtsReady =
     episode.stages.find((stage) => stage.id === 's5_tts')?.status === 'done';
@@ -1622,7 +2471,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     };
   }, [episode.episode_id]);
 
-  const handlePreviewAudio = (beatId: string) => {
+  const handlePreviewAudio = useCallback((beatId: string) => {
     // Patch v4.12：只要这一句在清单里有真实时长，就优先播放后端 WAV；
     // 否则退回提示音（S5 未跑或该句尚未合成）。
     const beatAudioMs =
@@ -1682,7 +2531,90 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     setTimeout(() => {
       setPlayingBeatId((cur) => (cur === beatId ? null : cur));
     }, 1200);
-  };
+  }, [episode.episode_id, episode.beats, isTtsReady, playingBeatId, audioRevision, stopPreviewAudio]);
+
+  // ── Patch v4.25：审核表行的稳定回调 ──────────────────────────────────────
+  /**
+   * 审核表每一行都是 memo 子组件，回调引用一变整表都会重绘；
+   * 这里统一用 useCallback 固定住，并从 draftBeatsRef 里取当前这一句的最新值。
+   */
+  const handleRowChangeText = useCallback(
+    (beatId: string, key: 'narration_text' | 'tts_text', value: string) => {
+      updateBeatField(beatId, key, value);
+    },
+    [updateBeatField]
+  );
+
+  const handleRowChangeRole = useCallback(
+    (beatId: string, nextRole: string) => {
+      const beat = draftBeatsRef.current.find((b) => b.beat_id === beatId);
+      if (!beat) return;
+      const patch = speakerRolePatchOf(beat, nextRole, seriesTts);
+      (Object.keys(patch) as Array<keyof ScriptBeat>).forEach((key) => {
+        updateBeatField(beatId, key, patch[key] as ScriptBeat[typeof key]);
+      });
+    },
+    [updateBeatField, seriesTts]
+  );
+
+  const handleRowNudgeSpeed = useCallback(
+    (beatId: string, delta: number) => {
+      const beat = draftBeatsRef.current.find((b) => b.beat_id === beatId);
+      if (!beat) return;
+      const base = beat.speed_override ?? roleSpeedForBeatOf(beat, seriesTts);
+      const next = Math.min(2, Math.max(0.5, Math.round((base + delta) * 100) / 100));
+      updateBeatField(beatId, 'speed_override', next);
+    },
+    [updateBeatField, seriesTts]
+  );
+
+  const handleRowResetSpeed = useCallback(
+    (beatId: string) => updateBeatField(beatId, 'speed_override', null),
+    [updateBeatField]
+  );
+
+  const handleRowChangeMotion = useCallback(
+    (beatId: string, motion: CameraMotion) =>
+      updateBeatField(beatId, 'motion', motion),
+    [updateBeatField]
+  );
+
+  const handleRowChangePause = useCallback(
+    (beatId: string, ms: number) => updateBeatField(beatId, 'pause_after_ms', ms),
+    [updateBeatField]
+  );
+
+  const handleRowChangePanel = useCallback(
+    (beatId: string, panelId: string) =>
+      updateBeatField(beatId, 'target_panel_ids', [panelId]),
+    [updateBeatField]
+  );
+
+  const handleRowChangeScene = useCallback(
+    (beatId: string, sceneId: string | null) =>
+      updateBeatField(beatId, 'scene_id', sceneId),
+    [updateBeatField]
+  );
+
+  const handleRowToggleTagPicker = useCallback((beatId: string) => {
+    setTagPickerBeatId((prev) => (prev === beatId ? null : beatId));
+  }, []);
+
+  const handleRowPickTag = useCallback(
+    (beatId: string, snippet: string) => {
+      const beat = draftBeatsRef.current.find((b) => b.beat_id === beatId);
+      if (beat) insertTtsTag(beat, snippet);
+    },
+    [insertTtsTag]
+  );
+
+  const handleRowRegenerate = useCallback(
+    (beatId: string) => {
+      stopPreviewAudio();
+      setRegenerateTarget(beatId);
+    },
+    [stopPreviewAudio]
+  );
 
   const stageProgressRatio =
     totalSimDurationMs > 0 && currentVideoSegment
@@ -2343,6 +3275,25 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                 )}
                 补全各幕配乐建议
               </button>
+              {/* Patch v4.25：默认按幕折叠，这里给出「展开全部 / 全部折叠」快捷入口。 */}
+              <button
+                type="button"
+                onClick={expandAllScenes}
+                title="展开全部幕，逐句审核解说与多音字"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <ChevronDown className="w-3.5 h-3.5" />
+                展开全部
+              </button>
+              <button
+                type="button"
+                onClick={collapseAllScenes}
+                title="全部折叠，只保留幕标题与要点"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <ChevronRight className="w-3.5 h-3.5" />
+                全部折叠
+              </button>
               {tableDirty && (
                 <span className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg whitespace-nowrap shrink-0">
                   <AlertCircle className="w-3.5 h-3.5" />
@@ -2351,7 +3302,12 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
               )}
               <button
                 type="button"
-                disabled={savingBeats}
+                disabled={savingBeats || characterCheckBusy}
+                title={
+                  characterCheckBusy
+                    ? '正在预检角色名写法，请稍候…'
+                    : '保存解说稿（Cmd/Ctrl+S）'
+                }
                 onClick={() => void handleSaveBeats(false)}
                 className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium rounded-lg whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed ${
                   tableDirty
@@ -2368,7 +3324,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
               </button>
               <button
                 type="button"
-                disabled={savingBeats}
+                disabled={savingBeats || characterCheckBusy}
                 onClick={() => void handleSaveBeats(true)}
                 className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
               >
@@ -2477,16 +3433,20 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                         key={p.panel_id}
                         type="button"
                         onClick={() => setSelectedPanelId(p.panel_id)}
-                        className={`w-full text-left p-2.5 rounded-lg border flex items-start gap-3 transition-colors cursor-pointer ${
+                        className={`w-full text-left p-2.5 rounded-lg border flex items-start gap-3 transition-colors cursor-pointer [content-visibility:auto] [contain-intrinsic-size:88px] ${
                           isSelected
                             ? 'border-blue-600 bg-blue-50/40'
                             : 'border-slate-200 hover:bg-slate-50'
                         } ${p.is_transition_blank ? 'opacity-50' : ''}`}
                       >
+                        {/* Patch v4.25：缩略图走 ?w=180，并让浏览器懒加载；
+                            容器用 content-visibility:auto，200~300 张也不会一次性解码。 */}
                         <img
-                          src={p.image_url}
+                          src={panelThumbUrl(p.image_url, 180)}
                           alt={p.panel_id}
                           referrerPolicy="no-referrer"
+                          loading="lazy"
+                          decoding="async"
                           className="w-16 h-20 object-cover rounded border border-slate-200 shrink-0"
                         />
                         <div className="min-w-0 flex-1">
@@ -2616,6 +3576,8 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
               <div className="space-y-5">
                 {beatSceneGroups.map((group) => {
                   const scene = group.scene;
+                  // Patch v4.25：这一幕当前是否展开（折叠态不挂载表格 DOM）。
+                  const isExpanded = expandedSceneKeys.has(group.key);
                   const sceneDurationMs = group.beats.reduce(
                     (sum, beat) => sum + (beat.audio_duration_ms || 0),
                     0
@@ -2638,40 +3600,77 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                       key={group.key}
                       className="bg-white border border-slate-200 rounded-xl overflow-hidden"
                     >
-                      {scene && (
-                        <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-3 border-b border-slate-100 bg-slate-50/60">
-                          <span className="inline-flex items-center justify-center min-w-[3.5rem] px-2 py-1 rounded-md bg-slate-900 text-white text-xs font-semibold">
-                            第 {scene.scene_index} 幕
-                          </span>
-                          <div className="min-w-[10rem]">
-                            <p className="text-sm font-semibold text-slate-800">
-                              {scene.title || '未命名幕'}
-                              {scene.location && (
-                                <span className="ml-2 text-xs font-normal text-slate-500">
-                                  · {scene.location}
-                                </span>
-                              )}
-                            </p>
-                            <p className="text-[11px] text-slate-500">
-                              {group.beats.length} 句 · 配音合计{' '}
-                              {(sceneDurationMs / 1000).toFixed(1)}s
-                            </p>
-                          </div>
-                          {(scene.bgm_mood || scene.bgm_suggestion) && (
-                            <span
-                              className="inline-flex items-center gap-1.5 rounded-full border border-violet-200 bg-violet-50 px-2.5 py-1 text-[11px] text-violet-700 max-w-[24rem]"
-                              title={scene.bgm_suggestion}
-                            >
-                              <Music className="h-3.5 w-3.5 shrink-0" />
-                              {scene.bgm_mood && (
-                                <span className="font-medium shrink-0">{scene.bgm_mood}</span>
-                              )}
-                              {scene.bgm_suggestion && (
-                                <span className="truncate">{scene.bgm_suggestion}</span>
-                              )}
-                            </span>
+                      {/* Patch v4.25：幕头部兼折叠开关。
+                          折叠态只渲染这一行（<table> / <tr> 完全不挂载），
+                          200~300 分镜的一话才不会在打开审核台时卡住。 */}
+                      <div
+                        role="button"
+                        tabIndex={0}
+                        aria-expanded={isExpanded}
+                        onClick={() => toggleScene(group.key)}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter' || event.key === ' ') {
+                            event.preventDefault();
+                            toggleScene(group.key);
+                          }
+                        }}
+                        title={isExpanded ? '点击收起本幕' : '点击展开本幕'}
+                        className="flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-3 border-b border-slate-100 bg-slate-50/60 cursor-pointer hover:bg-slate-100/70"
+                      >
+                        <span className="inline-flex items-center justify-center w-5 h-5 rounded text-slate-500">
+                          {isExpanded ? (
+                            <ChevronDown className="h-4 w-4" />
+                          ) : (
+                            <ChevronRight className="h-4 w-4" />
                           )}
-                          <div className="flex items-center gap-2 ml-auto">
+                        </span>
+                        <span className="inline-flex items-center justify-center min-w-[3.5rem] px-2 py-1 rounded-md bg-slate-900 text-white text-xs font-semibold">
+                          {scene ? `第 ${scene.scene_index} 幕` : '未归幕'}
+                        </span>
+                        <div className="min-w-[10rem]">
+                          <p className="text-sm font-semibold text-slate-800">
+                            {scene ? scene.title || '未命名幕' : '未归幕的解说句'}
+                            {scene?.location && (
+                              <span className="ml-2 text-xs font-normal text-slate-500">
+                                · {scene.location}
+                              </span>
+                            )}
+                          </p>
+                          <p className="text-[11px] text-slate-500">
+                            {group.beats.length} 句 · 配音合计{' '}
+                            {(sceneDurationMs / 1000).toFixed(1)}s
+                          </p>
+                        </div>
+                        {/* Patch v4.25：这一幕还有没落盘的改动，折叠时也能看到。 */}
+                        {dirtySceneKeys.has(group.key) && (
+                          <span
+                            className="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[11px] text-amber-700 whitespace-nowrap"
+                            title="这一幕有未保存的改动"
+                          >
+                            未保存
+                          </span>
+                        )}
+                        {scene && (scene.bgm_mood || scene.bgm_suggestion) && (
+                          <span
+                            className="inline-flex items-center gap-1.5 rounded-full border border-violet-200 bg-violet-50 px-2.5 py-1 text-[11px] text-violet-700 max-w-[24rem]"
+                            title={scene.bgm_suggestion}
+                          >
+                            <Music className="h-3.5 w-3.5 shrink-0" />
+                            {scene.bgm_mood && (
+                              <span className="font-medium shrink-0">{scene.bgm_mood}</span>
+                            )}
+                            {scene.bgm_suggestion && (
+                              <span className="truncate">{scene.bgm_suggestion}</span>
+                            )}
+                          </span>
+                        )}
+                        {scene && (
+                          // Patch v4.25：点 BGM 控件不能顺手把幕折叠掉。
+                          <div
+                            className="flex items-center gap-2 ml-auto"
+                            onClick={(event) => event.stopPropagation()}
+                            onKeyDown={(event) => event.stopPropagation()}
+                          >
                             <select
                               value={scene.bgm ?? ''}
                               disabled={sceneBgmSavingId === scene.scene_id}
@@ -2731,409 +3730,65 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                               <Loader2 className="h-4 w-4 animate-spin text-blue-600" />
                             )}
                           </div>
+                        )}
+                      </div>
+                      {isExpanded && (
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-left border-collapse">
+                            <thead>
+                              <tr className="bg-slate-50 border-b border-slate-200 text-xs font-medium text-slate-500">
+                                <th className="py-3 pl-5 pr-2 w-20">分镜</th>
+                                <th className="py-3 px-3 min-w-[260px]">
+                                  字幕原文 (narration_text · 屏幕显示)
+                                </th>
+                                <th className="py-3 px-3 min-w-[220px]">
+                                  TTS 送音文本（整句 · 不改字幕）
+                                </th>
+                                <th className="py-3 px-3 min-w-[185px]">
+                                  配音角色与语速
+                                </th>
+                                <th className="py-3 px-3 w-36">运镜与停顿</th>
+                                <th className="py-3 pl-3 pr-5 w-32 text-right">试听 / 插入 / 删</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-100 text-xs align-top">
+                              {group.beats.map((beat) => (
+                                <ScriptBeatRow
+                                  key={beat.beat_id}
+                                  beat={beat}
+                                  panel={panelMap.get(beat.target_panel_ids[0])}
+                                  panelOptions={panelOptions}
+                                  sceneOptions={sceneOptions}
+                                  rules={rules}
+                                  ttsModel={config.ttsModel}
+                                  seriesTts={seriesTts}
+                                  roleNames={roleNames}
+                                  regenerateEnabled={regenerateEnabled}
+                                  playingBeatId={playingBeatId}
+                                  tagPickerOpen={tagPickerBeatId === beat.beat_id}
+                                  ttsTextareaRefs={ttsTextareaRefs}
+                                  ttsSelections={ttsSelections}
+                                  onChangeText={handleRowChangeText}
+                                  onChangeRole={handleRowChangeRole}
+                                  onNudgeSpeed={handleRowNudgeSpeed}
+                                  onResetSpeed={handleRowResetSpeed}
+                                  onChangeMotion={handleRowChangeMotion}
+                                  onChangePause={handleRowChangePause}
+                                  onChangePanel={handleRowChangePanel}
+                                  onChangeScene={handleRowChangeScene}
+                                  onToggleTagPicker={handleRowToggleTagPicker}
+                                  onPickTag={handleRowPickTag}
+                                  onPreview={handlePreviewAudio}
+                                  onRegenerate={handleRowRegenerate}
+                                  onInsert={handleInsertBeat}
+                                  onDelete={handleDeleteBeat}
+                                  onZoom={setZoomBeatId}
+                                />
+                              ))}
+                            </tbody>
+                          </table>
                         </div>
                       )}
-                      <div className="overflow-x-auto">
-                        <table className="w-full text-left border-collapse">
-                          <thead>
-                            <tr className="bg-slate-50 border-b border-slate-200 text-xs font-medium text-slate-500">
-                              <th className="py-3 pl-5 pr-2 w-20">分镜</th>
-                              <th className="py-3 px-3 min-w-[260px]">
-                                字幕原文 (narration_text · 屏幕显示)
-                              </th>
-                              <th className="py-3 px-3 min-w-[220px]">
-                                TTS 送音文本（整句 · 不改字幕）
-                              </th>
-                              <th className="py-3 px-3 min-w-[185px]">
-                                配音角色与语速
-                              </th>
-                              <th className="py-3 px-3 w-36">运镜与停顿</th>
-                              <th className="py-3 pl-3 pr-5 w-32 text-right">试听 / 插入 / 删</th>
-                            </tr>
-                          </thead>
-                          <tbody className="divide-y divide-slate-100 text-xs align-top">
-                            {group.beats.map((beat) => {
-                              const panel = episode.panels.find(
-                                (p) => p.panel_id === beat.target_panel_ids[0]
-                              );
-                              const { spokenText, matchedRules } = resolveSpokenText(beat, rules);
-                              const voiceInfo = beatVoiceInfo(beat);
-                              const roleOptions = roleOptionsFor(beat);
-                              const charLen = beat.narration_text.trim().length;
-                              const isLengthWarn = charLen < 8 || charLen > 30;
-                              return (
-                                <tr key={beat.beat_id} className="hover:bg-slate-50/50">
-                          <td className="py-3.5 pl-5 pr-2">
-                            <div className="space-y-1.5">
-                              <div className="font-mono-tabular font-semibold text-slate-700">
-                                {beat.beat_id}
-                              </div>
-                              {panel && (
-                                <button
-                                  type="button"
-                                  onClick={() => setZoomBeatId(beat.beat_id)}
-                                  title="放大查看分镜并编辑字幕原文"
-                                  aria-label={`放大查看 ${panel.panel_id} 并编辑字幕原文`}
-                                  className="block w-12 h-16 rounded border border-slate-200 overflow-hidden hover:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/40 cursor-pointer transition-colors"
-                                >
-                                  <img
-                                    src={panel.image_url}
-                                    alt={panel.panel_id}
-                                    referrerPolicy="no-referrer"
-                                    className="w-12 h-16 object-cover"
-                                  />
-                                </button>
-                              )}
-                              <select
-                                value={beat.target_panel_ids[0]}
-                                onChange={(e) =>
-                                  updateBeatField(beat.beat_id, 'target_panel_ids', [
-                                    e.target.value,
-                                  ])
-                                }
-                                className="w-16 px-1 py-0.5 text-[11px] font-mono-tabular bg-white border border-slate-200 rounded"
-                              >
-                                {episode.panels.map((p) => (
-                                  <option key={p.panel_id} value={p.panel_id}>
-                                    {p.panel_id}
-                                  </option>
-                                ))}
-                              </select>
-                              {/* Patch v4.13：归属幕与分镜解耦，这里单独指定这一句讲哪一幕。 */}
-                              {storyboardScenes.length > 0 && (
-                                <select
-                                  value={beat.scene_id ?? ''}
-                                  onChange={(e) =>
-                                    updateBeatField(
-                                      beat.beat_id,
-                                      'scene_id',
-                                      e.target.value === '' ? null : e.target.value
-                                    )
-                                  }
-                                  title="这一句归属哪一幕（留空＝按分镜自动回退）"
-                                  aria-label={`${beat.beat_id} 归属幕`}
-                                  className="w-24 px-1 py-0.5 text-[11px] bg-white border border-slate-200 rounded"
-                                >
-                                  <option value="">自动</option>
-                                  {storyboardScenes.map((scene) => (
-                                    <option key={scene.scene_id} value={scene.scene_id}>
-                                      {scene.scene_index}. {scene.title || scene.scene_id}
-                                    </option>
-                                  ))}
-                                </select>
-                              )}
-                            </div>
-                          </td>
-
-                          <td className="py-3.5 px-3">
-                            <textarea
-                              rows={2}
-                              value={beat.narration_text}
-                              onChange={(e) =>
-                                updateBeatField(beat.beat_id, 'narration_text', e.target.value)
-                              }
-                              className="w-full p-2 text-xs text-slate-900 bg-white border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600 resize-none"
-                            />
-                            <div className="flex items-center justify-between mt-1 text-[11px] font-mono-tabular">
-                              <span className={isLengthWarn ? 'text-amber-600' : 'text-slate-400'}>
-                                {charLen} 字（建议 10–28 字）
-                              </span>
-                              <span className="text-slate-400">
-                                时长 {(beat.audio_duration_ms / 1000).toFixed(2)}s
-                              </span>
-                            </div>
-                          </td>
-
-                          <td className="py-3.5 px-3">
-                            <div className="relative">
-                              <div className="mb-1 flex items-center justify-between gap-2">
-                                <span className="text-[10px] text-slate-400">
-                                  标签只写送音文本，字幕不受影响
-                                </span>
-                                {/* Patch v4.14：语气词 / 句中停顿标签浮层入口。 */}
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    setTagPickerBeatId((prev) =>
-                                      prev === beat.beat_id ? null : beat.beat_id
-                                    )
-                                  }
-                                  aria-label={`${beat.beat_id} 插入语气或停顿标签`}
-                                  title="插入 MiniMax 语气词（如 (laughs)）或句中停顿（如 <#0.5#>）"
-                                  className="rounded-md border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-600 hover:border-blue-400 hover:text-blue-700 transition-colors"
-                                >
-                                  + 语气 / 停顿标签
-                                </button>
-                              </div>
-                              <textarea
-                                rows={2}
-                                value={beat.tts_text}
-                                ref={(el) => {
-                                  ttsTextareaRefs.current[beat.beat_id] = el;
-                                }}
-                                onSelect={(e) => {
-                                  const el = e.currentTarget;
-                                  ttsSelections.current[beat.beat_id] = {
-                                    start: el.selectionStart,
-                                    end: el.selectionEnd,
-                                  };
-                                }}
-                                onClick={(e) => {
-                                  const el = e.currentTarget;
-                                  ttsSelections.current[beat.beat_id] = {
-                                    start: el.selectionStart,
-                                    end: el.selectionEnd,
-                                  };
-                                }}
-                                onKeyUp={(e) => {
-                                  const el = e.currentTarget;
-                                  ttsSelections.current[beat.beat_id] = {
-                                    start: el.selectionStart,
-                                    end: el.selectionEnd,
-                                  };
-                                }}
-                                onBlur={(e) => {
-                                  const el = e.currentTarget;
-                                  ttsSelections.current[beat.beat_id] = {
-                                    start: el.selectionStart,
-                                    end: el.selectionEnd,
-                                  };
-                                }}
-                                onChange={(e) =>
-                                  updateBeatField(beat.beat_id, 'tts_text', e.target.value)
-                                }
-                                placeholder="留空则自动继承字幕 + 词典替换；填写时必须是整句送音文本..."
-                                className="w-full p-2 text-xs text-slate-800 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600 resize-none"
-                              />
-                              {tagPickerBeatId === beat.beat_id && (
-                                <div
-                                  data-tts-tag-popover
-                                  className="absolute right-0 top-full z-40 mt-1"
-                                >
-                                  <TtsTagPicker
-                                    value={beat.tts_text ?? ''}
-                                    selection={ttsSelections.current[beat.beat_id] ?? null}
-                                    ttsModel={config.ttsModel}
-                                    onPick={(snippet) => insertTtsTag(beat, snippet)}
-                                    onClose={() => setTagPickerBeatId(null)}
-                                  />
-                                </div>
-                              )}
-                            </div>
-                            <div className="mt-1 text-[11px] text-slate-500 leading-snug">
-                              {matchedRules.length > 0 ? (
-                                <span className="text-blue-700">
-                                  词典命中：{matchedRules.map((r) => `${r.source}→${r.replacement}`).join('、')}
-                                  {' · '}实际送音：{spokenText}
-                                </span>
-                              ) : (
-                                <span className="text-slate-400">无词典替换 · 直接按字幕语义合成</span>
-                              )}
-                            </div>
-                          </td>
-
-                          <td className="py-3.5 px-3">
-                            {/* Patch v4.18：移除情绪指令输入框——情绪指令不再由前端设置，
-                                合成侧固定使用后端契约里的默认/继承值。 */}
-                            <div className="text-[11px] font-mono-tabular text-slate-400">
-                              {config.ttsModel}
-                            </div>
-                            {/* Patch v3.4：显示「本句配音」（角色 + 音色），并可就地改角色。 */}
-                            <div className="mt-1.5 space-y-1">
-                              <div className="text-[11px] leading-snug text-slate-600">
-                                本句配音：{voiceInfo.label} · {voiceInfo.voice} ·{' '}
-                                {voiceInfo.speed.toFixed(2)}x
-                                {voiceInfo.pending && (
-                                  <span className="text-amber-600">（保存重跑后生效）</span>
-                                )}
-                                {voiceInfo.speedOverridden && (
-                                  <span className="text-slate-400">
-                                    （已微调，默认 {voiceInfo.roleSpeed.toFixed(2)}x）
-                                  </span>
-                                )}
-                              </div>
-                              <select
-                                value={beat.speaker_role ?? ''}
-                                onChange={(e) => {
-                                  const nextRole = e.target.value;
-                                  // 与弹窗走同一套规则：同步 speaker_gender（空值重置 unknown）、
-                                  // 清空 voice_override。
-                                  const patch = speakerRolePatch(beat, nextRole);
-                                  (Object.keys(patch) as Array<keyof ScriptBeat>).forEach(
-                                    (key) => {
-                                      updateBeatField(
-                                        beat.beat_id,
-                                        key,
-                                        patch[key] as ScriptBeat[typeof key]
-                                      );
-                                    }
-                                  );
-                                }}
-                                aria-label={`${beat.beat_id} 配音角色`}
-                                className="w-full px-2 py-1 text-[11px] bg-white border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
-                              >
-                                {roleOptions.map((option) => (
-                                  <option
-                                    key={option.value || '__none__'}
-                                    value={option.value}
-                                  >
-                                    {option.label}
-                                  </option>
-                                ))}
-                              </select>
-                              {voiceInfo.hint && (
-                                <div className="text-[10px] leading-snug text-slate-400">
-                                  {voiceInfo.hint}
-                                </div>
-                              )}
-                              {/* Patch v4.13：表格行紧凑语速微调（-/+ 步进 + 数字 + 恢复默认）。 */}
-                              <div className="flex items-center gap-1 text-[11px] font-mono-tabular">
-                                <span className="text-slate-400">语速</span>
-                                <button
-                                  type="button"
-                                  onClick={() => nudgeBeatSpeed(beat, -0.02)}
-                                  aria-label={`${beat.beat_id} 语速降低`}
-                                  className="w-5 h-5 rounded border border-slate-200 bg-white text-slate-600 leading-none hover:border-slate-400 hover:text-slate-900"
-                                >
-                                  −
-                                </button>
-                                <span
-                                  className={`w-12 text-center ${
-                                    voiceInfo.speedOverridden
-                                      ? 'text-blue-700 font-semibold'
-                                      : 'text-slate-500'
-                                  }`}
-                                  title={
-                                    voiceInfo.speedOverridden
-                                      ? `已逐句微调，角色默认 ${voiceInfo.roleSpeed.toFixed(2)}x`
-                                      : `跟随角色默认 ${voiceInfo.roleSpeed.toFixed(2)}x`
-                                  }
-                                >
-                                  {voiceInfo.speed.toFixed(2)}x
-                                </span>
-                                <button
-                                  type="button"
-                                  onClick={() => nudgeBeatSpeed(beat, 0.02)}
-                                  aria-label={`${beat.beat_id} 语速提高`}
-                                  className="w-5 h-5 rounded border border-slate-200 bg-white text-slate-600 leading-none hover:border-slate-400 hover:text-slate-900"
-                                >
-                                  +
-                                </button>
-                                {voiceInfo.speedOverridden && (
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      updateBeatField(beat.beat_id, 'speed_override', null)
-                                    }
-                                    aria-label={`${beat.beat_id} 语速恢复默认`}
-                                    title="恢复为角色默认语速"
-                                    className="rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-500 hover:border-slate-400 hover:text-slate-800"
-                                  >
-                                    恢复默认
-                                  </button>
-                                )}
-                              </div>
-                            </div>
-                          </td>
-
-                          <td className="py-3.5 px-3 space-y-2">
-                            <select
-                              value={beat.motion}
-                              onChange={(e) =>
-                                updateBeatField(
-                                  beat.beat_id,
-                                  'motion',
-                                  e.target.value as CameraMotion
-                                )
-                              }
-                              className="w-full px-2 py-1.5 text-[11px] font-mono-tabular bg-white border border-slate-200 rounded-lg"
-                            >
-                              {Object.entries(MOTION_LABELS).map(([val, label]) => (
-                                <option key={val} value={val}>
-                                  {label}
-                                </option>
-                              ))}
-                            </select>
-
-                            <div className="flex items-center gap-1.5">
-                              <span className="text-[11px] text-slate-500 whitespace-nowrap">
-                                停顿ms
-                              </span>
-                              <input
-                                type="number"
-                                step={50}
-                                min={0}
-                                max={2000}
-                                value={beat.pause_after_ms}
-                                onChange={(e) =>
-                                  updateBeatField(
-                                    beat.beat_id,
-                                    'pause_after_ms',
-                                    // Patch v4.8：整数 + 0~2000ms 钳位，避免越界值让时间轴算崩。
-                                    Math.max(
-                                      0,
-                                      Math.min(2000, Math.round(Number(e.target.value) || 0))
-                                    )
-                                  )
-                                }
-                                className="w-full px-2 py-1 text-[11px] font-mono-tabular bg-white border border-slate-200 rounded"
-                              />
-                            </div>
-                          </td>
-
-                          <td className="py-3.5 pl-3 pr-5 text-right">
-                            <div className="flex items-center justify-end gap-1.5">
-                              <button
-                                type="button"
-                                onClick={() => handlePreviewAudio(beat.beat_id)}
-                                className={`inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border text-[11px] font-medium whitespace-nowrap shrink-0 cursor-pointer transition-colors ${
-                                  playingBeatId === beat.beat_id
-                                    ? 'border-blue-600 bg-blue-50 text-blue-700'
-                                    : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
-                                }`}
-                              >
-                                <Volume2 className="w-3.5 h-3.5" />
-                                {playingBeatId === beat.beat_id ? '试听中' : '试听'}
-                              </button>
-                              {regenerateEnabled && (
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    stopPreviewAudio();
-                                    setRegenerateTarget(beat.beat_id);
-                                  }}
-                                  title="只重新合成这一句的配音，其它句子不受影响"
-                                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border text-[11px] font-medium whitespace-nowrap shrink-0 cursor-pointer transition-colors border-slate-200 bg-white text-slate-700 hover:bg-amber-50 hover:border-amber-300 hover:text-amber-700"
-                                >
-                                  <RotateCcw className="w-3.5 h-3.5" />
-                                  重配
-                                </button>
-                              )}
-                              <button
-                                type="button"
-                                onClick={() => handleInsertBeat(beat.beat_id)}
-                                title="在本格之后插入一条解说句"
-                                aria-label={`在 ${beat.beat_id} 之后插入解说句`}
-                                className="p-1.5 text-slate-400 hover:text-blue-600 cursor-pointer"
-                              >
-                                <Plus className="w-3.5 h-3.5" />
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => handleDeleteBeat(beat.beat_id)}
-                                aria-label={`删除 ${beat.beat_id}`}
-                                className="p-1.5 text-slate-400 hover:text-red-600 cursor-pointer"
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
-                            </div>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
                     </section>
                   );
                 })}
@@ -3174,6 +3829,17 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                               <span className="truncate font-semibold">
                                 {seg.beat.target_panel_ids.join('+')}
                               </span>
+                              {/* Patch v4.25：时间轴也用 ?w=140 缩略图，别再拉原图。 */}
+                              {seg.panel?.image_url && (
+                                <img
+                                  src={panelThumbUrl(seg.panel.image_url, 140)}
+                                  alt={seg.beat.target_panel_ids.join('+')}
+                                  referrerPolicy="no-referrer"
+                                  loading="lazy"
+                                  decoding="async"
+                                  className="h-8 w-auto object-cover rounded border border-slate-200 shrink-0 ml-1"
+                                />
+                              )}
                               <span className="text-slate-400 ml-1 shrink-0">
                                 {seg.beat.motion}
                               </span>
@@ -3506,6 +4172,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         onChangeNarration={handleZoomNarrationChange}
         onChangeRole={handleZoomRoleChange}
         onChangeSpeed={handleZoomSpeedChange}
+        onQuickSave={flushSave}
       />
 
       {/* Patch v4.13：单句重配 TTS 的居中确认弹窗（禁用 window.confirm / window.alert）。 */}
@@ -3659,6 +4326,88 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                   )}
                   <div className="mt-1 text-[11px] leading-4 text-slate-500">
                     {warning.message}
+                  </div>
+                </div>
+              ))}
+            </div>
+            {/* Patch v4.25：角色档案同步选项。
+                默认全部「仅本次放行，不改档案」——用户明确勾选后，
+                「仍按我的修改保存」才会带上 sync_character_updates 提交。 */}
+            <div className="border-t border-slate-100 px-4 py-3 space-y-2">
+              <div className="flex items-baseline gap-2">
+                <p className="text-xs font-semibold text-slate-800">
+                  要不要顺手把作品角色档案一起改掉？
+                </p>
+                <p className="text-[11px] text-slate-500">
+                  默认不改档案，只放行这一次保存；勾选后按「仍按我的修改保存」才会写入作品设定。
+                </p>
+              </div>
+              {buildCharacterSyncGroups(charPrompt.warnings).length === 0 && (
+                <p className="text-[11px] text-slate-500">没有可同步的角色名写法。</p>
+              )}
+              {buildCharacterSyncGroups(charPrompt.warnings).map((group, groupIndex) => (
+                <div
+                  key={group.key}
+                  className="rounded-lg border border-slate-200 bg-white px-2.5 py-2 space-y-1.5"
+                >
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                    <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono-tabular text-slate-700">
+                      {group.found_name}
+                    </span>
+                    {group.suggested_canonical ? (
+                      <>
+                        <span className="text-slate-400">→</span>
+                        <span className="rounded bg-blue-50 px-1.5 py-0.5 font-mono-tabular text-blue-700 ring-1 ring-blue-200">
+                          {group.suggested_canonical}
+                        </span>
+                      </>
+                    ) : (
+                      <span className="text-[11px] text-slate-500">
+                        {CHARACTER_REASON_LABELS[group.reason] ?? group.reason}（没有建议名）
+                      </span>
+                    )}
+                    <span className="text-[11px] text-slate-500">
+                      涉及 {group.beatIds.length} 句
+                    </span>
+                  </div>
+                  <div className="space-y-1">
+                    <label className="flex items-start gap-2 cursor-pointer">
+                      <input
+                        type="radio"
+                        name={`char-sync-${groupIndex}`}
+                        className="mt-0.5 accent-blue-600"
+                        checked={!charSyncChoices[group.key]}
+                        onChange={() =>
+                          setCharSyncChoices((prev) => {
+                            const next = { ...prev };
+                            delete next[group.key];
+                            return next;
+                          })
+                        }
+                      />
+                      <span className="text-[11px] text-slate-700">
+                        仅本次放行，不改档案
+                      </span>
+                    </label>
+                    {group.actions.map((action) => (
+                      <label key={action} className="flex items-start gap-2 cursor-pointer">
+                        <input
+                          type="radio"
+                          name={`char-sync-${groupIndex}`}
+                          className="mt-0.5 accent-blue-600"
+                          checked={charSyncChoices[group.key] === action}
+                          onChange={() =>
+                            setCharSyncChoices((prev) => ({
+                              ...prev,
+                              [group.key]: action,
+                            }))
+                          }
+                        />
+                        <span className="text-[11px] text-slate-700">
+                          {CHARACTER_SYNC_ACTION_LABELS[action]}
+                        </span>
+                      </label>
+                    ))}
                   </div>
                 </div>
               ))}

@@ -95,9 +95,20 @@ SMALL_BUBBLE_MAX_HEIGHT_RATIO = 0.35
 TEXT_BOX_MONO_RATIO = 0.78
 #: 独白框向下吸附的最大白边间距（相对宽度）：< 0.25 * img_width。
 TEXT_BOX_MERGE_GAP_RATIO = 0.25
-#: 合并后总高度上限（相对宽度）：合并后 <= 1.65 * img_width。
+#: 合并后总高度上限（相对宽度）：合并后 <= 3.6 * img_width。
 #: Patch 6 铁律：超过该上限严禁合并，保证成片「一幕一画面」，绝不双景粘连。
-TEXT_BOX_MERGE_MAX_HEIGHT_RATIO = 1.65
+#: Patch v4.25：1.65 → 3.6。原上限把「690x1732 的高瘦人物格 + 上方 ~400px 气泡」
+#: 这种组合判成「双景粘连」而拒绝合并，导致顶部悬空气泡被切离人物格单独成图；
+#: 实际合并高度仍有绝对上限（MAX_ATOMIC_BLOCK_HEIGHT）兜底。
+TEXT_BOX_MERGE_MAX_HEIGHT_RATIO = 3.6
+#: 连续吸收多个纯文本框时，被吸收文本块自身的累计高度上限（相对宽度）：
+#: 超过 1.0 * img_width 就停止继续串并，避免把一长串独白框全吸进同一张 Panel。
+TEXT_BOX_STACK_MAX_HEIGHT_RATIO = 1.0
+#: 高瘦「纯背景无外框气泡」的高度上限（相对宽度）：height < 0.80 * img_width。
+#: Patch v4.25：顶部悬空气泡常被页面留白拉高，不再受 0.35 的矮独白框上限约束。
+MONO_BUBBLE_MAX_HEIGHT_RATIO = 0.80
+#: 高瘦气泡的单色背景像素占比阈值（> 82% 视为纯背景气泡）。
+MONO_BUBBLE_MIN_RATIO = 0.82
 #: 判定「封闭漫画外框线」时，横向/纵向笔画需要覆盖整边的比例。
 CLOSED_FRAME_COVERAGE = 0.9
 #: 「纯白带」的亮度下限：行均值低于该值，即便完全平坦也不算白带。
@@ -648,6 +659,10 @@ def segment_episode(
     for temp_dir in (staging_dir, trash_dir):
         if temp_dir.exists():
             shutil.rmtree(temp_dir, ignore_errors=True)
+    # Patch v4.25：重切图时顺手清掉旧缩略图缓存。
+    # 缩略图按「原图文件名 + 宽度」缓存，重切后原图内容已变，
+    # 旧缩略图会被前端继续当成新面板的预览图（画面与分镜对不上）。
+    shutil.rmtree(target_dir / ".thumbs", ignore_errors=True)
     staging_dir.mkdir(parents=True, exist_ok=True)
     trash_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1146,6 +1161,43 @@ def cut_atomic_blocks(
     return blocks
 
 
+def _has_sparse_high_contrast_text(gray: np.ndarray, mode_value: int) -> bool:
+    """块内是否存在「稀疏但高反差」的文字墨迹（Patch v4.25）。
+
+    白底黑框 / 黑底白字的气泡正文在整块里占比极低（不到 6% 的偏离像素），
+    :func:`is_contentless_panel` 会把它判成空镜。但它**确实有字**，
+    不能当空页丢掉（丢掉后气泡会被切走、或整页被当成空白过渡页）。
+
+    判据（全满足才算有字）：
+
+    1. 高度 >= 48px —— 太高太矮都不像一行字；
+    2. 底色极端：亮底（``mode_value >= 200``）看深色墨迹（``gray <= 128``），
+       暗底（``mode_value <= 50``）看亮色文字（``gray >= 190``），
+       中间调底色一律不算（避免把灰底场景图的噪点当文字）；
+    3. 墨迹至少跨越 12 行（每行只要有 1 个墨迹像素即计入）；
+    4. 至少 4 行的 Canny 边缘密度 >= ``DARK_SCENE_LOCAL_EDGE_MIN``——
+       文字笔画自带边缘，纯色噪点没有。
+
+    **严禁**改成调用 :func:`_has_local_structure`：那道判据是为「深黑底 +
+    高亮对白框」设计的，会把短黑页救回来，破坏既有空镜判定红线。
+    """
+    if gray is None or gray.size == 0 or gray.ndim != 2:
+        return False
+    height = int(gray.shape[0])
+    if height < 48:
+        return False
+    if mode_value >= 200:
+        ink_mask = gray <= 128
+    elif mode_value <= 50:
+        ink_mask = gray >= 190
+    else:
+        return False
+    if int(ink_mask.any(axis=1).sum()) < 12:
+        return False
+    edge_rows = int((canny_edge_density(gray) >= DARK_SCENE_LOCAL_EDGE_MIN).sum())
+    return edge_rows >= 4
+
+
 def is_contentless_panel(
     block_bgr: np.ndarray,
     *,
@@ -1161,6 +1213,10 @@ def is_contentless_panel(
     这类页面过去会被当成正常分镜送进 VLM、再被写成一段「纯黑如墨吸走呼吸」
     的废话旁白，成片里表现为「白屏空等 3 秒」。现在它们会被标记
     ``is_transition_blank``，Stage 4 直接过滤，不再进剧情池。
+
+    Patch v4.25：白底黑框 / 黑底白字的**稀疏气泡**像素占比同样很低，
+    会被误判成空镜。现在加一道 :func:`_has_sparse_high_contrast_text` 保护：
+    确实有字的气泡一律不算空镜。
     """
     if block_bgr.size == 0:
         return True
@@ -1171,6 +1227,8 @@ def is_contentless_panel(
     mode_value = mode_level * 16 + 8
     deviation = np.abs(gray.astype(np.int16) - mode_value) > delta
     content_ratio = float(deviation.mean())
+    if content_ratio < ratio and _has_sparse_high_contrast_text(gray, mode_value):
+        return False
     return content_ratio < ratio
 
 
@@ -1265,21 +1323,32 @@ def is_standalone_text_box(
 
     特征 B（小尺寸悬浮气泡）：``height < 0.35 * img_width`` 且没有形成封闭漫画外框线。
 
+    Patch v4.25 新增**高瘦气泡**（纯背景、无外框）：漫画页顶部的悬空气泡常被
+    页面留白拉高（可到 ``0.8 * img_width``），此前会被 0.35 的高度上限直接
+    判成「主画格」，于是它被切离下方的高瘦人物格、单独成图。只要
+    ``height < 0.80 * img_width``、单色背景占比 > 82%、且没有封闭漫画外框线，
+    就按气泡处理（:func:`merge_standalone_text_boxes` 会把它向下吸附并入人物格）。
+
     ``orig_gap_below`` 是该块与下方主画格之间的白边间距（像素），
     合并决策在 :func:`merge_standalone_text_boxes` 中完成。
     """
     if block_bgr.size == 0 or img_width <= 0:
         return False
     height = int(block_bgr.shape[0])
-    if height >= img_width * TEXT_BOX_MAX_HEIGHT_RATIO:
-        # 太高就不是「偏扁的独白框」了，走主画格逻辑。
+    if height < img_width * TEXT_BOX_MAX_HEIGHT_RATIO:
+        # 矮独白框 / 小气泡（Patch 4 原有特征 A / B）
+        if dominant_color_ratio(block_bgr) > TEXT_BOX_MONO_RATIO:
+            return True  # 特征 A
+        if height < img_width * SMALL_BUBBLE_MAX_HEIGHT_RATIO and not has_closed_border_frame(
+            to_gray(block_bgr)
+        ):
+            return True  # 特征 B
         return False
-    if dominant_color_ratio(block_bgr) > TEXT_BOX_MONO_RATIO:
-        return True  # 特征 A
-    if height < img_width * SMALL_BUBBLE_MAX_HEIGHT_RATIO and not has_closed_border_frame(
-        to_gray(block_bgr)
-    ):
-        return True  # 特征 B
+    # Patch v4.25：高瘦纯背景气泡（无封闭外框）。
+    if height < img_width * MONO_BUBBLE_MAX_HEIGHT_RATIO and dominant_color_ratio(
+        block_bgr
+    ) > MONO_BUBBLE_MIN_RATIO and not has_closed_border_frame(to_gray(block_bgr)):
+        return True
     return False
 
 
@@ -1296,11 +1365,19 @@ def merge_standalone_text_boxes(
     ``< 0.25 * img_width``（Patch 6 收紧，原 0.50）。合并后两者连同中间留白
     合成同一张 Panel。
 
-    **Patch 6 防双景粘连铁律**：合并后总高度必须 ``<= 1.65 * img_width``，
-    否则严禁合并——宁可让独白框单独成块，也不能把两个独立镜头粘成「一幕两画面」。
+    **Patch 6 防双景粘连铁律**：合并后总高度必须 ``<= min(MAX_ATOMIC_BLOCK_HEIGHT,
+    3.6 * img_width)``，否则严禁合并——宁可让独白框单独成块，也不能把两个独立镜头
+    粘成「一幕两画面」。
 
     防误合并：像「医院走廊」这种带丰富建筑透视线条与灰阶色彩的场景图，
     单色背景占比远低于 78%，不会被判成文本框，因此仍然独立成块。
+
+    **Patch v4.25 高度上限解耦**：合并上限改为
+    ``min(MAX_ATOMIC_BLOCK_HEIGHT, 3.6 * img_width)``，让「690x1732 的高瘦人物格」
+    能向下吸附上方约 400px 的悬空气泡；同时新增**串并上限**
+    ``TEXT_BOX_STACK_MAX_HEIGHT_RATIO = 1.0``：连续向后吸收多个纯文本框时，
+    被吸收文本块自身的累计高度超过 ``1.0 * img_width`` 就停止继续串并，
+    避免把一长串独白框全吸进同一张 Panel。
     """
     if not blocks:
         return []
@@ -1314,20 +1391,31 @@ def merge_standalone_text_boxes(
         for index, (top, bottom) in enumerate(blocks)
     ]
     limit = img_width * gap_ratio
-    max_merged_height = img_width * TEXT_BOX_MERGE_MAX_HEIGHT_RATIO
+    max_merged_height = min(
+        MAX_ATOMIC_BLOCK_HEIGHT, int(img_width * TEXT_BOX_MERGE_MAX_HEIGHT_RATIO)
+    )
+    max_stack_height = img_width * TEXT_BOX_STACK_MAX_HEIGHT_RATIO
     absorbed: dict[int, int] = {}
     for index in range(len(blocks)):
         if not flags[index]:
             continue
         total_gap = 0
+        # Patch v4.25：被吸收文本块自身的累计高度（含本块）。
+        stack_height = blocks[index][1] - blocks[index][0]
         for target in range(index + 1, len(blocks)):
             total_gap += blocks[target][0] - blocks[target - 1][1]
             if not flags[target]:
                 merged_height = blocks[target][1] - blocks[index][0]
-                if total_gap < limit and merged_height <= max_merged_height:
+                if (
+                    total_gap < limit
+                    and merged_height <= max_merged_height
+                    and stack_height <= max_stack_height
+                ):
                     absorbed[index] = target
                 break
-            if total_gap >= limit:
+            # 连续文本框：累计高度超限就停止继续串并。
+            stack_height += blocks[target][1] - blocks[target][0]
+            if total_gap >= limit or stack_height > max_stack_height:
                 break
     merged: list[tuple[int, int]] = []
     index = 0

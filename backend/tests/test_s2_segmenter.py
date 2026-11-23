@@ -28,6 +28,7 @@ from stages.s2_segmenter import (
     is_blank_panel,
     list_slice_paths,
     load_blacklist_hashes,
+    merge_standalone_text_boxes,
     panels_dir_for,
     row_statistics,
     segment_episode,
@@ -731,3 +732,109 @@ def test_patch6_keeps_cross_slice_scene_and_trims_padding(tmp_path) -> None:
     # 上下白边被裁掉（每侧只留 10px 安全边距），块高明显小于原始 1200px
     assert panel.shape[0] < 1200
     assert panel.shape[0] > 320
+
+
+# --------------------------------------------------------------------------
+# Patch v4.25：高瘦纯背景气泡合并 + 稀疏气泡不判空镜
+# --------------------------------------------------------------------------
+def make_dark_bubble(
+    top: int, bottom: int, *, lines: int = 5, fill: int = 60
+) -> np.ndarray:
+    """深色纯背景气泡（无外框），内嵌多行白字。
+
+    行距刻意压到 30px：气泡内部不出现 >= 18px 的单色行带，
+    整块才会被当成**一个**原子块（而不是被空白带切碎）。
+    """
+    block = np.full((bottom - top, WIDTH, 3), fill, dtype=np.uint8)
+    step = max(1, (bottom - top) // (lines + 1))
+    for index in range(lines):
+        baseline = step * (index + 1)
+        cv2.putText(
+            block,
+            f"台词{index}",
+            (20, baseline),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2,
+        )
+    return block
+
+
+def test_patch425_tall_mono_bubble_is_recognized_as_text_box() -> None:
+    """高瘦纯背景气泡（> 0.35 宽、< 0.8 宽）也算气泡，带外框的则不算。"""
+    bubble = make_dark_bubble(0, 160)  # 160 / 320 = 0.5 宽
+    scene = make_texture(0, 160, seed=21)
+    framed = make_dark_bubble(0, 160).copy()
+    cv2.rectangle(framed, (5, 5), (WIDTH - 6, 154), (255, 255, 255), 3)
+
+    assert is_standalone_text_box(bubble, 60, WIDTH) is True
+    # 复杂纹理的场景图不是气泡
+    assert is_standalone_text_box(scene, 60, WIDTH) is False
+    # 有封闭外框的是漫画画格，不该被当气泡吸走
+    assert is_standalone_text_box(framed, 60, WIDTH) is False
+
+
+def test_patch425_tall_bubble_merges_into_scene_below(tmp_path) -> None:
+    """高瘦气泡必须向下吸附并入主画格（此前被 0.35 高度上限挡掉，单独成图）。"""
+    image = np.full((700, WIDTH, 3), 255, dtype=np.uint8)
+    image[100:260] = make_dark_bubble(100, 260)  # 160px 高的纯背景气泡
+    image[320:700] = make_texture(320, 700, seed=11)  # 下方人物格
+    raw_dir = tmp_path / "01_raw"
+    raw_dir.mkdir()
+    imwrite_unicode(raw_dir / "001.png", image)
+
+    metas = segment_episode(raw_dir, tmp_path / "02_panels")
+
+    assert len(metas) == 1
+    assert metas[0].height > 400
+
+
+def test_patch425_sparse_text_bubble_is_not_contentless() -> None:
+    """白底黑框 / 黑底白字的稀疏气泡有字，不能被判成空镜。"""
+    white_frame = np.full((160, WIDTH, 3), 255, dtype=np.uint8)
+    cv2.rectangle(white_frame, (20, 20), (WIDTH - 21, 139), (0, 0, 0), 2)
+    cv2.putText(
+        white_frame,
+        "心里话",
+        (40, 90),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        (0, 0, 0),
+        2,
+    )
+    black_text = np.full((160, WIDTH, 3), 30, dtype=np.uint8)
+    cv2.putText(
+        black_text,
+        "心里话",
+        (40, 90),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        (255, 255, 255),
+        2,
+    )
+    plain_white = np.full((160, WIDTH, 3), 255, dtype=np.uint8)
+
+    assert is_contentless_panel(white_frame) is False
+    assert is_contentless_panel(black_text) is False
+    # 纯白空页仍然是空镜
+    assert is_contentless_panel(plain_white) is True
+
+
+def test_patch425_merge_stops_when_text_stack_too_tall() -> None:
+    """连续吸收多个文本框时，累计高度超过 1.0 * 宽就停止继续串并。"""
+    image = np.full((1060, WIDTH, 3), 255, dtype=np.uint8)
+    image[100:300] = make_dark_bubble(100, 300, lines=6)
+    image[320:520] = make_dark_bubble(320, 520, lines=6)
+    image[540:740] = make_dark_bubble(540, 740, lines=6)
+    image[760:1060] = make_texture(760, 1060, seed=33)
+
+    merged = merge_standalone_text_boxes(
+        [(100, 300), (320, 520), (540, 740), (760, 1060)], image, img_width=WIDTH
+    )
+
+    # 前两个文本框累计高度（200+200=400）超过 1.0 * 320 = 320 → 不再串并；
+    # 最后一个文本框自己够矮，仍并入下方场景。
+    assert len(merged) == 3
+    assert merged[0][1] - merged[0][0] <= 220
+    assert merged[2][1] - merged[2][0] > 400

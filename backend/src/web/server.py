@@ -46,6 +46,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from PIL import Image
 from pydantic import BaseModel, Field, ValidationError
 from sse_starlette.sse import EventSourceResponse
 
@@ -390,6 +391,10 @@ class ScriptUpdateRequest(BaseModel):
     #: Patch v4.23：人工保存**默认不**强制恢复角色名（用户改的写法原样落盘）；
     #: 只有显式打开这个开关才按规范名归一。
     auto_unify_characters: bool = False
+    #: Patch v4.25：用户勾选的「角色档案同步」动作。**默认为空 = 绝不动档案**。
+    #: 每项形如 ``{"action": "add_alias"|"promote_canonical"|"register_character",
+    #: "found_name": "南道振", "target_canonical": "道振"}``。
+    sync_character_updates: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class CharacterCheckRequest(BaseModel):
@@ -426,6 +431,52 @@ PANEL_MEDIA_TYPES: dict[str, str] = {
     ".webp": "image/webp",
     ".bmp": "image/bmp",
 }
+
+#: 缩略图 JPEG 质量（Patch v4.25）。
+PANEL_THUMBNAIL_QUALITY = 82
+
+
+def _panel_thumbnail(
+    source: Path, width: int
+) -> tuple[Path, str]:
+    """按宽度生成（并缓存）面板缩略图（Patch v4.25）。
+
+    一话 200~300 个分镜时，前端把 690px 宽的原图整张拉进列表会瞬间吃掉
+    几十兆流量与解码时间。这里按需缩到指定宽度（**只缩不放**），
+    缓存到 ``02_panels/.thumbs/{stem}_w{width}.jpg``。
+
+    缓存失效条件：目标不存在、或原图 mtime 比缓存新（重切图后原图会更新），
+    或缓存文件读不出来。
+
+    返回 ``(图片路径, media_type)``。原图本身已经比目标宽度窄时直接返回原图。
+    """
+    suffix = source.suffix.lower()
+    media_type = PANEL_MEDIA_TYPES.get(suffix, "application/octet-stream")
+    try:
+        from providers.image_utils import load_image
+
+        with load_image(source) as image:
+            origin_width = int(image.width)
+            if origin_width <= width:
+                # 只缩不放：原图已经够窄，直接回原图。
+                return source, media_type
+            target_height = max(1, round(int(image.height) * width / origin_width))
+            thumbs_dir = source.parent / ".thumbs"
+            target = thumbs_dir / f"{source.stem}_w{width}.jpg"
+            stale = True
+            if target.is_file():
+                try:
+                    stale = target.stat().st_mtime < source.stat().st_mtime
+                except OSError:
+                    stale = True
+            if stale:
+                thumbs_dir.mkdir(parents=True, exist_ok=True)
+                resized = image.resize((width, target_height), Image.LANCZOS)
+                resized.save(target, format="JPEG", quality=PANEL_THUMBNAIL_QUALITY)
+            return target, "image/jpeg"
+    except Exception as exc:  # 缩略图失败不能挡住原图回源
+        print(f"[web] 缩略图生成失败，回退原图：{source}（{exc}）", file=sys.stderr)
+        return source, media_type
 
 
 def _load_episode_vision(episode_dir: Path) -> VisionWindowOutput | None:
@@ -745,6 +796,126 @@ def _merge_beats_for_check(
                 continue
         return merged
 
+
+
+def _migrate_character_voice(series_dir: Path, old_key: str, new_key: str) -> bool:
+    """把 ``series_config.yaml`` 里的专属音色键从旧角色名迁到新角色名。
+
+    Patch v4.25：用户把「道振」提升为规范名「南道振」后，专属音色还挂在
+    旧键上会失效（``character_voices`` 的键就是角色名）。新键已经存在时
+    **不覆盖**（用户手工配过的优先），只删旧键。
+    """
+    path = series_dir / "series_config.yaml"
+    if not path.is_file() or not old_key or not new_key or old_key == new_key:
+        return False
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 - 档案同步失败不应阻断保存
+        print(f"[server] 读取 series_config.yaml 失败：{exc}", file=sys.stderr)
+        return False
+    if not isinstance(data, dict):
+        return False
+    tts = data.get("tts")
+    if not isinstance(tts, dict):
+        return False
+    voices = tts.get("character_voices")
+    if not isinstance(voices, dict) or old_key not in voices:
+        return False
+    if new_key not in voices:
+        voices[new_key] = voices[old_key]
+    del voices[old_key]
+    path.write_text(
+        yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8"
+    )
+    return True
+
+
+def _apply_character_sync(
+    series_dir: Path,
+    updates: Sequence[dict[str, Any]],
+    *,
+    episode_no: int = 0,
+) -> list[str]:
+    """把用户勾选的角色名写法同步进作品档案（Patch v4.25）。
+
+    **只有前端显式传了 ``sync_character_updates`` 才会调用**；默认一个都不传，
+    绝不动档案（Patch v4.23「人工保存原样落盘」铁律）。
+
+    支持三种动作：
+
+    * ``add_alias``：把 ``found_name`` 加进 ``target_canonical`` 的 aliases；
+    * ``promote_canonical``：把 ``target_canonical`` 改名为 ``found_name``
+      （原名并入 aliases，并去掉重复的 found_name），同时迁移
+      ``series_config.yaml`` 里 ``tts.character_voices`` 的旧键；
+    * ``register_character``：把 ``found_name`` 登记成新角色。
+
+    返回实际执行的动作列表（形如 ``add_alias:道振<-南道振``）。
+    """
+    applied: list[str] = []
+    if not updates:
+        return applied
+    bible_path = series_dir / "story_bible.json"
+    if not bible_path.is_file():
+        print(
+            "[server] 没有 story_bible.json，跳过角色档案同步", file=sys.stderr
+        )
+        return applied
+    try:
+        bible = load_model(StoryBibleV2, bible_path)
+    except Exception as exc:  # noqa: BLE001 - 档案同步失败不应阻断保存
+        print(
+            f"[server] 读取 story_bible.json 失败，跳过角色档案同步：{exc}",
+            file=sys.stderr,
+        )
+        return applied
+    characters = list(bible.characters)
+    for item in updates:
+        if not isinstance(item, dict):
+            continue
+        action = str(item.get("action") or "").strip()
+        found = str(item.get("found_name") or "").strip()
+        target = str(item.get("target_canonical") or "").strip()
+        if not found:
+            continue
+        if action == "add_alias":
+            for profile in characters:
+                if profile.name != target:
+                    continue
+                if found != profile.name and found not in profile.aliases:
+                    profile.aliases = [*profile.aliases, found]
+                    applied.append(f"add_alias:{target}<-{found}")
+                break
+        elif action == "promote_canonical":
+            for profile in characters:
+                if profile.name != target:
+                    continue
+                aliases = [alias for alias in profile.aliases if alias != found]
+                if target not in aliases:
+                    aliases = [*aliases, target]
+                profile.aliases = aliases
+                profile.name = found
+                _migrate_character_voice(series_dir, target, found)
+                applied.append(f"promote_canonical:{target}->{found}")
+                break
+        elif action == "register_character":
+            if any(profile.name == found for profile in characters):
+                continue
+            characters.append(
+                CharacterProfile(
+                    name=found,
+                    aliases=[],
+                    visual_traits="",
+                    current_status="",
+                    first_seen_ep=episode_no,
+                    last_seen_ep=episode_no,
+                )
+            )
+            applied.append(f"register_character:{found}")
+    if not applied:
+        return applied
+    bible = bible.model_copy(update={"characters": characters})
+    save_model(bible, bible_path)
+    return applied
 
 
 class PanelFlagRequest(BaseModel):
@@ -2069,6 +2240,19 @@ def create_app(
         # Patch v4.13：人工保存也强制简体中文（字幕与送音文本一起转）。
         beats = [_to_simplified_beat(beat) for beat in beats]
         series_dir = view.registry.series_dir(series_id)
+        # Patch v4.25：用户勾选的档案同步**先落地**，再算角色名告警——
+        # 这样「记为规范名」之后同一句不会再被报成别名写法。
+        if payload.sync_character_updates:
+            applied = _apply_character_sync(
+                series_dir,
+                payload.sync_character_updates,
+                episode_no=episode_no,
+            )
+            if applied:
+                print(
+                    f"[server] 角色档案同步：{applied}", file=sys.stderr
+                )
+                _reload_config()
         # Patch v4.23：人工保存**默认原样落盘**——用户写的「未来的丈夫」不该
         # 被悄悄改回角色本名。只有显式打开 auto_unify_characters 才归一。
         if payload.auto_unify_characters:
@@ -2674,8 +2858,17 @@ def create_app(
         return _storyboard_payload(storyboard, episode_id, series_id, episode_no)
 
     @app.get("/api/episodes/{episode_id}/panels/{filename}")
-    async def get_episode_panel_file(episode_id: str, filename: str) -> FileResponse:
-        """按文件名回源一话的分镜原图（Storyboard 缩略图与识图复核共用）。"""
+    async def get_episode_panel_file(
+        episode_id: str,
+        filename: str,
+        w: int | None = Query(default=None, ge=64, le=800),
+    ) -> FileResponse:
+        """按文件名回源一话的分镜图（Storyboard 缩略图与识图复核共用）。
+
+        Patch v4.25：可选查询参数 ``w``（64~800）——带上就返回按该宽度
+        等比缩小的 JPEG 缩略图（只缩不放，缓存在 ``02_panels/.thumbs/``），
+        不带则原样返回高清原图。
+        """
         located = view.find_episode(episode_id)
         if located is None:
             raise HTTPException(status_code=404, detail=f"找不到话次：{episode_id}")
@@ -2689,11 +2882,18 @@ def create_app(
             raise HTTPException(
                 status_code=404, detail=f"找不到分镜图片：{safe_name}"
             )
+        if w is None:
+            return FileResponse(
+                path,
+                media_type=PANEL_MEDIA_TYPES.get(suffix, "application/octet-stream"),
+                filename=safe_name,
+                content_disposition_type="inline",
+            )
+        thumb_path, thumb_type = _panel_thumbnail(path, w)
         return FileResponse(
-            path,
-            media_type=PANEL_MEDIA_TYPES.get(suffix, "application/octet-stream"),
-            filename=safe_name,
-            content_disposition_type="inline",
+            thumb_path,
+            media_type=thumb_type,
+            headers={"Cache-Control": "public, max-age=86400"},
         )
 
     @app.patch("/api/episodes/{episode_id}/panels/{panel_id}")
