@@ -23,6 +23,7 @@ import type {
   BeatRegenerateTTSResponse,
   CharacterCheckResponse,
   CharacterProfile,
+  CharacterSaveOptions,
   CharacterSyncUpdate,
   EpisodeCleanupResponse,
   EpisodeDigest,
@@ -1293,6 +1294,28 @@ export default function App() {
     );
   };
 
+  /**
+   * Patch v4.26：人物实体图谱可编辑（改名 / 改字段 / 合并 / 删除）。
+   *
+   * 后端会按 `character_renames` 迁移专属音色键，并按 `deleted_character_names`
+   * 清理快照；`sync_snapshots` 默认开启，保证重跑某话时读到的是最新档案。
+   */
+  const handleSaveCharacters = (
+    sid: string,
+    characters: CharacterProfile[],
+    options: CharacterSaveOptions = {}
+  ) => {
+    const payload: Record<string, unknown> = { characters };
+    if (options.character_renames && options.character_renames.length > 0) {
+      payload.character_renames = options.character_renames;
+    }
+    if (options.deleted_character_names && options.deleted_character_names.length > 0) {
+      payload.deleted_character_names = options.deleted_character_names;
+    }
+    payload.sync_snapshots = true;
+    void saveMemory(sid, payload, '已更新人物实体图谱（并同步按话快照与专属音色）');
+  };
+
   const handleAddPlotThread = (sid: string, thread: Omit<PlotThread, 'thread_id'>) => {
     const current = seriesList.find((s) => s.series_id === sid);
     if (!current) return;
@@ -1806,6 +1829,7 @@ export default function App() {
             <MemoryView
               series={activeSeries}
               onAddCharacter={handleAddCharacter}
+              onSaveCharacters={handleSaveCharacters}
               onAddPlotThread={handleAddPlotThread}
               onToggleThreadStatus={handleToggleThreadStatus}
               onUpdateStyle={handleUpdateStyle}

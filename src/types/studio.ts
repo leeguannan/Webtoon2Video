@@ -316,6 +316,23 @@ export interface CharacterProfile {
   gender?: 'male' | 'female' | 'unknown';
 }
 
+/**
+ * Patch v4.26：角色主名改名同步。
+ *
+ * 后端会把 `series_config.yaml` 里 `tts.character_voices` 的旧键迁移到新名，
+ * 否则改主名会让专属音色静默失效。
+ */
+export interface CharacterRenameSync {
+  from_name: string;
+  to_name: string;
+}
+
+/** Patch v4.26：角色档案批量保存的附带动作。 */
+export interface CharacterSaveOptions {
+  character_renames?: CharacterRenameSync[];
+  deleted_character_names?: string[];
+}
+
 export interface PlotThread {
   thread_id: string;
   title: string;

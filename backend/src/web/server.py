@@ -343,6 +343,15 @@ class SeriesCreateRequest(BaseModel):
     title: str = ""
 
 
+class CharacterRenameSync(BaseModel):
+    """Patch v4.26：角色主名改动的同步描述。"""
+
+    #: 改名前的角色主名。
+    from_name: str
+    #: 改名后的角色主名。
+    to_name: str
+
+
 class MemoryUpdateRequest(BaseModel):
     """``PUT /api/series/{series_id}/memory`` 请求体。"""
 
@@ -350,6 +359,13 @@ class MemoryUpdateRequest(BaseModel):
     characters: list[dict[str, Any]] | None = None
     plot_threads: list[dict[str, Any]] | None = None
     arc_summaries: list[dict[str, Any]] | None = None
+    #: Patch v4.26：本次提交里发生的角色主名改动。用于迁移专属音色键
+    #: （``series_config.yaml`` 的 ``tts.character_voices``）并同步按话快照。
+    character_renames: list[CharacterRenameSync] = Field(default_factory=list)
+    #: Patch v4.26：本次提交里被删除的角色主名（快照同步时一并剔除）。
+    deleted_character_names: list[str] = Field(default_factory=list)
+    #: Patch v4.26：是否把改动同步到 ``bible_snapshots/ep_*.json``。
+    sync_snapshots: bool = True
 
 
 class JobBatchRequest(BaseModel):
@@ -918,11 +934,214 @@ def _apply_character_sync(
     return applied
 
 
+def _normalize_characters(items: Sequence[dict[str, Any]]) -> list[CharacterProfile]:
+    """规整并校验前端提交的角色列表（Patch v4.26）。
+
+    规则（任一不满足 → 400 中文提示）：
+
+    * 主名去首尾空白；空名 → ``角色主名不能为空``；
+    * 同一请求内主名重复 → ``角色主名重复：{name}``；
+    * aliases 去重、剔除主名与空串；
+    * ``first_seen_ep >= 1``（首现话次从第 1 话起）；
+    * ``last_seen_ep >= first_seen_ep``（最近出场不能早于首现）。
+    """
+    characters: list[CharacterProfile] = []
+    seen: set[str] = set()
+    for item in items:
+        data = dict(item)
+        name = str(data.get("name", "")).strip()
+        if not name:
+            raise ValueError("角色主名不能为空")
+        if name in seen:
+            raise ValueError(f"角色主名重复：{name}")
+        seen.add(name)
+        aliases: list[str] = []
+        for raw_alias in data.get("aliases") or []:
+            alias = str(raw_alias).strip()
+            if not alias or alias == name or alias in aliases:
+                continue
+            aliases.append(alias)
+        data["name"] = name
+        data["aliases"] = aliases
+        try:
+            profile = CharacterProfile.model_validate(data)
+        except ValidationError as exc:
+            detail = exc.errors()[0].get("msg", "") if exc.errors() else ""
+            raise ValueError(f"角色「{name}」数据不合法：{detail}") from exc
+        if profile.first_seen_ep < 1:
+            raise ValueError(f"角色「{name}」首现话次必须 ≥ 1")
+        if profile.last_seen_ep < profile.first_seen_ep:
+            raise ValueError(f"角色「{name}」最近出场话次不能早于首现话次")
+        characters.append(profile)
+    return characters
+
+
+def _sync_bible_snapshots(
+    series_dir: Path,
+    live: StoryBibleV2,
+    *,
+    old_characters: Sequence[CharacterProfile],
+    renames: Sequence[CharacterRenameSync],
+    deleted_names: Sequence[str],
+) -> list[str]:
+    """把角色档案改动同步到按话只读快照（Patch v4.26）。
+
+    快照 ``bible_snapshots/ep_{N}.json`` 代表「截至第 N 话结束」的 live 状态，
+    重跑第 N+1 话时会拿它当基线（见 ``memory.resolve_base_bible``），
+    因此必须严守防剧透：
+
+    * ``first_seen_ep > N`` 的角色一律不得进入 ep_N 快照；
+    * ``last_seen_ep`` 钳位到 ``<= N``；
+    * live 里 ``first_seen_ep <= N`` 但快照缺失的角色补录进去；
+    * 快照里的 ``current_status`` **只有**在本次确实改了状态、或发生改名合并时
+      才覆盖，否则保留历史状态（避免把最新状态倒灌进历史快照）。
+
+    返回被改写的快照文件名列表。
+    """
+    snapshot_dir = series_dir / "bible_snapshots"
+    if not snapshot_dir.is_dir():
+        return []
+    old_status = {c.name: c.current_status for c in old_characters}
+    live_by_name = {c.name: c for c in live.characters}
+    rename_map = {
+        r.from_name.strip(): r.to_name.strip()
+        for r in renames
+        if r.from_name.strip() and r.to_name.strip() and r.from_name.strip() != r.to_name.strip()
+    }
+    deleted = {name.strip() for name in deleted_names if name.strip()}
+    updated: list[str] = []
+    for path in sorted(snapshot_dir.glob("ep_*.json")):
+        try:
+            ep_no = int(path.stem.split("_", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        try:
+            snapshot = StoryBibleV2.model_validate_json(path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001 - 坏快照不该阻断档案保存
+            print(f"[server] 跳过损坏的快照 {path.name}：{exc}", file=sys.stderr)
+            continue
+        changed = False
+        merged_names: set[str] = set()
+        merged_aliases: dict[str, list[str]] = {}
+
+        # 1) 删除：被删角色从快照里剔除
+        #    （若该角色是某次改名的源，则交给改名/合并分支处理，不在此删除）
+        if deleted:
+            keep = [
+                c
+                for c in snapshot.characters
+                if c.name not in deleted or c.name in rename_map
+            ]
+            if len(keep) != len(snapshot.characters):
+                snapshot.characters = keep
+                changed = True
+
+        # 2) 改名 / 合并
+        for old_name, new_name in rename_map.items():
+            names = {c.name for c in snapshot.characters}
+            if old_name in names and new_name in names:
+                # 合并：旧角色的别名并入新角色，新角色保留主名
+                old_profile = next(c for c in snapshot.characters if c.name == old_name)
+                new_profile = next(c for c in snapshot.characters if c.name == new_name)
+                aliases = list(new_profile.aliases)
+                for alias in [old_name, *old_profile.aliases]:
+                    if alias and alias != new_name and alias not in aliases:
+                        aliases.append(alias)
+                snapshot.characters = [
+                    c for c in snapshot.characters if c.name not in {old_name, new_name}
+                ]
+                live_profile = live_by_name.get(new_name)
+                snapshot.characters.append(
+                    new_profile.model_copy(
+                        update={
+                            "aliases": aliases,
+                            "first_seen_ep": min(
+                                new_profile.first_seen_ep, old_profile.first_seen_ep
+                            ),
+                            "last_seen_ep": max(
+                                new_profile.last_seen_ep, old_profile.last_seen_ep
+                            ),
+                            "current_status": (
+                                live_profile.current_status
+                                if live_profile is not None
+                                else new_profile.current_status
+                            ),
+                        }
+                    )
+                )
+                merged_names.add(new_name)
+                merged_aliases[new_name] = [
+                    alias for alias in aliases if alias not in new_profile.aliases
+                ]
+                changed = True
+            elif old_name in names:
+                profile = next(c for c in snapshot.characters if c.name == old_name)
+                snapshot.characters = [
+                    c.model_copy(update={"name": new_name}) if c.name == old_name else c
+                    for c in snapshot.characters
+                ]
+                merged_names.add(new_name)
+                changed = True
+
+        # 3) 对齐 live 字段 + 防剧透剔除
+        synced: list[CharacterProfile] = []
+        for profile in snapshot.characters:
+            live_profile = live_by_name.get(profile.name)
+            if live_profile is None:
+                synced.append(profile)
+                continue
+            if live_profile.first_seen_ep > ep_no:
+                # 未来才登场的角色不得出现在该话快照里（防跨话剧透）
+                changed = True
+                continue
+            updates: dict[str, Any] = {
+                "aliases": list(live_profile.aliases),
+                "visual_traits": live_profile.visual_traits,
+                "gender": live_profile.gender,
+                "first_seen_ep": live_profile.first_seen_ep,
+                # 快照是「截至第 N 话」的历史记录：绝不能因为 live 的全局
+                # last_seen_ep 偏小就把「这一话里出现过」的事实抹掉，
+                # 因此取两者的较大值再钳位到本话。
+                "last_seen_ep": min(
+                    max(live_profile.last_seen_ep, profile.last_seen_ep), ep_no
+                ),
+            }
+            for extra in merged_aliases.get(profile.name, []):
+                if extra and extra not in updates["aliases"]:
+                    updates["aliases"].append(extra)
+            status_changed = old_status.get(profile.name) != live_profile.current_status
+            if status_changed or profile.name in merged_names:
+                updates["current_status"] = live_profile.current_status
+            merged = profile.model_copy(update=updates)
+            if merged != profile:
+                changed = True
+            synced.append(merged)
+
+        # 4) 补录：live 里首现不晚于该话、但快照里缺失的角色
+        existing = {c.name for c in synced}
+        for live_profile in live.characters:
+            if live_profile.name in existing or live_profile.first_seen_ep > ep_no:
+                continue
+            synced.append(
+                live_profile.model_copy(
+                    update={"last_seen_ep": min(live_profile.last_seen_ep, ep_no)}
+                )
+            )
+            existing.add(live_profile.name)
+            changed = True
+
+        if not changed:
+            continue
+        snapshot.characters = synced
+        save_model(snapshot, path)
+        updated.append(path.name)
+    return updated
+
+
 class PanelFlagRequest(BaseModel):
     """``PATCH /api/episodes/{ep_id}/panels/{panel_id}`` 请求体。"""
 
     is_transition_blank: bool = False
-
 
 class VoiceSpecRequest(BaseModel):
     """作品级配音设置里的一项（音色 + 语速）。"""
@@ -2076,10 +2295,27 @@ def create_app(
                 bible = StoryBibleV2(series_id=series_id, series_title="")
         else:
             bible = StoryBibleV2(series_id=series_id, series_title="")
+        # Patch v4.26：先记住旧角色，用于判断 current_status 是否被改过。
+        old_characters = list(bible.characters)
         if payload.narration_style is not None:
             bible.narration_style = payload.narration_style
         if payload.characters is not None:
-            bible.characters = [CharacterProfile.model_validate(item) for item in payload.characters]
+            try:
+                bible.characters = _normalize_characters(payload.characters)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            # 改名 → 迁移专属音色键（series_config.yaml 的 tts.character_voices）。
+            for rename in payload.character_renames:
+                if _migrate_character_voice(series_dir, rename.from_name, rename.to_name):
+                    _reload_config()
+            if payload.sync_snapshots:
+                _sync_bible_snapshots(
+                    series_dir,
+                    bible,
+                    old_characters=old_characters,
+                    renames=payload.character_renames,
+                    deleted_names=payload.deleted_character_names,
+                )
         if payload.plot_threads is not None:
             bible.plot_threads = [PlotThread.model_validate(item) for item in payload.plot_threads]
         if payload.arc_summaries is not None:
