@@ -86,6 +86,12 @@ from core.manifest import (
     infer_stage_status,
 )
 from core.panel_ids import panel_sort_key
+from core.panel_scope import (
+    PanelScope,
+    clamp_beats_to_scope,
+    load_panel_scope,
+    violations_payload,
+)
 from core.normalize import to_simplified_chinese
 from core.schemas import (
     ArcSummary,
@@ -681,6 +687,21 @@ def _merge_script_beats(
                     raw[field] = getattr(old, field)
         merged.append(ScriptBeat.model_validate(raw))
     return merged
+
+
+def _clamp_beat_dicts(
+    beats: list[dict[str, Any]], scope: PanelScope | None
+) -> list[dict[str, Any]]:
+    """把 beat 字典列表里越界的分镜引用收口回编排范围（Patch v4.32）。
+
+    供 auto-pacing / auto-motions 这类「读剧本 → 改字段 → 写回」的接口使用：
+    它们不新增内容，但写回时也不该把越界引用重新落盘。
+    """
+    if scope is None or scope.is_empty:
+        return beats
+    validated = [ScriptBeat.model_validate(beat) for beat in beats]
+    clamped, _violations = clamp_beats_to_scope(validated, scope)
+    return [beat.model_dump() for beat in clamped]
 
 
 def _to_simplified_beat(beat: ScriptBeat) -> ScriptBeat:
@@ -2483,6 +2504,21 @@ def create_app(
         beats = _merge_script_beats(script.beats, payload.beats)
         # Patch v4.13：人工保存也强制简体中文（字幕与送音文本一起转）。
         beats = [_to_simplified_beat(beat) for beat in beats]
+        # Patch v4.32：镜头编排（启用幕引用的分镜）是「用户在分镜里选过的画面」
+        # 的唯一权威口径 —— 保存前把越界引用收口回编排范围，避免成片出现
+        # 用户从没选过的画面。收口记录随响应返回，前端据此提示。
+        scope = load_panel_scope(view.episode_dir(series_id, episode_no))
+        beats, scope_violations = clamp_beats_to_scope(beats, scope)
+        if scope_violations:
+            print(
+                "[server] 分镜引用超出镜头编排范围，已收口："
+                + "; ".join(
+                    f"{item.beat_id} 去掉 {list(item.removed)}"
+                    + (f" → {item.replacement}" if item.replacement else "")
+                    for item in scope_violations
+                ),
+                file=sys.stderr,
+            )
         series_dir = view.registry.series_dir(series_id)
         # Patch v4.25：用户勾选的档案同步**先落地**，再算角色名告警——
         # 这样「记为规范名」之后同一句不会再被报成别名写法。
@@ -2516,6 +2552,8 @@ def create_app(
             "script": script.model_dump(),
             "job": None,
             "character_warnings": character_warnings,
+            # Patch v4.32：被收口的越界分镜引用，前端据此提示「已改回编排范围内」。
+            "panel_scope_violations": violations_payload(scope_violations),
         }
         if payload.from_stage:
             job = await job_runner.submit_episode(
@@ -2600,6 +2638,10 @@ def create_app(
             scenes=active_scenes or None,
             audio_durations_ms=view._audio_durations(episode_dir),
         )
+        # Patch v4.32：写回前把越界（编排范围外）的分镜引用收口，避免成片出现
+        # 用户没在分镜里选过的画面。
+        scope = load_panel_scope(episode_dir)
+        paced_beats = _clamp_beat_dicts(paced_beats, scope)
         try:
             updated_script = NarrationScript.model_validate(
                 {**script.model_dump(), "beats": paced_beats}
@@ -2672,6 +2714,9 @@ def create_app(
             panel_metas=panel_metas or None,
             scenes=active_scenes or None,
         )
+        # Patch v4.32：写回前把越界（编排范围外）的分镜引用收口。
+        scope = load_panel_scope(episode_dir)
+        assigned_beats = _clamp_beat_dicts(assigned_beats, scope)
         try:
             updated_script = NarrationScript.model_validate(
                 {**script.model_dump(), "beats": assigned_beats}

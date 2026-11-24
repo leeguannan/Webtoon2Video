@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   Check,
@@ -103,7 +103,18 @@ export const PanelZoomModal: React.FC<PanelZoomModalProps> = ({
 
   const index = beats.findIndex((b) => b.beat_id === activeBeatId);
   const beat = index >= 0 ? beats[index] : undefined;
-  const panelId = beat?.target_panel_ids[0] ?? '';
+  // Patch v4.32：这一句实际会播出的全部分镜（Stage 6 按格数均分时长轮播）。
+  // 以前只看第 1 格，成片里出现的第 2..N 格在审核台/弹窗里都看不见。
+  const targetPanelIds = beat?.target_panel_ids ?? [];
+  const [activePanelIndex, setActivePanelIndex] = useState(0);
+  useEffect(() => {
+    setActivePanelIndex(0);
+  }, [activeBeatId]);
+  const safePanelIndex =
+    targetPanelIds.length === 0
+      ? 0
+      : Math.min(activePanelIndex, targetPanelIds.length - 1);
+  const panelId = targetPanelIds[safePanelIndex] ?? '';
   const panel = panels.find((p) => p.panel_id === panelId);
 
   // 打开时把光标放进字幕框，直接就能改字。
@@ -229,7 +240,7 @@ export const PanelZoomModal: React.FC<PanelZoomModalProps> = ({
 
         <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_360px]">
           {/* 左：大图 */}
-          <div className="min-h-0 bg-slate-900 flex items-center justify-center p-4 overflow-hidden">
+          <div className="min-h-0 bg-slate-900 flex flex-col items-center justify-center p-4 gap-3 overflow-hidden">
             {panel ? (
               <img
                 src={panel.image_url}
@@ -239,6 +250,42 @@ export const PanelZoomModal: React.FC<PanelZoomModalProps> = ({
               />
             ) : (
               <p className="text-xs text-slate-400">该条解说未绑定分镜</p>
+            )}
+            {/* Patch v4.32：一句多格时把每一格都列出来（成片会按格数均分时长轮播）。 */}
+            {targetPanelIds.length > 1 && (
+              <div className="flex flex-wrap gap-2 justify-center">
+                {targetPanelIds.map((pid, i) => {
+                  const item = panels.find((p) => p.panel_id === pid);
+                  const active = i === safePanelIndex;
+                  return (
+                    <button
+                      key={`${pid}-${i}`}
+                      type="button"
+                      onClick={() => setActivePanelIndex(i)}
+                      title={`第 ${i + 1} 格：${pid}`}
+                      className={
+                        active
+                          ? 'w-12 h-16 rounded border-2 border-blue-500 overflow-hidden'
+                          : 'w-12 h-16 rounded border border-white/30 overflow-hidden opacity-70 hover:opacity-100'
+                      }
+                    >
+                      {item ? (
+                        <img
+                          src={item.image_url}
+                          alt={pid}
+                          referrerPolicy="no-referrer"
+                          loading="lazy"
+                          className="w-12 h-16 object-cover"
+                        />
+                      ) : (
+                        <span className="text-[10px] text-slate-300 font-mono-tabular">
+                          {pid}
+                        </span>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
             )}
           </div>
 

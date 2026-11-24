@@ -144,11 +144,29 @@ export interface CharacterCheckResponse {
   warnings: CharacterCheckWarning[];
 }
 
+/**
+ * Patch v4.32：一次「分镜引用超出镜头编排范围」的收口记录。
+ *
+ * 成片里出现了用户从没在镜头编排里选过的画面 —— 根因就是剧本里存在
+ * 编排范围外的 target_panel_ids。后端保存时会把它们收口回编排范围，
+ * 并把收口明细回传，前端据此提示用户「已自动改回编排范围内」。
+ */
+export interface PanelScopeViolation {
+  /** 出问题的解说句 ID。 */
+  beat_id: string;
+  /** 被剔除的编排外分镜。 */
+  removed: string[];
+  /** 整体替换时用到的替代分镜（null 表示只剔除、未整体替换）。 */
+  replacement: string | null;
+}
+
 /** PUT /script 的响应（Patch v4.23 起带角色名告警）。 */
 export interface ScriptUpdateResponse {
   script: { beats: ScriptBeat[] } & Record<string, unknown>;
   job: Record<string, unknown> | null;
   character_warnings: CharacterCheckWarning[];
+  /** Patch v4.32：被收口的编排外分镜引用（空数组＝没有越界）。 */
+  panel_scope_violations?: PanelScopeViolation[];
 }
 
 /** 前端保存解说稿后的结果（用于刷新本地数据与温和提示）。 */
@@ -157,6 +175,8 @@ export interface ScriptSaveOutcome {
   ok: boolean;
   /** 后端返回的角色名写法告警（默认保存时通常为空）。 */
   warnings: CharacterCheckWarning[];
+  /** Patch v4.32：被后端收口的编排外分镜引用（默认保存时通常为空）。 */
+  scope_violations?: PanelScopeViolation[];
 }
 
 // ---------------------------------------------------------------------------

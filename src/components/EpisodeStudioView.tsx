@@ -692,6 +692,12 @@ interface ScriptBeatRowProps {
   onChangeMotion: (beatId: string, motion: CameraMotion) => void;
   onChangePause: (beatId: string, ms: number) => void;
   onChangePanel: (beatId: string, panelId: string) => void;
+  /** Patch v4.32：改第 index 个目标分镜（保留其它目标格，不再一改就压成一格）。 */
+  onChangePanelAt: (beatId: string, index: number, panelId: string) => void;
+  /** Patch v4.32：删掉第 index 个目标分镜（至少保留一格）。 */
+  onRemovePanelAt: (beatId: string, index: number) => void;
+  /** Patch v4.32：镜头编排（启用幕）覆盖的分镜集合；空集合＝不限制。 */
+  scopePanelIds: Set<string>;
   onChangeScene: (beatId: string, sceneId: string | null) => void;
   onToggleTagPicker: (beatId: string) => void;
   onPickTag: (beatId: string, snippet: string) => void;
@@ -735,6 +741,9 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
     onChangeMotion,
     onChangePause,
     onChangePanel,
+    onChangePanelAt,
+    onRemovePanelAt,
+    scopePanelIds,
     onChangeScene,
     onToggleTagPicker,
     onPickTag,
@@ -775,6 +784,33 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
     () => resolveSpokenText(beat, rules),
     [beat, rules]
   );
+
+  /**
+   * Patch v4.32：这一句实际会播出的全部分镜（Stage 6 会按格数均分时长轮播）。
+   *
+   * 以前审核台只暴露第 1 格，成片里出现的第 2..N 格在审核台完全看不见，
+   * 用户观感就是「这帧我没选过」。现在全部目标格都显式列出来、可改可删。
+   */
+  const targetPanelIds = beat.target_panel_ids ?? [];
+
+  /**
+   * Patch v4.32：分镜下拉只列「镜头编排范围内」的分镜。
+   *
+   * - 编排范围为空（还没编排 / 没有启用幕）→ 不限制，列全部分镜；
+   * - 否则只列编排内的分镜，但**始终保留本句当前用到的分镜**，
+   *   否则老剧本里的越界引用在下拉里会显示空白（用户看不出当前是什么）。
+   */
+  const scopedPanelOptions = useMemo(() => {
+    if (scopePanelIds.size === 0) return panelOptions;
+    const inScope = panelOptions.filter((option) => scopePanelIds.has(option.value));
+    const missing = targetPanelIds.filter(
+      (panelId) => !scopePanelIds.has(panelId) && !inScope.some((o) => o.value === panelId)
+    );
+    return [
+      ...inScope,
+      ...missing.map((panelId) => ({ value: panelId, label: `${panelId}（编排外）` })),
+    ];
+  }, [panelOptions, scopePanelIds, targetPanelIds]);
 
   // Patch v4.25：送音文本框的 ref 与选区记忆用 useCallback 固定下来，
   // 避免每次渲染都换 ref 回调导致 DOM ref 被反复置空。
@@ -822,17 +858,43 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
               />
             </button>
           )}
-          <select
-            value={beat.target_panel_ids[0]}
-            onChange={(e) => onChangePanel(beat.beat_id, e.target.value)}
-            className="w-16 px-1 py-0.5 text-[11px] font-mono-tabular bg-white border border-slate-200 rounded"
-          >
-            {panelOptions.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
+          {/* Patch v4.32：这一句实际会播出的每一格分镜都列出来，可改可删。 */}
+          {targetPanelIds.map((panelId, index) => (
+            <div key={`${panelId}-${index}`} className="flex items-center gap-1">
+              <select
+                value={panelId}
+                onChange={(e) =>
+                  index === 0
+                    ? onChangePanel(beat.beat_id, e.target.value)
+                    : onChangePanelAt(beat.beat_id, index, e.target.value)
+                }
+                title={
+                  index === 0
+                    ? '这一句的主画面分镜'
+                    : `这一句的第 ${index + 1} 格分镜（成片会按格数均分时长轮播）`
+                }
+                aria-label={`${beat.beat_id} 第 ${index + 1} 格分镜`}
+                className="w-16 px-1 py-0.5 text-[11px] font-mono-tabular bg-white border border-slate-200 rounded"
+              >
+                {scopedPanelOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              {index > 0 && (
+                <button
+                  type="button"
+                  onClick={() => onRemovePanelAt(beat.beat_id, index)}
+                  title="删掉这一格分镜"
+                  aria-label={`${beat.beat_id} 删掉第 ${index + 1} 格分镜`}
+                  className="w-5 h-5 text-[11px] leading-none text-slate-400 hover:text-red-600 border border-slate-200 rounded bg-white"
+                >
+                  ×
+                </button>
+              )}
+            </div>
+          ))}
           {/* Patch v4.13：归属幕与分镜解耦，这里单独指定这一句讲哪一幕。 */}
           {sceneOptions.length > 0 && (
             <select
@@ -1828,6 +1890,23 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     [episode.panels]
   );
 
+  /**
+   * Patch v4.32：镜头编排（启用幕）覆盖的分镜集合 —— 「用户在分镜里选过的画面」
+   * 的唯一权威口径。
+   *
+   * 审核台的分镜下拉只列这批分镜，避免用户在这里挑到编排范围外的画面
+   * （那批画面从没进过镜头编排，成片里出现就是「我没选过的画面」）。
+   * 编排为空（还没编排 / 没有启用幕）时返回空集合 = 不限制，与后端口径一致。
+   */
+  const scopePanelIds = useMemo(() => {
+    const ids = new Set<string>();
+    storyboardScenes.forEach((scene) => {
+      if (scene.enabled === false) return;
+      scene.panel_ids.forEach((pid) => ids.add(pid));
+    });
+    return ids;
+  }, [storyboardScenes]);
+
   /** Patch v4.25：归属幕下拉的选项数组预计算（引用稳定）。 */
   const sceneOptions = useMemo(
     () =>
@@ -2277,7 +2356,14 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
 
   const handleAddBeat = useCallback(() => {
     const prev = draftBeatsRef.current;
-    const firstPanel = episode.panels[0]?.panel_id ?? 'p_001';
+    // Patch v4.32：新句默认落在「镜头编排范围内」的第一格分镜。
+    // 以前取的是 episode.panels[0]（全部分镜的第一格），那一格往往根本不在
+    // 用户编排的幕里 —— 于是新句从一开始就指向一张用户没选过的画面。
+    const scopedFirst =
+      episode.panels.find((p) => scopePanelIds.has(p.panel_id))?.panel_id ??
+      episode.panels[0]?.panel_id ??
+      'p_001';
+    const firstPanel = scopedFirst;
     const newBeat: ScriptBeat = {
       beat_id: uniqueBeatId(prev),
       narration_text: '请在此输入新的短句解说文案。',
@@ -2305,6 +2391,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     storyboardScenes,
     sceneKeyOfBeat,
     expandSceneKey,
+    scopePanelIds,
   ]);
 
   /**
@@ -2320,14 +2407,24 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     if (index < 0) return;
     const current = prev[index];
     const next = prev[index + 1];
+    // Patch v4.32：继承分镜时只继承「镜头编排范围内」的那些格，
+    // 避免把越界（用户没在编排里选过）的画面带进新句。
+    const inherited = next
+      ? [...next.target_panel_ids]
+      : [...current.target_panel_ids];
+    const inScope = scopePanelIds.size
+      ? inherited.filter((pid) => scopePanelIds.has(pid))
+      : inherited;
+    const fallbackPanel =
+      episode.panels.find((p) => scopePanelIds.has(p.panel_id))?.panel_id ??
+      episode.panels[0]?.panel_id ??
+      'p_001';
     const newBeat: ScriptBeat = {
       beat_id: uniqueBeatId(prev),
       narration_text: '请在此输入新的短句解说文案。',
       tts_text: '',
       emotion_instruction: current.emotion_instruction,
-      target_panel_ids: next
-        ? [...next.target_panel_ids]
-        : [...current.target_panel_ids],
+      target_panel_ids: inScope.length ? inScope : [fallbackPanel],
       motion: current.motion,
       pause_after_ms: current.pause_after_ms,
       audio_duration_ms: 0,
@@ -2350,6 +2447,8 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     storyboardScenes,
     sceneKeyOfBeat,
     expandSceneKey,
+    scopePanelIds,
+    episode.panels,
   ]);
 
   const handleDeleteBeat = useCallback((beatId: string) => {
@@ -2412,7 +2511,20 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         tableDirtyEpisodeRef.current = '';
         setTableDirty(false);
         pendingRef.current = null;
-        if ((outcome.warnings ?? []).length > 0) {
+        // Patch v4.32：后端把编排范围外的分镜引用收口了 —— 如实告诉用户改了哪几处。
+        const scopeViolations = outcome.scope_violations ?? [];
+        if (scopeViolations.length > 0) {
+          const detail = scopeViolations
+            .map(
+              (item) =>
+                `${item.beat_id}：去掉 ${item.removed.join('、')}` +
+                (item.replacement ? ` → 改用 ${item.replacement}` : '')
+            )
+            .join('；');
+          setSaveHint(
+            `已保存，但有 ${scopeViolations.length} 处分镜引用不在镜头编排范围内，已自动改回编排内（${detail}）。`
+          );
+        } else if ((outcome.warnings ?? []).length > 0) {
           setSaveHint(
             `已保存，但有 ${outcome.warnings.length} 处角色名写法与规范名不一致（点「保存解说稿」可查看详情）。`
           );
@@ -2905,9 +3017,56 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     [updateBeatField]
   );
 
+  /**
+   * Patch v4.32：改这一句的**主画面**分镜（第 1 格）。
+   *
+   * 以前这里是 `updateBeatField(beatId, 'target_panel_ids', [panelId])` ——
+   * 一改就把整句的多目标压成一格，Stage 4 分配的「一句多格」信息当场丢失，
+   * 成片随之与审核台对不上。现在只替换第 1 格，其余目标格原样保留。
+   */
   const handleRowChangePanel = useCallback(
-    (beatId: string, panelId: string) =>
-      updateBeatField(beatId, 'target_panel_ids', [panelId]),
+    (beatId: string, panelId: string) => {
+      const beat = draftBeatsRef.current.find((b) => b.beat_id === beatId);
+      if (!beat) return;
+      const next = [...(beat.target_panel_ids ?? [])];
+      if (next.length === 0) {
+        updateBeatField(beatId, 'target_panel_ids', [panelId]);
+        return;
+      }
+      next[0] = panelId;
+      updateBeatField(beatId, 'target_panel_ids', next);
+    },
+    [updateBeatField]
+  );
+
+  /**
+   * Patch v4.32：改第 index 个目标分镜（保留其它目标格）。
+   *
+   * 以前改分镜会把多目标压成一格 —— Stage 4 分配的「一句多格」信息一改就丢，
+   * 成片随之与审核台对不上。现在只替换被点的那一格。
+   */
+  const handleRowChangePanelAt = useCallback(
+    (beatId: string, index: number, panelId: string) => {
+      const beat = draftBeatsRef.current.find((b) => b.beat_id === beatId);
+      if (!beat) return;
+      const next = [...(beat.target_panel_ids ?? [])];
+      if (index < 0 || index >= next.length) return;
+      next[index] = panelId;
+      updateBeatField(beatId, 'target_panel_ids', next);
+    },
+    [updateBeatField]
+  );
+
+  /** Patch v4.32：删掉第 index 个目标分镜（至少保留一格，否则后端校验会拒）。 */
+  const handleRowRemovePanelAt = useCallback(
+    (beatId: string, index: number) => {
+      const beat = draftBeatsRef.current.find((b) => b.beat_id === beatId);
+      if (!beat) return;
+      const current = beat.target_panel_ids ?? [];
+      if (current.length <= 1 || index < 0 || index >= current.length) return;
+      const next = current.filter((_, i) => i !== index);
+      updateBeatField(beatId, 'target_panel_ids', next);
+    },
     [updateBeatField]
   );
 
@@ -4167,6 +4326,9 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                                   onChangeMotion={handleRowChangeMotion}
                                   onChangePause={handleRowChangePause}
                                   onChangePanel={handleRowChangePanel}
+                                  onChangePanelAt={handleRowChangePanelAt}
+                                  onRemovePanelAt={handleRowRemovePanelAt}
+                                  scopePanelIds={scopePanelIds}
                                   onChangeScene={handleRowChangeScene}
                                   onToggleTagPicker={handleRowToggleTagPicker}
                                   onPickTag={handleRowPickTag}

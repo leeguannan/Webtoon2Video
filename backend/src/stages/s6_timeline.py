@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from core.panel_ids import PanelIdResolver, trailing_number
+from core.panel_scope import PanelScope, load_panel_scope
 from core.schemas import (
     AudioClipMeta,
     CameraMotion,
@@ -632,6 +633,50 @@ def text_card_panel_ids(series_dir: str | Path, episode_no: int) -> set[str]:
     }
 
 
+def _nearest_scoped_panel(
+    scope: PanelScope,
+    index: PanelIndex,
+    target_panel_ids: Sequence[str],
+    scene_id: str | None = None,
+) -> PanelMeta | None:
+    """在编排范围内找出与目标分镜**序位最接近**、且磁盘上真实存在的一格。
+
+    Patch v4.32：当一句解说的目标分镜全被剔除（编排范围外）时，不能默默
+    换成上一句的画面（画面与解说对不上），而要换成编排范围内离原目标最近
+    的那一格，保证「这句讲的就是这一格」。
+
+    **与写回层保持同一口径**：先看这句归属的那一幕（``scene_id``）在编排里
+    有哪些分镜，优先用同幕的（画面与这一幕的叙事一致）；同幕没有可用分镜时
+    才退回「序位最近」的一格。
+    """
+    candidates: list[tuple[int, int, str, PanelMeta]] = []
+    for allowed_id in scope.ordered_allowed():
+        panel = index.resolve(allowed_id)
+        if panel is None:
+            continue
+        number = trailing_number(panel.panel_id)
+        if number is None:
+            continue
+        candidates.append((number, 0, str(panel.panel_id), panel))
+    if not candidates:
+        return None
+    by_id = {item[2]: item for item in candidates}
+    # 同幕优先：这一句本来就属于这一幕，画面与叙事才对得上。
+    for scene_panel_id in scope.scene_panels(scene_id):
+        hit = by_id.get(scene_panel_id)
+        if hit is not None:
+            return hit[3]
+    targets = [trailing_number(pid) for pid in target_panel_ids]
+    targets = [t for t in targets if t is not None]
+    if not targets:
+        return candidates[0][3]
+    best = min(
+        candidates,
+        key=lambda item: (min(abs(item[0] - t) for t in targets), item[0]),
+    )
+    return best[3]
+
+
 def build_timeline(
     *,
     episode_id: str,
@@ -643,6 +688,7 @@ def build_timeline(
     fps: int = DEFAULT_FPS,
     focus_regions: Mapping[str, tuple[float, float, float, float]] | None = None,
     panel_sfx_map: Mapping[str, Sequence[str]] | None = None,
+    panel_scope: PanelScope | None = None,
 ) -> RenderTimeline:
     """按 Audio-First 规则编排时间轴。
 
@@ -659,6 +705,16 @@ def build_timeline(
     **帧对齐取舍**：只有「切点」（每句起点、每段画面边界）落在 33ms 栅格上，
     音频/字幕的**终点**保留真实毫秒（``start + 真实时长``），
     这样字幕与语音严格对齐，同时渲染端按帧切片不会抖动。
+
+    **Patch v4.32：镜头编排范围收口**。``panel_scope`` 来自镜头编排页
+    （``04_script/storyboard.json``）**启用幕**引用的分镜集合，是「用户在分镜里
+    选过的画面」的唯一权威口径。传入后：
+
+    * 指向编排范围外分镜的 target 会被丢弃（不再渲染用户没选过的画面）；
+    * 一句的所有 target 都被丢弃时，回退到**编排范围内序位最接近**的一格
+      （而不是上一句的画面），保证「这句讲的就是这一格」；
+    * ``panel_scope`` 为 ``None`` 或空范围（没有编排文件 / 没有启用幕）时，
+      行为与 Patch v4.32 之前完全一致（向后兼容）。
     """
     fps = max(1, int(fps))
     grid = frame_ms(fps)
@@ -674,6 +730,9 @@ def build_timeline(
     index = PanelIndex(panels)
     if not index:
         raise TimelineError("没有可用面板，无法编排时间轴（Stage 2 面板目录为空）")
+
+    # Patch v4.32：镜头编排范围（启用幕引用的分镜）是唯一权威口径。
+    scope_active = panel_scope is not None and not panel_scope.is_empty
 
     regions: dict[str, tuple[float, float, float, float]] = {
         str(key): tuple(float(v) for v in value)  # type: ignore[misc]
@@ -701,14 +760,42 @@ def build_timeline(
 
         # ---- 选画面 ----
         chosen: list[PanelMeta] = []
+        dropped_out_of_scope: list[str] = []
         if beat is not None:
             for panel_id in getattr(beat, "target_panel_ids", []) or []:
                 panel = index.resolve(panel_id)
-                if panel is not None:
-                    chosen.append(panel)
+                if panel is None:
+                    continue
+                # Patch v4.32：镜头编排页启用幕引用的分镜才是「用户选过的画面」，
+                # 编排范围外的引用一律不渲染（成片里不该出现用户没选过的画面）。
+                if scope_active and not panel_scope.allows(panel.panel_id):
+                    dropped_out_of_scope.append(panel.panel_id)
+                    continue
+                chosen.append(panel)
+        if not chosen and scope_active:
+            # 这一句的目标全在编排范围外 → 换成编排范围内同幕（优先）或序位最近的一格，
+            # 保证「这句讲的就是这一格」，而不是默默换成上一句的画面。
+            replacement = _nearest_scoped_panel(
+                panel_scope,
+                index,
+                list(getattr(beat, "target_panel_ids", []) or []) if beat is not None else [],
+                scene_id=(
+                    str(getattr(beat, "scene_id", "") or "") or None
+                    if beat is not None
+                    else None
+                ),
+            )
+            if replacement is not None:
+                chosen = [replacement]
         if not chosen:
             # 没有可用面板 → 复用上一张，保持画面连续（不产生空 scene）。
             chosen = [previous_panel] if previous_panel is not None else [index.panels[0]]
+        if dropped_out_of_scope:
+            print(
+                f"[s6_timeline] {audio.beat_id} 的目标分镜 {sorted(set(dropped_out_of_scope))} "
+                "不在镜头编排范围内，已剔除",
+                file=sys.stderr,
+            )
 
         # ---- 该 beat 内部按帧切分画面（每段至少 1 帧）----
         total_frames = max(1, duration // grid)
@@ -1026,6 +1113,16 @@ def build_timeline_from_workspace(
     # Patch v3.1 Patch 11 B3：画面音效描述（sfx_cue 缺失时的兜底来源）。
     panel_sfx_map = load_panel_sfx_lists(series_dir, episode_no)
 
+    # Patch v4.32：镜头编排范围（启用幕引用的分镜）是「用户选过的画面」的唯一权威。
+    # 这里在**渲染层**再兜一次底：即便剧本里有越界引用（历史文件 / 手工改盘），
+    # 成片也不会出现用户没在分镜里选过的画面。
+    panel_scope = load_panel_scope(_episode_dir(series_dir, episode_no))
+    if panel_scope is not None and not panel_scope.is_empty:
+        print(
+            f"[s6_timeline] 镜头编排范围生效：允许 {len(panel_scope.allowed_panel_ids)} 格分镜",
+            file=sys.stderr,
+        )
+
     return build_timeline(
         episode_id=str(script.episode_id or f"ep_{episode_no:03d}"),
         script=script,
@@ -1036,6 +1133,7 @@ def build_timeline_from_workspace(
         fps=fps,
         focus_regions=focus_regions,
         panel_sfx_map=panel_sfx_map,
+        panel_scope=panel_scope,
     )
 
 

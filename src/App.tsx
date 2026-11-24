@@ -1144,7 +1144,12 @@ export default function App() {
       showToast(
         triggerFromStage5 ? '已保存脚本修改，并从 Stage 5 重新出片' : '已保存脚本修改'
       );
-      return { ok: true, warnings: res?.character_warnings ?? [] };
+      return {
+        ok: true,
+        warnings: res?.character_warnings ?? [],
+        // Patch v4.32：后端把编排范围外的分镜引用收口了，这里如实回传给审核台提示。
+        scope_violations: res?.panel_scope_violations ?? [],
+      };
     } catch (err) {
       reportError('保存脚本失败', err);
       return { ok: false, warnings: [] };
@@ -1173,7 +1178,11 @@ export default function App() {
       ...ep,
       beats: savedBeats,
     }));
-    return { ok: true, warnings: res?.character_warnings ?? [] };
+    return {
+      ok: true,
+      warnings: res?.character_warnings ?? [],
+      scope_violations: res?.panel_scope_violations ?? [],
+    };
   };
 
   /**
