@@ -870,11 +870,19 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
                 }
                 title={
                   index === 0
-                    ? '这一句的主画面分镜'
+                    ? `这一句的主画面分镜${
+                        targetPanelIds.length > 1
+                          ? `（本句共 ${targetPanelIds.length} 格，会按格数均分时长轮播）`
+                          : ''
+                      }`
                     : `这一句的第 ${index + 1} 格分镜（成片会按格数均分时长轮播）`
                 }
                 aria-label={`${beat.beat_id} 第 ${index + 1} 格分镜`}
-                className="w-16 px-1 py-0.5 text-[11px] font-mono-tabular bg-white border border-slate-200 rounded"
+                className={
+                  index > 0
+                    ? 'w-16 px-1 py-0.5 text-[11px] font-mono-tabular bg-amber-50/70 border border-amber-300 rounded ring-1 ring-amber-200'
+                    : 'w-16 px-1 py-0.5 text-[11px] font-mono-tabular bg-white border border-slate-200 rounded'
+                }
               >
                 {scopedPanelOptions.map((option) => (
                   <option key={option.value} value={option.value}>
@@ -1574,6 +1582,14 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   const [characterCheckBusy, setCharacterCheckBusy] = useState(false);
   /** 表格保存失败或校验失败时的提示文案。 */
   const [saveHint, setSaveHint] = useState('');
+  /**
+   * Patch v4.33：「全部按主画面」的处理结果提示。
+   *
+   * Stage 4 会给一句解说配多格分镜（Stage 6 按格数均分时长轮播），
+   * 用户没有逐格确认过 —— 成片里就会播到用户没参与决策的画面。
+   * 这个提示把「改了几句、保存后要重跑什么」一次说清。
+   */
+  const [multiPanelHint, setMultiPanelHint] = useState('');
   /** Patch v4.23：角色名写法告警的确认弹窗（null = 不显示）。 */
   const [charPrompt, setCharPrompt] = useState<CharacterPrompt | null>(null);
   /**
@@ -3070,6 +3086,40 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     [updateBeatField]
   );
 
+  /**
+   * Patch v4.33：一键把「一句多格画面」收敛为「只播主画面」。
+   *
+   * 背景：Stage 4 会给一句解说配多格分镜（Stage 6 按格数**均分时长**轮播它们）。
+   * 用户在审核台并没有逐格确认过这些画面 —— 成片里就会播到「用户没参与决策」
+   * 的画面（真实案例：wt_3924 EP.001 的 b4 配了 p_014 + p_017，成片 26 秒
+   * 播的是第 2 格 p_017，而审核台那一行只让人看到第 1 格）。
+   *
+   * 这个按钮把全话所有多目标句统一收敛成只保留第 1 格（主画面）：
+   * - 满足铁律「成片播的画面 = 审核台这一行选中的画面」；
+   * - 想要轮播的用户，仍然可以在行内手动加回第 2 格（Patch v4.32 的逐格编辑）。
+   */
+  const handleCollapseToMainPanel = useCallback(() => {
+    const beats = draftBeatsRef.current;
+    let changed = 0;
+    const next = beats.map((beat) => {
+      const ids = beat.target_panel_ids ?? [];
+      if (ids.length <= 1) return beat;
+      changed += 1;
+      return { ...beat, target_panel_ids: [ids[0]] };
+    });
+    if (changed === 0) {
+      setMultiPanelHint('当前没有「一句多格画面」的句子，无需处理。');
+      return;
+    }
+    draftBeatsRef.current = next;
+    setDraftBeats(next);
+    markTableDirty();
+    setMultiPanelHint(
+      `已把 ${changed} 句的「一句多格画面」收敛为只播主画面（第 1 格）。` +
+        '保存解说稿后重跑 S6~S7 即可生效（无需重跑配音）。'
+    );
+  }, [markTableDirty]);
+
   const handleRowChangeScene = useCallback(
     (beatId: string, sceneId: string | null) =>
       updateBeatField(beatId, 'scene_id', sceneId),
@@ -3719,89 +3769,107 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
           </div>
 
           {activeTab === 'script' && (
-            <div className="flex items-center gap-2.5">
+            /* Patch v4.34：审核台工具栏改为纯图标（悬停出 title 提示），避免按钮文字把
+               工具条撑出可视区、后面的按钮（如 v4.33 的「全部按主画面」）被挤掉看不见。 */
+            <div className="flex flex-wrap items-center gap-1.5">
               <button
                 type="button"
                 onClick={handleAddBeat}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0 cursor-pointer"
+                title="新增解说句"
+                aria-label="新增解说句"
+                className="inline-flex items-center justify-center w-8 h-8 rounded-lg text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 shrink-0 cursor-pointer"
               >
-                <Plus className="w-3.5 h-3.5" />
-                新增解说句
+                <Plus className="w-4 h-4" />
               </button>
               <button
                 type="button"
                 disabled={autoPacingLoading || !onAutoPacing}
                 onClick={() => void handleRunAutoPacing()}
-                title={tableDirty ? '请先保存解说稿再执行自动节奏留白' : '按叙事节奏规则自动优化句间停顿（pause_after_ms）'}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
+                title={tableDirty ? '请先保存解说稿再执行自动节奏留白' : '自动节奏留白：按叙事节奏规则优化句间停顿（pause_after_ms）'}
+                aria-label="自动节奏留白"
+                className="inline-flex items-center justify-center w-8 h-8 rounded-lg text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 shrink-0 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
               >
                 {autoPacingLoading ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  <Loader2 className="w-4 h-4 animate-spin" />
                 ) : (
-                  <Wand2 className="w-3.5 h-3.5" />
+                  <Clock className="w-4 h-4" />
                 )}
-                自动节奏留白
               </button>
               {/* Patch v4.28：一键自动分配画面动效（按分镜几何 + 情绪自动挑运镜）。 */}
               <button
                 type="button"
                 disabled={autoMotionLoading || !onAutoMotions}
                 onClick={() => void handleRunAutoMotions()}
-                title={tableDirty ? '请先保存解说稿再执行自动分配动效' : '按分镜尺寸与情绪自动分配运镜（pan_down / pan_left / shake 等）'}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
+                title={tableDirty ? '请先保存解说稿再执行自动分配动效' : '自动分配动效：按分镜尺寸与情绪自动分配运镜（横扫 / 推拉 / 震动等）'}
+                aria-label="自动分配动效"
+                className="inline-flex items-center justify-center w-8 h-8 rounded-lg text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 shrink-0 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
               >
                 {autoMotionLoading ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  <Loader2 className="w-4 h-4 animate-spin" />
                 ) : (
-                  <Wand2 className="w-3.5 h-3.5" />
+                  <Wand2 className="w-4 h-4" />
                 )}
-                自动分配动效
+              </button>
+              {/* Patch v4.33：一键把「一句多格画面」收敛成「只播主画面」。
+                  防止成片里出现用户没在审核台逐格确认过的画面。 */}
+              <button
+                type="button"
+                onClick={handleCollapseToMainPanel}
+                title="全部按主画面：把全话所有「一句多格画面」的句子收敛为只播主画面（第 1 格）；想要轮播的行仍可手动加回第 2 格"
+                aria-label="全部按主画面"
+                className="inline-flex items-center justify-center w-8 h-8 rounded-lg text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 shrink-0 cursor-pointer"
+              >
+                <Film className="w-4 h-4" />
               </button>
               <button
                 type="button"
                 onClick={() => setBgmDrawerOpen(true)}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0 cursor-pointer"
+                title="BGM 曲库管理"
+                aria-label="BGM 曲库管理"
+                className="inline-flex items-center justify-center w-8 h-8 rounded-lg text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 shrink-0 cursor-pointer"
               >
-                <Music className="w-3.5 h-3.5" />
-                BGM 曲库管理
+                <Music className="w-4 h-4" />
               </button>
               <button
                 type="button"
                 disabled={suggestBgmLoading}
                 onClick={() => void handleSuggestBgm()}
-                title="按各幕标题/地点/视觉摘要与分镜台词，AI 推断五档情绪与搜歌关键词"
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
+                title="补全各幕配乐建议：按各幕标题/地点/视觉摘要与分镜台词，AI 推断五档情绪与搜歌关键词"
+                aria-label="补全各幕配乐建议"
+                className="inline-flex items-center justify-center w-8 h-8 rounded-lg text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 shrink-0 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
               >
                 {suggestBgmLoading ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  <Loader2 className="w-4 h-4 animate-spin" />
                 ) : (
-                  <Sparkles className="w-3.5 h-3.5" />
+                  <Sparkles className="w-4 h-4" />
                 )}
-                补全各幕配乐建议
               </button>
               {/* Patch v4.25：默认按幕折叠，这里给出「展开全部 / 全部折叠」快捷入口。 */}
               <button
                 type="button"
                 onClick={expandAllScenes}
                 title="展开全部幕，逐句审核解说与多音字"
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0 cursor-pointer"
+                aria-label="展开全部幕"
+                className="inline-flex items-center justify-center w-8 h-8 rounded-lg text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 shrink-0 cursor-pointer"
               >
-                <ChevronDown className="w-3.5 h-3.5" />
-                展开全部
+                <ChevronDown className="w-4 h-4" />
               </button>
               <button
                 type="button"
                 onClick={collapseAllScenes}
                 title="全部折叠，只保留幕标题与要点"
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0 cursor-pointer"
+                aria-label="全部折叠"
+                className="inline-flex items-center justify-center w-8 h-8 rounded-lg text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 shrink-0 cursor-pointer"
               >
-                <ChevronRight className="w-3.5 h-3.5" />
-                全部折叠
+                <ChevronRight className="w-4 h-4" />
               </button>
               {tableDirty && (
-                <span className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-lg whitespace-nowrap shrink-0">
-                  <AlertCircle className="w-3.5 h-3.5" />
-                  有未保存的改动
+                <span
+                  title="有未保存的改动"
+                  aria-label="有未保存的改动"
+                  className="inline-flex items-center justify-center w-8 h-8 rounded-lg text-amber-700 bg-amber-50 border border-amber-200 shrink-0"
+                >
+                  <AlertCircle className="w-4 h-4" />
                 </span>
               )}
               <button
@@ -3812,32 +3880,33 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                     ? '正在预检角色名写法，请稍候…'
                     : '保存解说稿（Cmd/Ctrl+S）'
                 }
+                aria-label="保存解说稿"
                 onClick={() => void handleSaveBeats(false)}
-                className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium rounded-lg whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed ${
+                className={`inline-flex items-center justify-center w-8 h-8 rounded-lg shrink-0 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed ${
                   tableDirty
                     ? 'text-blue-700 bg-blue-50 border border-blue-300 hover:bg-blue-100'
                     : 'text-slate-700 bg-white border border-slate-200 hover:bg-slate-50'
                 }`}
               >
                 {savingBeats ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  <Loader2 className="w-4 h-4 animate-spin" />
                 ) : (
-                  <FileText className="w-3.5 h-3.5" />
+                  <FileText className="w-4 h-4" />
                 )}
-                保存解说稿
               </button>
               <button
                 type="button"
                 disabled={savingBeats || characterCheckBusy}
                 onClick={() => void handleSaveBeats(true)}
-                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
+                title="保存并从 Stage 5 重跑配音（会作废旧配音重新合成）"
+                aria-label="保存并从 Stage 5 重跑配音"
+                className="inline-flex items-center justify-center w-8 h-8 rounded-lg text-white bg-blue-600 hover:bg-blue-700 shrink-0 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
               >
                 {savingBeats ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  <Loader2 className="w-4 h-4 animate-spin" />
                 ) : (
-                  <RotateCcw className="w-3.5 h-3.5" />
+                  <RotateCcw className="w-4 h-4" />
                 )}
-                保存并从 Stage 5 重跑配音
               </button>
             </div>
           )}
@@ -3930,6 +3999,13 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
           <div className="mt-2 flex items-start gap-2 px-3 py-2 text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg">
             <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
             <span>{autoMotionError}</span>
+          </div>
+        )}
+        {/* Patch v4.33：「全部按主画面」结果条。 */}
+        {activeTab === 'script' && multiPanelHint && (
+          <div className="mt-2 flex items-start gap-2 px-3 py-2 text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-lg">
+            <Film className="w-4 h-4 mt-0.5 shrink-0" />
+            <span>{multiPanelHint}</span>
           </div>
         )}
 
