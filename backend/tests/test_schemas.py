@@ -185,6 +185,9 @@ FIELD_LOCKS: list[tuple[type, tuple[str, ...]]] = [
             "focus_region",
             # Patch v2.6-5：focus_region 是 focus_hint 取景带时置 True，渲染端据此裁切。
             "focus_band",
+            # Patch v4.30：接力扫镜区间（同格连续平移时由 Stage 6 写入，Stage 7 读取）。
+            "pan_start_ratio",
+            "pan_end_ratio",
         ),
     ),
     (SubtitleLine, ("index", "beat_id", "text", "start_ms", "end_ms")),

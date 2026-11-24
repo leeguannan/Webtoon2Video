@@ -75,7 +75,9 @@ function splitSceneAt(
   const leftIds = target.panel_ids.slice(0, panelLocalIdx);
   const rightIds = target.panel_ids.slice(panelLocalIdx);
   const next = [...scenes];
-  next[sceneIdx] = { ...target, panel_ids: leftIds };
+  // Patch v4.29：拆幕后左半幕的分镜组合已经变了，旧「画面复核」摘要必然过期，
+  // 必须清空，否则 Stage 4 会拿着过期摘要去讲已经拆走的画面。
+  next[sceneIdx] = { ...target, panel_ids: leftIds, visual_recap: '' };
   next.splice(sceneIdx + 1, 0, {
     scene_id: '',
     scene_index: 0, // 占位，renumber 会按 1-based 重排
@@ -107,6 +109,8 @@ function mergeIntoPrevious(scenes: StoryboardScene[], sceneIdx: number): Storybo
     // 合并后必保台词取并集，避免人工锁定被静默丢弃。
     locked_quotes: Array.from(new Set([...prev.locked_quotes, ...target.locked_quotes])),
     user_note: [prev.user_note, target.user_note].filter(Boolean).join('\n'),
+    // Patch v4.29：合并后分镜组合变了，画面复核摘要过期，必须清空。
+    visual_recap: '',
   };
   const next = [...scenes];
   next[sceneIdx - 1] = merged;
@@ -135,6 +139,10 @@ function movePanel(
   } else {
     next[neighbourIdx].panel_ids.unshift(panelId);
   }
+  // Patch v4.29：源幕（被移出）与目标幕（被移入）的分镜组合都变了，
+  // 两边的画面复核摘要都过期，必须清空。
+  next[sceneIdx].visual_recap = '';
+  next[neighbourIdx].visual_recap = '';
   // 源幕被搬空时删除空幕，避免出现零分镜镜头组。
   const compact = next.filter((scene) => scene.panel_ids.length > 0);
   return renumber(compact);
@@ -204,6 +212,9 @@ function movePanelWithinScene(
   const current = ids[localIdx];
   ids[localIdx] = ids[neighbourIdx];
   ids[neighbourIdx] = current;
+  // Patch v4.29：幕内换序同样改变了 panel_ids 序列（后端比较的是列表），
+  // 画面复核摘要按同一规则失效，前后端口径一致。
+  next[sceneIdx].visual_recap = '';
   // 幕内换序不改变幕的数量与先后，scene_index / scene_id 保持不变。
   return next;
 }
@@ -230,7 +241,8 @@ function addPanelToScene(
   }
   ids.splice(insertAt, 0, panelId);
   return scenes.map((scene, index) =>
-    index === sceneIdx ? { ...scene, panel_ids: ids } : scene
+    // Patch v4.29：加格后分镜组合变了，画面复核摘要过期，必须清空。
+    index === sceneIdx ? { ...scene, panel_ids: ids, visual_recap: '' } : scene
   );
 }
 
@@ -246,7 +258,8 @@ function removePanelFromScene(
   if (localIdx < 0 || localIdx >= target.panel_ids.length) return scenes;
   const ids = target.panel_ids.filter((_, index) => index !== localIdx);
   return scenes.map((scene, index) =>
-    index === sceneIdx ? { ...scene, panel_ids: ids } : scene
+    // Patch v4.29：删格后分镜组合变了，画面复核摘要过期，必须清空。
+    index === sceneIdx ? { ...scene, panel_ids: ids, visual_recap: '' } : scene
   );
 }
 
@@ -916,7 +929,10 @@ export const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
       const ids = target.panel_ids.filter((pid) => pid !== panelId);
       // 移除后为空说明这一格就是本幕唯一分镜，禁止清空某一幕。
       if (ids.length === 0 || ids.length === target.panel_ids.length) return prev;
-      return prev.map((scene, index) => (index === sceneIdx ? { ...scene, panel_ids: ids } : scene));
+      // Patch v4.29：整格移除后分镜组合变了，画面复核摘要过期，必须清空。
+      return prev.map((scene, index) =>
+        index === sceneIdx ? { ...scene, panel_ids: ids, visual_recap: '' } : scene
+      );
     });
   }, []);
 

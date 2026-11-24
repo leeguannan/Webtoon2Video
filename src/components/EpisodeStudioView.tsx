@@ -1130,7 +1130,10 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
                 Math.max(0, Math.min(2000, Math.round(Number(e.target.value) || 0)))
               )
             }
-            className="w-full px-2 py-1 text-[11px] font-mono-tabular bg-white border border-slate-200 rounded"
+            // Patch v4.29：数字框太窄时 Chrome 的上下微调箭头会把数字整段挤掉，
+            // 用户只能看到一个「‹」。这里给足最小宽度并让输入框吃掉剩余空间，
+            // 同时用 hide-spinner 隐藏箭头（见 index.css），保证 0~2000 的数字完整可见。
+            className="hide-spinner flex-1 min-w-[76px] w-auto px-2 py-1 text-[11px] font-mono-tabular bg-white border border-slate-200 rounded"
           />
         </div>
       </td>
@@ -1593,6 +1596,30 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     setVideoTimeMs(0);
     setIsPlayingVideo(false);
   }, [episode.episode_id, episode.beats, episode.panels]);
+
+  /**
+   * Patch v4.29：重跑 Stage 4 后本话的 beats 会整体换一批（编排重组后
+   * 解说跟着重排）。若幕编排还是重组前的那份，按幕分组渲染就会把新剧本
+   * 挂到旧幕上——审核页看到的就是「分镜头乱序、内容与画面对不上」。
+   * 这里在 beats 变化时同步补拉一次最新的 storyboard，保证分组依据与
+   * 新剧本一致（与上面按 Tab 加载的 effect 互相独立，互为兜底）。
+   */
+  useEffect(() => {
+    if (activeTab !== 'script') return;
+    if (!episode.beats || episode.beats.length === 0) return;
+    let cancelled = false;
+    const episodeBase = `/api/episodes/${encodeURIComponent(episode.episode_id)}`;
+    void (async () => {
+      const res = await fetch(`${episodeBase}/storyboard`);
+      if (cancelled) return;
+      if (res.ok) {
+        setSceneStoryboard((await res.json()) as EpisodeStoryboard);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, episode.episode_id, episode.beats]);
 
   // Patch v4.8：换话次时清掉「停顿已改 / 待裁决重跑」的跨话残留状态。
   useEffect(() => {
@@ -4087,7 +4114,8 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                                 <th className="py-3 px-3 min-w-[185px]">
                                   配音角色与语速
                                 </th>
-                                <th className="py-3 px-3 w-36">运镜与停顿</th>
+                                {/* Patch v4.29：加宽「运镜与停顿」列，保证停顿数字框不被挤扁。 */}
+                                <th className="py-3 px-3 w-44 min-w-[176px]">运镜与停顿</th>
                                 <th className="py-3 pl-3 pr-5 w-32 text-right">试听 / 插入 / 删</th>
                               </tr>
                             </thead>

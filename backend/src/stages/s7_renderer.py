@@ -108,6 +108,16 @@ PAN_MARGIN = 1.16
 PAN_BANNER_RATIO = 2.8
 #: Patch v4.28：超窄横幅的放大倍率上限（防止过度放大导致画面发糊）。
 PAN_MAX_BANNER_SCALE = 2.2
+#: Patch v4.30：平移运镜的舒适扫速上限（单位：2x 超采样画布像素/秒）。
+#:
+#: 取景窗最终缩回 1020×1220（超采样画布的 1/2），因此安全框等效速度分别是
+#: <= 260 px/秒（竖扫）与 <= 300 px/秒（横扫）——漫画长图不该被「甩」过去。
+#: 超过上限时只扫到舒适速度为止，绝不为了一次扫完而硬加速。
+PAN_MAX_SPEED_Y_SS = 520.0
+PAN_MAX_SPEED_X_SS = 600.0
+#: Patch v4.30：镜头起止定格时长（秒）——起手与收尾各留一小段静止，
+#: 消除运镜的生硬起停；同时按总帧数收敛，短句不会因为定格而完全不动。
+PAN_HOLD_SECONDS = 0.18
 #: 背景固定质感滤镜（规范明文）：同图放大铺满后高斯模糊 + 暗化降饱和，
 #: 营造沉浸暗调，彻底消除黑/白边生硬感。
 BACKGROUND_BLUR_FILTER = "boxblur=30:4"
@@ -444,6 +454,14 @@ def _motion_of(scene: TimelineScene) -> str:
     return str(value or "static").strip().lower() or "static"
 
 
+def _smoothstep_expr(progress: str) -> str:
+    """把 0~1 的进度表达式转成 Smoothstep 缓动（``p*p*(3-2*p)``）。
+
+    Smoothstep 的速度先增后减，起步与收尾自然减速，比线性推进耐看得多。
+    """
+    return f"({progress})*({progress})*(3-2*({progress}))"
+
+
 def _motion_expressions(motion: str, frames: int) -> tuple[str, str, str]:
     """返回 ``zoompan`` 的 ``z`` / ``x`` / ``y`` 表达式。
 
@@ -453,15 +471,21 @@ def _motion_expressions(motion: str, frames: int) -> tuple[str, str, str]:
 
     **Patch v4.28**：``pan_down`` / ``pan_up`` / ``pan_left`` / ``pan_right``
     已不再走 zoompan（它会把长图压扁并把 y 夹死），改由
-    :func:`_pan_filter_chain` 处理，这里只保留缩放类与抖动类运镜
-    （``frames`` 参数保留只为调用方签名稳定）。
+    :func:`_pan_filter_chain` 处理，这里只保留缩放类与抖动类运镜。
+
+    **Patch v4.30**：``zoom_in`` / ``zoom_out`` 改为**随句长自适应**的 Smoothstep 推拉
+    （``1.0 → 1.10`` / ``1.10 → 1.00``）。旧的「每帧 ±0.0008」写死步长，
+    30 帧短句只能推到 1.024，肉眼几乎看不出推拉；现在无论多长多短的句子，
+    都会在句内完整推到位，且速度先增后减、不再匀速生硬。
     """
     center_x = "(iw-iw/zoom)/2"
     center_y = "(ih-ih/zoom)/2"
+    span = max(1, int(frames) - 1)
+    eased = _smoothstep_expr(f"clip(on/{span}.0,0,1)")
     if motion == "zoom_in":
-        return ("min(zoom+0.0008,1.12)", center_x, center_y)
+        return (f"1.0+0.10*({eased})", center_x, center_y)
     if motion == "zoom_out":
-        return ("if(lte(zoom,1.0),1.12,max(1.001,zoom-0.0008))", center_x, center_y)
+        return (f"1.10-0.10*({eased})", center_x, center_y)
     if motion == "shake":
         return ("1.12", f"{center_x}+sin(on*1.7)*6", f"{center_y}+cos(on*2.3)*6")
     return ("1.0", center_x, center_y)
@@ -610,6 +634,92 @@ def _pan_plan(
     return (fit_scale, fit_pad, None, None)
 
 
+def _pan_hold_frames(frames: int, fps: int) -> int:
+    """返回镜头起止的定格帧数（起手、收尾各一段静止）。
+
+    定格让运镜有「起步」和「收势」，不再是生硬的匀速滑动；
+    上限按总帧数收敛（``(frames - 2) // 6``），短句不会因为定格而完全不动。
+    """
+    total = max(1, int(frames))
+    rate = max(1, int(fps))
+    limit = max(0, (total - 2) // 6)
+    return max(0, min(int(round(PAN_HOLD_SECONDS * rate)), limit))
+
+
+def _pan_axis_expressions(
+    motion: str,
+    frames: int,
+    fps: int,
+    *,
+    pan_start_ratio: float | None,
+    pan_end_ratio: float | None,
+    focus_centered: bool,
+    canvas_w: int | None,
+    canvas_h: int | None,
+) -> tuple[str, str]:
+    """生成滑动取景窗的 ``x`` / ``y`` 位置表达式（Patch v4.30）。
+
+    三条约束同时成立：
+
+    1. **速度封顶**：本段行程 ``travel`` 不超过 ``舒适速度上限 × 有效运动时长``，
+       再长的长图也只扫到「看得清」的速度，绝不为了一次扫完而硬加速；
+    2. **起止定格**：运动只发生在中间的 ``active_frames`` 内，
+       起手与收尾各留 ``hold_frames`` 静止；
+    3. **Smoothstep 缓动**：位置按 ``p*p*(3-2*p)`` 过渡，速度先增后减。
+
+    ``pan_start_ratio`` / ``pan_end_ratio`` 是接力扫镜区间（0~1 的相对行程），
+    由 Stage 6 按「同格连续场景」的时长比例切分：给定后镜头从区间起点出发，
+    只走区间内的行程（同样受速度封顶约束），从而与上一句首尾相接、不再割裂。
+
+    **所有取值都被夹在合法区间内**：位置始终落在 ``[0, 全行程]``，
+    因此 ``crop`` 的 ``x`` / ``y`` 绝不会越界（越界会让整条渲染直接失败）。
+    """
+    vertical = motion in ("pan_down", "pan_up")
+    direction = 1 if motion in ("pan_down", "pan_right") else -1
+    full = f"(ih-{SS_HEIGHT})" if vertical else f"(iw-{SS_WIDTH})"
+    speed_cap = PAN_MAX_SPEED_Y_SS if vertical else PAN_MAX_SPEED_X_SS
+
+    hold = _pan_hold_frames(frames, fps)
+    active_frames = max(1, int(frames) - 2 * hold)
+    active_span = max(1, active_frames - 1)
+    active_sec = active_frames / max(1, int(fps))
+    max_travel = speed_cap * active_sec
+    eased = _smoothstep_expr(f"clip((n-{hold})/{active_span}.0,0,1)")
+
+    start_ratio = pan_start_ratio
+    end_ratio = pan_end_ratio
+    has_ratio = (
+        start_ratio is not None
+        and end_ratio is not None
+        and float(end_ratio) > float(start_ratio) + 1e-6
+    )
+    if has_ratio:
+        low = min(float(start_ratio), float(end_ratio))
+        high = max(float(start_ratio), float(end_ratio))
+        # 接力区间：只走自己那一段行程，且不超过舒适速度上限。
+        travel = f"min(({high:.6f}-{low:.6f})*{full},{max_travel:.4f})"
+        base = f"{low:.6f}*{full}" if direction > 0 else f"{high:.6f}*{full}"
+    else:
+        travel = f"min({full},{max_travel:.4f})"
+        if focus_centered:
+            # 有取景带时优先围绕焦点范围居中，避免一头撞到底或停在边角。
+            base = (
+                f"({full}-{travel})/2"
+                if direction > 0
+                else f"{full}-({full}-{travel})/2"
+            )
+        else:
+            base = "0" if direction > 0 else full
+
+    axis_expr = f"{base}{'+' if direction > 0 else '-'}{travel}*{eased}"
+    if vertical:
+        x_expr = "0" if canvas_w == SS_WIDTH else f"(iw-{SS_WIDTH})/2"
+        return (x_expr, axis_expr)
+    x_expr = axis_expr
+    y_expr = "0" if canvas_h == SS_HEIGHT else f"(ih-{SS_HEIGHT})/2"
+    return (x_expr, y_expr)
+
+
 def _pan_filter_chain(
     fg_label: str,
     motion: str,
@@ -618,8 +728,11 @@ def _pan_filter_chain(
     *,
     out_label: str,
     source_size: tuple[int, int] | None,
+    pan_start_ratio: float | None = None,
+    pan_end_ratio: float | None = None,
+    focus_centered: bool = False,
 ) -> str:
-    """生成平移运镜（上下扫 / 左右横扫）的前景滤镜链（Patch v4.28）。
+    """生成平移运镜（上下扫 / 左右横扫）的前景滤镜链（Patch v4.28 / v4.30）。
 
     **为什么不再用 zoompan**：``zoompan`` 会把输入帧直接缩放到输出尺寸
     （``s=1020x1220``），超长竖格因此被**压扁**成 1020×1220；同时 ``x/y``
@@ -635,23 +748,22 @@ def _pan_filter_chain(
 
     ``pan_down`` 取样点自顶向下移动，``pan_up`` 自底向上；``pan_right`` 自左向右，
     ``pan_left`` 自右向左。
+
+    **Patch v4.30**：位置表达式改由 :func:`_pan_axis_expressions` 生成——
+    速度封顶 + 起止定格 + Smoothstep 缓动；``pan_start_ratio`` /
+    ``pan_end_ratio`` 用于接力扫镜（同格连续多句首尾相接）。
     """
-    span = max(1, int(frames) - 1)
     scale, pad, canvas_w, canvas_h = _pan_plan(motion, source_size)
-    if motion in ("pan_down", "pan_up"):
-        x_expr = "0" if canvas_w == SS_WIDTH else f"(iw-{SS_WIDTH})/2"
-        y_expr = (
-            f"(ih-{SS_HEIGHT})*n/{span}"
-            if motion == "pan_down"
-            else f"(ih-{SS_HEIGHT})*(1-n/{span})"
-        )
-    else:
-        x_expr = (
-            f"(iw-{SS_WIDTH})*n/{span}"
-            if motion == "pan_right"
-            else f"(iw-{SS_WIDTH})*(1-n/{span})"
-        )
-        y_expr = "0" if canvas_h == SS_HEIGHT else f"(ih-{SS_HEIGHT})/2"
+    x_expr, y_expr = _pan_axis_expressions(
+        motion,
+        frames,
+        fps,
+        pan_start_ratio=pan_start_ratio,
+        pan_end_ratio=pan_end_ratio,
+        focus_centered=focus_centered,
+        canvas_w=canvas_w,
+        canvas_h=canvas_h,
+    )
 
     parts: list[str] = [
         "trim=end_frame=1",
@@ -757,6 +869,9 @@ def build_scene_filter(
     # zoompan 会把整张长图直接缩放压扁到 1020×1220，且 y 取样坐标越界后被夹死，
     # 结果是「画面被压扁 + 镜头几乎不动」。新链路等比缩放后用 crop 滑动取景，
     # 画面零压缩，滑动过程也没有抖动。
+    #
+    # Patch v4.30：滑动位置改为「速度封顶 + 起止定格 + Smoothstep 缓动」，
+    # 并支持接力扫镜区间（pan_start_ratio / pan_end_ratio）。
     if motion in ("pan_down", "pan_up", "pan_left", "pan_right"):
         chains.append(
             _pan_filter_chain(
@@ -766,6 +881,11 @@ def build_scene_filter(
                 fps,
                 out_label=f"f{index}",
                 source_size=_effective_source_size(scene, source_size),
+                # Patch v4.30：接力扫镜区间（Stage 6 按同格连续场景时长切分）。
+                pan_start_ratio=getattr(scene, "pan_start_ratio", None),
+                pan_end_ratio=getattr(scene, "pan_end_ratio", None),
+                # 有取景带时，围绕焦点范围居中扫，而不是一头撞到边角。
+                focus_centered=bool(crop),
             )
         )
     elif motion == "static":

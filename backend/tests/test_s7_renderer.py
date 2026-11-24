@@ -780,6 +780,9 @@ def test_tall_panel_pan_down_scans_inside_safe_window(tmp_path: Path) -> None:
 
     Patch v4.28：扫镜不再用 zoompan（它会把长图压扁、并把 y 取样坐标夹死），
     改为「等比缩放 → 2x 超采样 → 滑动 crop → 缩回 1020×1220」。
+
+    Patch v4.30：滑动位置改为「速度封顶 + 起止定格 + Smoothstep 缓动」，
+    因此这里断言的是新表达式而不是旧的 ``(ih-2440)*n/29`` 匀速扫。
     """
 
     def _pan_fragment(source_size: tuple[int, int]) -> str:
@@ -809,8 +812,11 @@ def test_tall_panel_pan_down_scans_inside_safe_window(tmp_path: Path) -> None:
     assert "scale=2040:-2" in tall_fragment
     assert "setsar=1" in tall_fragment
     assert "crop=w=2040:h=2440" in tall_fragment
-    assert "y='(ih-2440)*n/29'" in tall_fragment
     assert "scale=1020:1220:flags=lanczos" in tall_fragment
+    # Patch v4.30：速度封顶（min(可动行程, 舒适速度 × 有效时长)）+ Smoothstep 缓动。
+    assert "min((ih-2440)," in tall_fragment
+    assert "clip((n-4)/21.0,0,1)" in tall_fragment
+    assert "3-2*(clip((n-4)/21.0,0,1))" in tall_fragment
     # 不再走旧的「缩小 + pad + 1.12 倍放大」链路，也不再有会压扁长图的 zoompan。
     assert "1.12" not in tall_fragment
     assert "force_original_aspect_ratio=decrease" not in tall_fragment

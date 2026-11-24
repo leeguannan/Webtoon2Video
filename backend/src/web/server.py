@@ -602,6 +602,14 @@ def _validate_storyboard_scenes(
             )
         previous_last_key = ordered[-1]
         seen.update(panel_ids)
+        # Patch v4.29：重组编排（拆分幕 / 合并幕 / 跨幕移格 / 删格）之后，
+        # 旧的「画面复核」摘要已经对不上新的分镜组合，必须失效——否则 4A 会
+        # 拿着过期摘要去讲早就被改掉的画面。提交值仍等于旧值时强制清空；
+        # 用户主动重写过的新摘要照旧保留。
+        visual_recap = str(raw.get("visual_recap") or "")
+        if existing is not None and list(existing.panel_ids or []) != panel_ids:
+            if visual_recap == (existing.visual_recap or ""):
+                visual_recap = ""
         scenes.append(
             StoryboardScene(
                 # 与 s3b_scenes 约定对齐：scene_index 1-based、scene_id 前缀 sc_。
@@ -616,7 +624,7 @@ def _validate_storyboard_scenes(
                 locked_quotes=[
                     str(item) for item in (raw.get("locked_quotes") or []) if str(item)
                 ],
-                visual_recap=str(raw.get("visual_recap") or ""),
+                visual_recap=visual_recap,
                 bgm_mood=bgm_mood,
                 bgm_suggestion=bgm_suggestion,
                 bgm=bgm_value,

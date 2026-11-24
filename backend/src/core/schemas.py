@@ -342,6 +342,14 @@ class TimelineScene(BaseModel):
     #: Stage 7 应当据此裁切前景（镜头偏移到上/下/中部）；
     #: False = Stage 3 给出的主体框，仅作参考，不改变「原图完整居中」的构图。
     focus_band: bool = False
+    #: Patch v4.30：接力扫镜区间（0~1 的相对行程比例）。
+    #:
+    #: Stage 6 在「连续共享同一分镜且均为平移运镜」的相邻场景组里，
+    #: 按各句时长比例把整条行程切成若干区间，逐句写入本字段；
+    #: Stage 7 据此让镜头从自己那一段的起点出发、首尾相接，
+    #: 长图就不会被「一句一甩」地割裂。``None`` 表示不接力，按整段行程扫。
+    pan_start_ratio: float | None = None
+    pan_end_ratio: float | None = None
 
 
 class SubtitleLine(BaseModel):

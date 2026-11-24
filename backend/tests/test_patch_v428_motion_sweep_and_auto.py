@@ -95,8 +95,10 @@ def test_tall_panel_pan_down_uses_supersampled_crop(tmp_path: Path) -> None:
     # 像素宽高比归一 + 2x 超采样视窗。
     assert "setsar=1" in fragment
     assert "crop=w=2040:h=2440" in fragment
-    # 从顶扫到底（n 从 0 计，span = frames - 1 = 29）。
-    assert "y='(ih-2440)*n/29'" in fragment
+    # Patch v4.30：滑动改为「速度封顶 + 起止定格 + Smoothstep 缓动」，
+    # n 从 0 计，hold=4 帧、active=22 帧（span=21）。
+    assert "min((ih-2440)," in fragment
+    assert "clip((n-4)/21.0,0,1)" in fragment
     # 最后缩回安全框。
     assert "scale=1020:1220:flags=lanczos" in fragment
     # 旧链路（会把长图压扁、并把取样 y 夹死）必须彻底消失。
@@ -110,7 +112,9 @@ def test_tall_panel_pan_up_scrolls_backwards(tmp_path: Path) -> None:
     assert "scale=2040:-2" in fragment
     assert "setsar=1" in fragment
     assert "crop=w=2040:h=2440" in fragment
-    assert "y='(ih-2440)*(1-n/29)'" in fragment
+    # Patch v4.30：从行程末端往回扫（同样是速度封顶 + Smoothstep）。
+    assert "(ih-2440)-min((ih-2440)," in fragment
+    assert "clip((n-4)/21.0,0,1)" in fragment
     assert "zoompan=" not in fragment
 
 
@@ -120,13 +124,15 @@ def test_wide_panel_uses_horizontal_sliding_crop(tmp_path: Path) -> None:
     assert "scale=-2:2440" in right
     assert "setsar=1" in right
     assert "crop=w=2040:h=2440" in right
-    assert "x='(iw-2040)*n/29'" in right
+    # Patch v4.30：横向同样是速度封顶 + Smoothstep（横扫上限略高于竖扫）。
+    assert "min((iw-2040)," in right
+    assert "clip((n-4)/21.0,0,1)" in right
     assert "y='0'" in right
     assert "scale=1020:1220:flags=lanczos" in right
     assert "zoompan=" not in right
 
     left = _motion_fragment(tmp_path, CameraMotion.PAN_LEFT, (1800, 1000))
-    assert "x='(iw-2040)*(1-n/29)'" in left
+    assert "(iw-2040)-min((iw-2040)," in left
     assert "scale=-2:2440" in left
     assert "zoompan=" not in left
 
@@ -315,7 +321,7 @@ def _beat(
 
 
 def test_auto_motions_assigns_by_panel_geometry() -> None:
-    """长竖格 → 竖扫；宽格 → 左右横扫；同一格的连续后续拍 → 推近。"""
+    """长竖格 → 竖扫（Patch v4.30 起同格第 2 拍接力竖扫）；宽格 → 左右横扫。"""
     metas = [
         _panel_meta("p_tall", 800, 2400, tall=True),
         _panel_meta("p_wide_a", 1600, 900),
@@ -331,18 +337,18 @@ def test_auto_motions_assigns_by_panel_geometry() -> None:
     ]
     assigned, report = apply_auto_motions(beats, panel_metas=metas)
     motions = {beat["beat_id"]: beat["motion"] for beat in assigned}
-    # 规则 A：长竖格首拍竖扫，同格后续拍改为推近。
+    # 规则 A：长竖格首拍竖扫；Patch v4.30 起同格第 2 拍继续竖扫（接力扫镜）。
     assert motions["b1"] == "pan_down"
-    assert motions["b2"] == "zoom_in"
+    assert motions["b2"] == "pan_down"
     # 规则 B：宽格左右横扫交替。
     assert motions["b3"] == "pan_right"
     assert motions["b4"] == "pan_left"
     # 规则 D：普通竖格默认推近。
     assert motions["b5"] == "zoom_in"
-    # updated_count 只统计「被改动」的拍（b2 / b5 原本就是 zoom_in，未变）。
-    assert report.updated_count == 3
-    assert report.changed_beat_ids == ["b1", "b3", "b4"]
-    assert report.tall_pan_count == 1
+    # updated_count 只统计「被改动」的拍（b5 原本就是 zoom_in，未变）。
+    assert report.updated_count == 4
+    assert report.changed_beat_ids == ["b1", "b2", "b3", "b4"]
+    assert report.tall_pan_count == 2
     assert report.wide_pan_count == 2
     assert report.push_pull_count == 0
 

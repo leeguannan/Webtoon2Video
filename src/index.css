@@ -11,6 +11,20 @@
     font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
     font-variant-numeric: tabular-nums;
   }
+
+  /* Patch v4.29：审核台「停顿ms」这类窄数字框里，Chrome 内置的上下微调箭头
+     会占掉小半个框宽，把数值整段挤没（只剩一个「‹」）。这里统一隐藏箭头，
+     数值恒可见；步进仍可通过键盘上下键 / 滚轮完成。 */
+  input[type='number'].hide-spinner::-webkit-outer-spin-button,
+  input[type='number'].hide-spinner::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+
+  input[type='number'].hide-spinner {
+    -moz-appearance: textfield;
+    appearance: textfield;
+  }
 }
 
 @keyframes panel-shake {

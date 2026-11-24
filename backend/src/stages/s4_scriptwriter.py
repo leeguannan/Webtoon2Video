@@ -495,6 +495,35 @@ def _scene_directives_block(scene: StoryboardScene | None) -> str:
     return "\n".join(lines)
 
 
+def _scene_count_feedback(
+    active_scenes: Sequence[StoryboardScene],
+    chapter_count: int,
+    ordered_panel_ids: Sequence[str],
+) -> str:
+    """4A 章数与启用幕数不符时的定向反馈（Patch v4.29）。
+
+    章与幕不是一一对应，后续 4B 会把第 k 章的解说挂到第 k 幕的分镜上——
+    章数错了，画面就整体错位。这里把期望的幕数与每幕的分镜边界原样告诉模型。
+    """
+    lines = [
+        f"【分幕数目校验失败】你返回了 {chapter_count} 章，但本话启用幕共 "
+        f"{len(active_scenes)} 幕。章与幕必须一一对应，否则解说会配错画面。"
+        "请严格按下列幕边界重新输出："
+    ]
+    for index, scene in enumerate(active_scenes, start=1):
+        panel_ids = list(scene.panel_ids or [])
+        span = f"{panel_ids[0]} ~ {panel_ids[-1]}" if panel_ids else "（无分镜）"
+        lines.append(
+            f"- 第 {index} 章 = 第 {index} 幕"
+            f"（{scene.title or '未命名幕'}）：分镜 {span}，共 {len(panel_ids)} 格"
+        )
+    lines.append(
+        f"请输出恰好 {len(active_scenes)} 章，章节标题写成「第 k 章」，"
+        "每章只讲对应幕出现的画面，不得跨幕合并或拆分。"
+    )
+    return "\n".join(lines)
+
+
 def _important_panel_ids(
     panels: Sequence[Any],
     active_scenes: Sequence[StoryboardScene],
@@ -517,6 +546,179 @@ def _important_panel_ids(
         if scene.enabled:
             enabled_panel_ids.update(scene.panel_ids or [])
     return [panel_id for panel_id in ids if panel_id in enabled_panel_ids]
+
+
+# ---------------------------------------------------------------------------
+# Patch v4.29：镜头组编排范围收敛（概览 / 4A / 4B 共用同一权威范围）
+# ---------------------------------------------------------------------------
+
+
+async def _resolve_storyboard_context(
+    *,
+    client: LLMClient,
+    model: str,
+    story_model: str,
+    context: Stage4Context,
+    episode_id: str,
+    vision: VisionWindowOutput | None,
+    storyboard: EpisodeStoryboard | None,
+    storyboard_path: Path | None,
+    vision_client: LLMClient | None,
+    vision_model: str,
+    panels_dir: Path | None,
+    reset_storyboard: bool,
+    storyboard_sink: list[EpisodeStoryboard] | None,
+) -> tuple[EpisodeStoryboard | None, list[StoryboardScene], bool]:
+    """解析本话镜头组编排，返回 ``(编排, 启用幕列表, 是否启用逐幕模式)``。
+
+    Patch v4.29：这段原本排在 ``_write_overview`` 与 4A **之后**，导致概览与
+    故事反写仍然「看着整话全部分镜」，而 4B 只在启用幕的窗口里挑图——
+    人工重组编排后两边看到的世界不一致，解说就会大面积对不上画面。
+    现在提前到撰稿之前，让「启用幕的分镜范围」成为全程唯一权威范围。
+    """
+    if vision is None or not vision.panels:
+        return None, [], False
+    # 局部导入，避免 stages 包内部的循环依赖。
+    from stages import s3b_scenes
+
+    resolved_storyboard: EpisodeStoryboard | None
+    scene_mode = False
+    if storyboard is not None:
+        resolved_storyboard = storyboard
+        scene_mode = True
+    elif storyboard_path is not None:
+        # Patch v4.19：改走语义切幕（LLM 通看整话摘要定幕边界），
+        # 内部失败时无感回退规则切幕；人工编排依然绝不覆写。
+        resolved_storyboard = await s3b_scenes.resolve_or_build_storyboard(
+            client,
+            episode_id=episode_id,
+            vision=vision,
+            storyboard_path=Path(storyboard_path),
+            model=story_model or model,
+            reset=reset_storyboard,
+        )
+        scene_mode = True
+    else:
+        resolved_storyboard = s3b_scenes.auto_build_storyboard(episode_id, vision)
+    active_scenes: list[StoryboardScene] = []
+    if resolved_storyboard is not None:
+        active_scenes = [scene for scene in resolved_storyboard.scenes if scene.enabled]
+        if vision_client is not None and panels_dir is not None:
+            resolved_storyboard = await s3b_scenes.enrich_storyboard_with_vision(
+                vision_client,
+                storyboard=resolved_storyboard,
+                panels_dir=panels_dir,
+                model=vision_model,
+                force=False,
+                vision=vision,
+                # Patch v4.19：注入 Layer 1 角色本名/别名/外貌，
+                # 让整幕复核用真名总结跨格因果与关键原话归属。
+                characters=getattr(context, "characters", ()) or (),
+            )
+            active_scenes = [
+                scene for scene in resolved_storyboard.scenes if scene.enabled
+            ]
+    if storyboard_sink is not None and resolved_storyboard is not None:
+        # Patch v4.0 Patch 20.1：把「整幕视觉复核后」的镜头组交出去，
+        # 供 run_stage4 回写（auto 版需要把 visual_recap 落盘）。
+        storyboard_sink.append(resolved_storyboard)
+    return resolved_storyboard, active_scenes, scene_mode
+
+
+def _converge_panel_pool(
+    *,
+    panels: Sequence[PanelVisionInfo],
+    all_panels: Sequence[PanelVisionInfo],
+    resolved_storyboard: EpisodeStoryboard | None,
+    active_scenes: Sequence[StoryboardScene],
+    scene_mode: bool,
+) -> tuple[set[str] | None, list[str], dict[str, PanelVisionInfo], list[PanelVisionInfo]]:
+    """按「启用幕的分镜范围」收敛有效分镜池（Patch v4.29）。
+
+    返回 ``(valid_panel_ids, ordered_panel_ids, panel_map, story_panels)``。
+
+    规则（仅在 ``scene_mode`` 且存在启用幕时生效，否则保持旧行为）：
+
+    * **放行**：启用幕引用、但被过渡页/纯字卡过滤掉的普通分镜重新纳入
+      （版权声明 / 推广尾页永远不放行）；
+    * **剔除禁用幕独有分镜**：用户关掉的幕不再讲；
+    * **剔除孤儿分镜**：不被任何启用幕引用的分镜（包括「移除分镜」后残留的）
+      一律不进入撰稿范围——否则会出现「解说讲了、但画面根本没有」的句子。
+
+    ``story_panels`` 是喂给概览与 4A 故事反写的上下文，必须与 4B 的候选窗口
+    落在同一集合里，否则概览会讲到用户已经删掉的画面。
+    """
+    valid_panel_ids = {panel.panel_id for panel in panels} if panels else None
+    panel_map: dict[str, PanelVisionInfo] = {
+        panel.panel_id: panel for panel in panels
+    }
+    ordered_panel_ids = _ordered_panel_ids(valid_panel_ids or [])
+    if not (scene_mode and active_scenes and resolved_storyboard is not None):
+        # 未启用逐幕模式：保持旧兼容行为。
+        return (
+            valid_panel_ids,
+            ordered_panel_ids,
+            panel_map,
+            exclude_pure_text_cards(list(panels)),
+        )
+
+    all_panel_map = {panel.panel_id: panel for panel in all_panels}
+    enabled_panel_ids = {
+        panel_id
+        for scene in active_scenes
+        for panel_id in (scene.panel_ids or [])
+    }
+    # 注意：必须拷贝一份，否则下面 update(extra_ids) 会连带改掉这个快照，
+    # 导致「放行」的分镜又被当成孤儿剔除。
+    current_ids = set(valid_panel_ids or set())
+    # 放行：用户手动编入启用幕的分镜，即使被自动流程判成过渡页 / 纯字卡，
+    # 也要参与本话撰稿；版权声明页与推广尾页则永远不放行。
+    extra_ids = [
+        panel_id
+        for panel_id in sorted(enabled_panel_ids)
+        if panel_id not in current_ids
+        and panel_id in all_panel_map
+        and all_panel_map[panel_id].non_story_type
+        not in ("copyright_notice", "promo_banner")
+    ]
+    if extra_ids:
+        if valid_panel_ids is None:
+            valid_panel_ids = set()
+        valid_panel_ids.update(extra_ids)
+        for panel_id in extra_ids:
+            panel_map[panel_id] = all_panel_map[panel_id]
+        print(
+            "[s4_scriptwriter] 用户编排额外放行分镜：" + "、".join(extra_ids),
+            file=sys.stderr,
+        )
+    disabled_panel_ids = {
+        panel_id
+        for scene in resolved_storyboard.scenes
+        if not scene.enabled
+        for panel_id in (scene.panel_ids or [])
+    }
+    # 剔除：禁用幕独有的分镜 + 未被任何启用幕引用的孤儿分镜。
+    drop_ids = (disabled_panel_ids - enabled_panel_ids) | (
+        current_ids - enabled_panel_ids
+    )
+    if drop_ids and valid_panel_ids is not None:
+        valid_panel_ids = valid_panel_ids - drop_ids
+        for panel_id in drop_ids:
+            panel_map.pop(panel_id, None)
+        print(
+            "[s4_scriptwriter] 已排除不在启用幕范围内的分镜："
+            + "、".join(sorted(drop_ids)),
+            file=sys.stderr,
+        )
+    # 放行与剔除都改过集合，这里统一重算一次顺序（放行 / 剔除都生效）。
+    ordered_panel_ids = _ordered_panel_ids(valid_panel_ids or [])
+    ordered_panel_ids = [
+        panel_id for panel_id in ordered_panel_ids if panel_id in panel_map
+    ]
+    story_panels = exclude_pure_text_cards(
+        [panel_map[panel_id] for panel_id in ordered_panel_ids]
+    )
+    return valid_panel_ids, ordered_panel_ids, panel_map, story_panels
 
 
 def _chapter_panel_span(
@@ -577,6 +779,100 @@ def _pair_chapters_with_scenes(
     return pairs
 
 
+def _merge_unpaired_chapters(
+    chapters: Sequence[StoryChapter],
+    pairs: dict[int, int],
+    active_scenes: Sequence[StoryboardScene],
+    ordered_panel_ids: Sequence[str],
+) -> list[StoryChapter]:
+    """把「没配上幕」的章节正文并入**最邻近的那一幕**对应的章节。
+
+    Patch v4.29：章幕数量不等时的旧实现把「幕下标」当成「章节下标」用
+    （``target = max(pairs)`` 后直接 ``chapters[target]``）：章数比幕少时会把
+    正文写进完全不相干的章节，章数比幕多时甚至直接越界——这正是「重组编排
+    后解说大面积对不上画面」的一个来源。
+
+    现在按「章节覆盖的分镜区间中心」与「幕覆盖的分镜区间中心」的距离就近
+    归并：既不会写错章节，也不会丢正文。
+    """
+    result = list(chapters)
+    used_chapters = set(pairs.values())
+    unused = [index for index in range(len(result)) if index not in used_chapters]
+    if not unused or not pairs:
+        return result
+    order_index = {
+        panel_id: index for index, panel_id in enumerate(ordered_panel_ids)
+    }
+
+    def _center_of_panel_ids(panel_ids: Sequence[str]) -> float | None:
+        positions = [
+            order_index[panel_id]
+            for panel_id in panel_ids
+            if panel_id in order_index
+        ]
+        if not positions:
+            return None
+        return sum(positions) / len(positions)
+
+    def _scene_center(scene_index: int) -> float | None:
+        return _center_of_panel_ids(active_scenes[scene_index].panel_ids or [])
+
+    def _chapter_center(chapter: StoryChapter) -> float | None:
+        return _center_of_panel_ids(_chapter_panel_span(chapter, ordered_panel_ids))
+
+    paired_scenes = sorted(pairs.items())
+    extra_by_chapter: dict[int, list[str]] = {}
+    for chapter_index in unused:
+        chapter_center = _chapter_center(result[chapter_index])
+        if chapter_center is None:
+            # 没有可定位的分镜区间：并入序号最靠前的已配对幕。
+            target_scene_index = paired_scenes[0][0]
+        else:
+            target_scene_index = min(
+                paired_scenes,
+                key=lambda item: (
+                    abs((_scene_center(item[0]) or 0.0) - chapter_center),
+                    item[0],
+                ),
+            )[0]
+        # 注意：``pairs`` 的键是「幕下标」、值是「章节下标」，
+        # 这里必须用章节下标去索引章节列表——旧实现在这里把两者搞混了。
+        target_chapter = pairs[target_scene_index]
+        extra_by_chapter.setdefault(target_chapter, []).append(
+            result[chapter_index].story_prose or ""
+        )
+    for target_chapter, extra_parts in extra_by_chapter.items():
+        extra = "\n".join(part for part in extra_parts if part).strip()
+        if not extra:
+            continue
+        base = result[target_chapter]
+        result[target_chapter] = base.model_copy(
+            update={
+                "story_prose": "\n".join([base.story_prose or "", extra]).strip()
+            }
+        )
+    return result
+
+
+def _scene_window(
+    scene: StoryboardScene,
+    valid_panel_ids: set[str] | None,
+) -> list[str]:
+    """某幕交给 4B 的候选分镜窗口（保序去重）。
+
+    Patch v4.29：「再加一格」允许同一格被编进多幕，``scene.panel_ids`` 里会
+    出现重复 panel_id。原实现直接把重复项塞给模型，模型会当成两格不同的
+    画面，顺位校验随即报冲突。这里按首次出现保序去重。
+    """
+    return list(
+        dict.fromkeys(
+            panel_id
+            for panel_id in (scene.panel_ids or [])
+            if not valid_panel_ids or panel_id in valid_panel_ids
+        )
+    )
+
+
 def _assign_scene_id(beats: list[dict[str, Any]], scene: StoryboardScene | None) -> None:
     """给某幕产出的解说句打上 ``scene_id``（Patch v4.13）。
 
@@ -634,10 +930,16 @@ def _splice_scene_beats(
     )
     kept: list[dict[str, Any]] = []
     insert_at: int | None = None
+    scene_id = scene.scene_id or ""
     for beat in beats:
         ids = set(coerce_str_list(beat.get("target_panel_ids") or []))
-        # 与本幕有交集的旧解说：整幕重写前先剔除，避免重复与倒序。
-        if scene_panels and ids & scene_panels:
+        beat_scene_id = beat.get("scene_id") or ""
+        # Patch v4.29：命中本幕的旧解说整条剔除。除了「指向本幕分镜」，
+        # 还要认「自称属于本幕」的句子——之前被 _clamp_regressive_beats
+        # 钳制到邻幕分镜的残句，target_panel_ids 已经落在别的幕上，
+        # 只按分镜交集判定就会把它留下来，导致整幕重讲时旧句残留。
+        same_scene = bool(scene_id) and bool(beat_scene_id) and beat_scene_id == scene_id
+        if (scene_panels and ids & scene_panels) or same_scene:
             if insert_at is None:
                 insert_at = len(kept)
             continue
@@ -1083,6 +1385,11 @@ def apply_narrative_pacing(
 
 #: 超长竖格判定阈值（高 / 宽）。
 MOTION_TALL_RATIO: float = 1.5
+#: Patch v4.30：同一张超长竖格最多连续几拍保持竖扫（接力扫镜）。
+#:
+#: 竖格连续讲两三句时，第 2、3 句继续 ``pan_down``，镜头顺着长图一路往下走；
+#: 超过该上限才切 ``zoom_in``，避免长图被缩成屏幕中央的细竖条。
+MOTION_TALL_RELAY_MAX: int = 3
 #: 横向宽格判定阈值（宽 / 高）。
 MOTION_WIDE_RATIO: float = 1.25
 #: 冲击类音效关键词（``sfx_cue`` 命中即视为高燃瞬间）。
@@ -1241,7 +1548,10 @@ def apply_auto_motions(
     规则（自上而下判定）：
 
     * **规则 A｜超长竖格**（``is_tall_panel`` 或 高/宽 >= 1.5）：该格首拍给
-      ``pan_down``；同一长格的连续后续拍改为 ``zoom_in``（命中冲击时给 ``shake``）。
+      ``pan_down``；**同一长格的连续第 2、3 拍继续保持 ``pan_down``**（Patch v4.30
+      接力扫镜——镜头顺着长图一路往下走，不再一句一甩把长图缩成细竖条），
+      超过 :data:`MOTION_TALL_RELAY_MAX` 拍才回到 ``zoom_in``
+      （命中冲击时给 ``shake``）。
     * **规则 B｜横向宽格**（宽/高 >= 1.25）：给 ``pan_right`` / ``pan_left``，
       连续宽格交替左右横扫；同一宽格的连续后续拍改为 ``zoom_in``。
     * **规则 C｜高燃冲击**：``sfx_cue`` 命中冲击动作词，或情绪为愤怒 / 震惊
@@ -1267,6 +1577,9 @@ def apply_auto_motions(
     prev_scene_ordinal: int | None = None
     wide_flip = 0
     shake_streak = 0
+    # Patch v4.30：同一张超长竖格的连续竖扫拍数（接力扫镜）与上一拍的接力拍数。
+    tall_relay_run = 0
+    prev_tall_relay_run = 0
 
     for beat in assigned:
         panel_id = _beat_first_panel_id(beat) or ""
@@ -1280,15 +1593,28 @@ def apply_auto_motions(
             scene_ordinal is not None and scene_ordinal != prev_scene_ordinal
         )
         first_beat_of_panel = panel_id != prev_panel_id
+        if first_beat_of_panel:
+            tall_relay_run = 0
 
         motion = ""
+        # Patch v4.30：本拍是否属于「同格接力竖扫」——接力链内不打散方向。
+        relay_pan = False
         if is_tall:
             if first_beat_of_panel:
                 motion = CameraMotion.PAN_DOWN.value
+                tall_relay_run = 1
             elif impact and shake_streak < MOTION_MAX_SHAKE_STREAK:
                 motion = CameraMotion.SHAKE.value
+                tall_relay_run = 0
+            elif tall_relay_run < MOTION_TALL_RELAY_MAX:
+                # 同一张超长竖格的第 2、3 句继续竖扫：镜头顺着长图往下接，
+                # 而不是突然把整条长竖格缩成屏幕中央的细竖条。
+                motion = CameraMotion.PAN_DOWN.value
+                tall_relay_run += 1
+                relay_pan = True
             else:
                 motion = CameraMotion.ZOOM_IN.value
+                tall_relay_run = 0
         elif is_wide:
             if first_beat_of_panel:
                 motion = (
@@ -1313,12 +1639,15 @@ def apply_auto_motions(
         # 规则 D 防单调：连续 2 拍同动效时，第 3 拍必须换掉。
         if motion == prev_motion == prev_prev_motion:
             if motion in (CameraMotion.PAN_DOWN.value, CameraMotion.PAN_UP.value):
-                # 竖扫不浪费长图几何：改成反向竖扫。
-                motion = (
-                    CameraMotion.PAN_UP.value
-                    if motion == CameraMotion.PAN_DOWN.value
-                    else CameraMotion.PAN_DOWN.value
-                )
+                # Patch v4.30：接力竖扫链（同格连续往下扫）不打断方向，
+                # 否则接力扫镜会被改成反向竖扫、长图又从头再来一遍。
+                # 只有互不相干的三连扫（上一拍不是接力链）才换向。
+                if not relay_pan and prev_tall_relay_run < 2:
+                    motion = (
+                        CameraMotion.PAN_UP.value
+                        if motion == CameraMotion.PAN_DOWN.value
+                        else CameraMotion.PAN_DOWN.value
+                    )
             elif motion == CameraMotion.SHAKE.value:
                 motion = CameraMotion.ZOOM_OUT.value
             elif motion == CameraMotion.ZOOM_OUT.value:
@@ -1346,6 +1675,7 @@ def apply_auto_motions(
         prev_prev_motion = prev_motion
         prev_motion = motion
         prev_panel_id = panel_id
+        prev_tall_relay_run = tall_relay_run
         if scene_ordinal is not None:
             prev_scene_ordinal = scene_ordinal
 
@@ -2804,7 +3134,9 @@ def _strip_pinyin_from_beats(beats: Sequence[dict]) -> None:
 
 
 def _clamp_regressive_beats(
-    beats: Sequence[dict], ordered_panel_ids: list[str]
+    beats: Sequence[dict],
+    ordered_panel_ids: list[str],
+    scenes: Sequence[StoryboardScene] | None = None,
 ) -> list[str]:
     """确定性兜底：把重写三轮仍「回看」的 beat 钳制到当前主画面。
 
@@ -2823,6 +3155,12 @@ def _clamp_regressive_beats(
     index_of = {panel_id: index for index, panel_id in enumerate(ordered_panel_ids)}
     last_index = -1
     logs: list[str] = []
+    # Patch v4.29：按 scene_id 建立「幕 → 分镜」索引，钳制时保证锚点留在本幕内。
+    scene_panels_by_id: dict[str, list[str]] = {}
+    for scene in scenes or ():
+        scene_id = coerce_str(getattr(scene, "scene_id", ""))
+        if scene_id:
+            scene_panels_by_id[scene_id] = list(scene.panel_ids or [])
     for position, beat in enumerate(beats, start=1):
         if not isinstance(beat, dict):
             continue
@@ -2839,11 +3177,44 @@ def _clamp_regressive_beats(
         original_ids = [panel_id for panel_id, _ in pairs]
         if not deduped:
             # 全部目标分镜都在回看：锚定到当前主画面（此时 last_index 必 >= 0）。
-            anchor_id = ordered_panel_ids[last_index]
+            fallback_anchor = ordered_panel_ids[last_index]
+            beat_scene_id = coerce_str(beat.get("scene_id"))
+            scene_panels = [
+                panel_id
+                for panel_id in scene_panels_by_id.get(beat_scene_id, [])
+                if panel_id in index_of
+            ]
+            if scene_panels:
+                # Patch v4.29：这条解说属于某一幕，锚点必须留在**本幕**内。
+                # 旧实现锚到「上一幕末尾分镜」，等于把本幕的解说挂到别的幕上，
+                # 重组编排后就会成片出现「讲 A 幕、配 B 幕画面」的错位。
+                earlier = sorted(
+                    (
+                        panel_id
+                        for panel_id in scene_panels
+                        if index_of[panel_id] <= last_index
+                    ),
+                    key=lambda panel_id: index_of[panel_id],
+                )
+                if earlier:
+                    anchor_id = earlier[-1]
+                else:
+                    anchor_id = min(scene_panels, key=lambda panel_id: index_of[panel_id])
+                suffix = (
+                    f"（原锚点 {fallback_anchor} 属于其他幕）"
+                    if anchor_id != fallback_anchor
+                    else ""
+                )
+                logs.append(
+                    f"第 {position} 条解说回看 {original_ids}，属于第 "
+                    f"{beat_scene_id} 幕，已钳制到本幕分镜 {anchor_id}{suffix}"
+                )
+            else:
+                anchor_id = fallback_anchor
+                logs.append(
+                    f"第 {position} 条解说回看 {original_ids}，钳制到当前主画面 {anchor_id}"
+                )
             beat["target_panel_ids"] = [anchor_id]
-            logs.append(
-                f"第 {position} 条解说回看 {original_ids}，钳制到当前主画面 {anchor_id}"
-            )
             continue
         beat["target_panel_ids"] = deduped
         if deduped != original_ids:
@@ -2964,10 +3335,42 @@ async def write_episode_script(
             file=sys.stderr,
         )
 
+    # ------------------------------------------------------------------
+    # Patch v4.29：镜头组编排先解析，再据此收敛撰稿范围
+    # ------------------------------------------------------------------
+    # 概览 / 4A 故事反写 / 4B 候选窗口必须看到**同一批**分镜：只要启用幕里
+    # 没有的分镜（禁用幕独有、或「移除分镜」后残留的孤儿），就不该被写进
+    # 解说。否则用户重排编排后重跑 S4 就会得到「讲的是 A、画的是 B」的错位稿。
+    resolved_storyboard, active_scenes, scene_mode = await _resolve_storyboard_context(
+        client=client,
+        model=model,
+        story_model=story_model,
+        context=context,
+        episode_id=episode_id,
+        vision=vision,
+        storyboard=storyboard,
+        storyboard_path=storyboard_path,
+        vision_client=vision_client,
+        vision_model=vision_model,
+        panels_dir=panels_dir,
+        reset_storyboard=reset_storyboard,
+        storyboard_sink=storyboard_sink,
+    )
+    (
+        valid_panel_ids,
+        ordered_panel_ids,
+        panel_map,
+        story_panels,
+    ) = _converge_panel_pool(
+        panels=panels,
+        all_panels=all_panels,
+        resolved_storyboard=resolved_storyboard,
+        active_scenes=active_scenes,
+        scene_mode=scene_mode,
+    )
+
     # Patch v3.2 Patch 12：纯字卡（白底黑字 PPT）从撰稿上下文里硬剔除，
     # overview / 4A 故事反写 / 4B 候选池都看不到它，避免被念成 PPT 朗读。
-    story_panels = exclude_pure_text_cards(panels)
-
     overview = await _write_overview(
         client,
         model=model,
@@ -2981,122 +3384,6 @@ async def write_episode_script(
     )
     overview_text = _overview_brief(overview)
 
-    valid_panel_ids = {panel.panel_id for panel in panels} if panels else None
-    ordered_panel_ids = _ordered_panel_ids(valid_panel_ids or [])
-    panel_map = {panel.panel_id: panel for panel in panels}
-
-    # ------------------------------------------------------------------
-    # Patch v4.0 Patch 19：镜头组编排（storyboard）+ 整幕视觉联看复核
-    # ------------------------------------------------------------------
-    # * 显式传入 storyboard 或 storyboard_path → 启用 Scene-Grounded 逐幕撰稿；
-    # * 两者都没有时，也在内存里聚一份镜头组，用于动态字数配额。
-    resolved_storyboard: EpisodeStoryboard | None = None
-    active_scenes: list[StoryboardScene] = []
-    scene_mode = False
-    if vision is not None and vision.panels:
-        # 局部导入，避免 stages 包内部的循环依赖。
-        from stages import s3b_scenes
-
-        if storyboard is not None:
-            resolved_storyboard = storyboard
-            scene_mode = True
-        elif storyboard_path is not None:
-            # Patch v4.19：改走语义切幕（LLM 通看整话摘要定幕边界），
-            # 内部失败时无感回退规则切幕；人工编排依然绝不覆写。
-            resolved_storyboard = await s3b_scenes.resolve_or_build_storyboard(
-                client,
-                episode_id=episode_id,
-                vision=vision,
-                storyboard_path=Path(storyboard_path),
-                model=story_model or model,
-                reset=reset_storyboard,
-            )
-            scene_mode = True
-        else:
-            resolved_storyboard = s3b_scenes.auto_build_storyboard(episode_id, vision)
-        if resolved_storyboard is not None:
-            active_scenes = [
-                scene for scene in resolved_storyboard.scenes if scene.enabled
-            ]
-            if vision_client is not None and panels_dir is not None:
-                resolved_storyboard = await s3b_scenes.enrich_storyboard_with_vision(
-                    vision_client,
-                    storyboard=resolved_storyboard,
-                    panels_dir=panels_dir,
-                    model=vision_model,
-                    force=False,
-                    vision=vision,
-                    # Patch v4.19：注入 Layer 1 角色本名/别名/外貌，
-                    # 让整幕复核用真名总结跨格因果与关键原话归属。
-                    characters=getattr(context, "characters", ()) or (),
-                )
-                active_scenes = [
-                    scene for scene in resolved_storyboard.scenes if scene.enabled
-                ]
-        if storyboard_sink is not None and resolved_storyboard is not None:
-            # Patch v4.0 Patch 20.1：把「整幕视觉复核后」的镜头组交出去，
-            # 供 run_stage4 回写（auto 版需要把 visual_recap 落盘）。
-            storyboard_sink.append(resolved_storyboard)
-        if scene_mode and active_scenes:
-            # Patch v4.0 Patch 20.1：用户手动把某些分镜编入启用幕后，这些分镜
-            # 即使被自动流程判成过渡页 / 纯字卡，也要参与本话撰稿；版权声明页
-            # 与推广尾页则永远不放行。
-            all_panel_map = {
-                panel.panel_id: panel for panel in (list(vision.panels) if vision else [])
-            }
-            enabled_panel_ids = {
-                panel_id
-                for scene in active_scenes
-                if scene.enabled
-                for panel_id in (scene.panel_ids or [])
-            }
-            current_ids = valid_panel_ids or set()
-            extra_ids = [
-                panel_id
-                for panel_id in sorted(enabled_panel_ids)
-                if panel_id not in current_ids
-                and panel_id in all_panel_map
-                and all_panel_map[panel_id].non_story_type
-                not in ("copyright_notice", "promo_banner")
-            ]
-            if extra_ids:
-                if valid_panel_ids is None:
-                    valid_panel_ids = set()
-                valid_panel_ids.update(extra_ids)
-                for panel_id in extra_ids:
-                    panel_map[panel_id] = all_panel_map[panel_id]
-                ordered_panel_ids = _ordered_panel_ids(valid_panel_ids)
-                print(
-                    "[s4_scriptwriter] 用户编排额外放行分镜："
-                    + "、".join(extra_ids),
-                    file=sys.stderr,
-                )
-        if scene_mode and active_scenes and resolved_storyboard is not None:
-            # Patch v4.0 Patch 20.1：被用户禁用（enabled=False）的镜头组，
-            # 其**独有**分镜整格排除——既不进入重要分镜统计，也不进入
-            # 有效分镜集合，避免讲出用户明确关掉的那一幕。
-            enabled_panel_ids = {
-                panel_id
-                for scene in active_scenes
-                for panel_id in (scene.panel_ids or [])
-            }
-            disabled_panel_ids = {
-                panel_id
-                for scene in resolved_storyboard.scenes
-                if not scene.enabled
-                for panel_id in (scene.panel_ids or [])
-            }
-            drop_ids = disabled_panel_ids - enabled_panel_ids
-            if drop_ids and valid_panel_ids is not None:
-                valid_panel_ids = valid_panel_ids - drop_ids
-                ordered_panel_ids = _ordered_panel_ids(valid_panel_ids)
-                for panel_id in drop_ids:
-                    panel_map.pop(panel_id, None)
-                print(
-                    "[s4_scriptwriter] 已排除被禁用镜头组的分镜："
-                    + "、".join(sorted(drop_ids)),
-                    file=sys.stderr,
-                )
     story_word_low, story_word_high = compute_story_word_budget(
         max(1, len(active_scenes)), len(ordered_panel_ids)
     )
@@ -3139,27 +3426,49 @@ async def write_episode_script(
             file=sys.stderr,
         )
     else:
-        try:
-            story_draft = await _write_story_draft(
-                client,
-                model=story_model or model,
-                context=context,
-                panels=story_panels,
-                episode_id=episode_id,
-                series_title=series_title,
-                template=story_draft_template,
-                temperature=temperature,
-                story_word_budget=story_word_budget,
-                storyboard_constraints=storyboard_constraints,
-                character_lock=canonicalizer_lock(canonicalizer),
+        # Patch v4.29：逐幕模式下若 4A 返回的章数与启用幕数不符，把明确的
+        # 幕数与分镜边界打回模型，并重试一次 4A——章幕错位会让后续 4B 把
+        # A 幕的解说配到 B 幕的分镜上。
+        draft_attempts = 2 if (scene_mode and active_scenes) else 1
+        for draft_attempt in range(draft_attempts):
+            try:
+                story_draft = await _write_story_draft(
+                    client,
+                    model=story_model or model,
+                    context=context,
+                    panels=story_panels,
+                    episode_id=episode_id,
+                    series_title=series_title,
+                    template=story_draft_template,
+                    temperature=temperature,
+                    story_word_budget=story_word_budget,
+                    storyboard_constraints=storyboard_constraints,
+                    character_lock=canonicalizer_lock(canonicalizer),
+                )
+            except Exception as exc:  # noqa: BLE001 - 故事反写失败不阻断流水线
+                # 故事反写失败不阻断流水线：退回整话概览作为 4B 的锚点。
+                print(
+                    f"[s4_scriptwriter] 故事反写失败，退回概览兜底：{exc}",
+                    file=sys.stderr,
+                )
+                story_draft = _fallback_story_draft(
+                    episode_id, story_panels, overview_text
+                )
+                break
+            chapter_count = len(story_draft.chapters or [])
+            if not (scene_mode and active_scenes) or chapter_count == len(
+                active_scenes
+            ):
+                break
+            feedback = _scene_count_feedback(
+                active_scenes, chapter_count, ordered_panel_ids
             )
-        except Exception as exc:  # noqa: BLE001 - 故事反写失败不阻断流水线
-            # 故事反写失败不阻断流水线：退回整话概览作为 4B 的锚点。
             print(
-                f"[s4_scriptwriter] 故事反写失败，退回概览兜底：{exc}",
+                f"[s4_scriptwriter] 4A 返回 {chapter_count} 章，启用幕共 "
+                f"{len(active_scenes)} 幕，重试一次 4A。",
                 file=sys.stderr,
             )
-            story_draft = _fallback_story_draft(episode_id, panels, overview_text)
+            storyboard_constraints = f"{storyboard_constraints}\n{feedback}".strip()
 
     # Patch v4.16：故事稿里的角色名写法归一（4A 可能把「恩彗」写成「恩慧」）。
     # 人工改过的初稿（human_markdown 非空）不覆写，所以只在这里改自动稿。
@@ -3246,20 +3555,9 @@ async def write_episode_script(
             index for index in range(len(chapters)) if index not in used_chapters
         ]
         if unused and pairs:
-            # 没被任何幕选中的章节：正文并入「幕序号最大的已配对章节」，不丢内容。
-            target = max(pairs)
-            extra = "\n".join(
-                (chapters[index].story_prose or "") for index in unused
-            ).strip()
-            if extra:
-                base = chapters[target]
-                chapters[target] = base.model_copy(
-                    update={
-                        "story_prose": "\n".join(
-                            [base.story_prose or "", extra]
-                        ).strip()
-                    }
-                )
+            chapters = _merge_unpaired_chapters(
+                chapters, pairs, active_scenes, ordered_panel_ids
+            )
         chapter_plan = []
         for index, scene in enumerate(active_scenes):
             chapter_index = pairs.get(index)
@@ -3276,11 +3574,7 @@ async def write_episode_script(
                     ),
                     story_prose=scene.visual_recap or scene.user_note or "",
                 )
-            window = [
-                panel_id
-                for panel_id in scene.panel_ids
-                if not valid_panel_ids or panel_id in valid_panel_ids
-            ]
+            window = _scene_window(scene, valid_panel_ids)
             chapter_plan.append((chapter, window, scene))
         episode_low, episode_high = compute_episode_beat_budget(
             len(active_scenes), len(ordered_panel_ids)
@@ -3387,7 +3681,11 @@ async def write_episode_script(
         # 兜底 1：把 tts_text 里的拼音剥掉（字幕 narration_text 绝不受影响）。
         _strip_pinyin_from_beats(merged_beats)
         # 兜底 2：确定性钳制仍回看的 beat，保证落盘剧本 100% 全局单调不减。
-        clamp_logs = _clamp_regressive_beats(merged_beats, ordered_panel_ids)
+        clamp_logs = _clamp_regressive_beats(
+            merged_beats,
+            ordered_panel_ids,
+            scenes=active_scenes if scene_mode else None,
+        )
         for line in clamp_logs:
             print(f"[s4_scriptwriter]   - 顺位钳制：{line}", file=sys.stderr)
         remaining = validate_beat_alignment(
@@ -3492,7 +3790,11 @@ async def write_episode_script(
                 # 与 4B 重试耗尽时走同一套兜底（剥拼音 + 夹逼顺位），
                 # 避免因为补写引入的异常直接漏到下游渲染。
                 _strip_pinyin_from_beats(merged_beats)
-                _clamp_regressive_beats(merged_beats, ordered_panel_ids)
+                _clamp_regressive_beats(
+                    merged_beats,
+                    ordered_panel_ids,
+                    scenes=active_scenes if scene_mode else None,
+                )
                 errors = validate_beat_alignment(
                     merged_beats,
                     ordered_panel_ids,
@@ -3750,6 +4052,46 @@ async def write_story_draft_document(
     return draft, json_path, markdown_path
 
 
+def _merge_visual_recap_into_human_storyboard(
+    final_storyboard: EpisodeStoryboard,
+    storyboard_path: str | Path,
+) -> EpisodeStoryboard | None:
+    """把本次视觉复核新得到的 ``visual_recap`` 回填进人工编排（Patch v4.29）。
+
+    人工编排（``source == "human"``）此前一律不落盘，导致用户重排编排后
+    重跑 S4，整幕复核算出来的画面摘要永远存不下来，下一轮 4A 又拿不到
+    画面复核信息。
+
+    这里**只补空**：以磁盘上的编排为基底，只在「该幕磁盘上 ``visual_recap``
+    为空、且本次复核确实给出了摘要」时写入。其余字段（``source``、``scenes``
+    结构、``panel_ids``、``enabled``、``user_note``、``locked_quotes``、
+    BGM 配置）原样不动——人工编排的显式意图绝不覆盖。
+
+    没有可回填内容时返回 ``None``，调用方无需落盘。
+    """
+    from stages import s3b_scenes
+
+    disk = s3b_scenes.load_storyboard(storyboard_path)
+    if disk is None:
+        return None
+    recap_by_scene = {
+        scene.scene_id: (scene.visual_recap or "").strip()
+        for scene in final_storyboard.scenes
+    }
+    new_scenes: list[StoryboardScene] = []
+    changed = False
+    for scene in disk.scenes:
+        recap = recap_by_scene.get(scene.scene_id, "")
+        if recap and not (scene.visual_recap or "").strip():
+            new_scenes.append(scene.model_copy(update={"visual_recap": recap}))
+            changed = True
+        else:
+            new_scenes.append(scene)
+    if not changed:
+        return None
+    return disk.model_copy(update={"scenes": new_scenes})
+
+
 async def run_stage4(
     series_dir: str | Path,
     episode_no: int,
@@ -3856,16 +4198,21 @@ async def run_stage4(
     )
     # Patch v4.0 Patch 20.1：auto 版镜头组**总是**回写（把整幕视觉复核得到的
     # visual_recap 落盘，下次打开镜头编排 Tab 直接能看到摘要）；
-    # 人工编排（source == "human"）一律不覆写用户的 user_note / locked_quotes。
+    # 人工编排（source == "human"）此前一律不覆写用户的 user_note / locked_quotes。
     final_storyboard = storyboard_sink[-1] if storyboard_sink else resolved_storyboard
-    if (
-        storyboard_path is not None
-        and final_storyboard is not None
-        and final_storyboard.source != "human"
-    ):
+    if storyboard_path is not None and final_storyboard is not None:
         from stages import s3b_scenes
 
-        s3b_scenes.save_storyboard(final_storyboard, Path(storyboard_path))
+        if final_storyboard.source != "human":
+            s3b_scenes.save_storyboard(final_storyboard, Path(storyboard_path))
+        else:
+            # Patch v4.29：人工编排也回写**新填的** visual_recap，
+            # 但只补「磁盘上原本为空」的幕，用户的编排结构与备注一律不动。
+            merged = _merge_visual_recap_into_human_storyboard(
+                final_storyboard, Path(storyboard_path)
+            )
+            if merged is not None:
+                s3b_scenes.save_storyboard(merged, Path(storyboard_path))
 
     script_path = target_dir / SCRIPT_FILENAME
     save_model(script, script_path)

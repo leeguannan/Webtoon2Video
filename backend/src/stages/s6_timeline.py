@@ -794,6 +794,9 @@ def build_timeline(
 
     total_duration = last_end + last_pause if plans else 0
 
+    # Patch v4.30：同格连续平移场景按句长比例切分接力区间（首尾相接，不再一句一甩）。
+    _assign_pan_relay(scenes)
+
     # ---- 音效事件（Patch v3.1 Patch 11 B3）----
     # 主来源：beat.sfx_cue；兜底：画面 sfx_list 的保守关键词。
     sfx_candidates: list[tuple[int, str]] = []
@@ -830,6 +833,56 @@ def _motion_of(beat: Any) -> CameraMotion:
         except ValueError:
             return CameraMotion.STATIC
     return CameraMotion.STATIC
+
+
+#: Patch v4.30：接力扫镜适用的平移运镜名单。
+_PAN_MOTIONS = ("pan_down", "pan_up", "pan_left", "pan_right")
+#: Patch v4.30：相邻接力段之间的衔接余量（两侧各留一半，避免切镜时硬跳）。
+_PAN_RELAY_OVERLAP = 0.05
+
+
+def _assign_pan_relay(scenes: list[TimelineScene]) -> None:
+    """为「连续共享同一分镜且均为平移」的相邻场景组切分接力区间。
+
+    **为什么要接力**：同一张长竖格连续讲两三句时，如果每句都从头顶重新扫一遍，
+    观众看到的就是「一句一甩」，画面被割裂。这里把整条行程按各句时长比例切成
+    若干段，逐句写入 ``pan_start_ratio`` / ``pan_end_ratio``；Stage 7 让每句
+    从自己那一段的起点出发，于是镜头顺着长图一路往下走，首尾相接。
+
+    相邻段之间留 :data:`_PAN_RELAY_OVERLAP` 的衔接余量：下一段略微提前起手，
+    切镜时画面是「接上」而不是「跳一下」。
+
+    只有同一张分镜的连续平移场景才接力；换了分镜就重新从整段行程开始。
+    """
+    group: list[TimelineScene] = []
+
+    def flush() -> None:
+        if len(group) < 2:
+            group.clear()
+            return
+        durations = [max(1, int(scene.duration_ms)) for scene in group]
+        total = float(sum(durations)) or 1.0
+        cursor = 0.0
+        for scene, duration in zip(group, durations):
+            start = cursor / total
+            cursor += duration
+            end = min(1.0, cursor / total)
+            scene.pan_start_ratio = max(0.0, start - _PAN_RELAY_OVERLAP / 2)
+            scene.pan_end_ratio = min(1.0, end + _PAN_RELAY_OVERLAP / 2)
+        group.clear()
+
+    for scene in scenes:
+        raw = getattr(scene.motion, "value", scene.motion)
+        motion = str(raw or "").strip().lower()
+        if motion in _PAN_MOTIONS and (
+            not group or group[-1].panel_id == scene.panel_id
+        ):
+            group.append(scene)
+            continue
+        flush()
+        if motion in _PAN_MOTIONS:
+            group.append(scene)
+    flush()
 
 
 def _focus_for(
