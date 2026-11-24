@@ -19,6 +19,7 @@ import {
   Terminal,
   Trash2,
   Volume2,
+  X,
   AlertCircle,
   Wand2,
   Music,
@@ -51,6 +52,13 @@ import type {
 import { formatMs, playPreviewTone, resolveSpokenText } from '../utils/pronunciation';
 import { formatBytes } from '../utils/format';
 import { PanelZoomModal, type RoleOption, type SaveStatus } from './PanelZoomModal';
+import {
+  CUSTOM_VOICE,
+  findVoiceOption,
+  groupVoices,
+  useVoicePreview,
+  type VoiceGroup,
+} from './VoicePicker';
 import { StoryboardEditor } from './StoryboardEditor';
 import { TtsTagPicker } from './TtsTagPicker';
 import BgmLibraryDrawer from './BgmLibraryDrawer';
@@ -446,7 +454,7 @@ const roleSpeedForBeatOf = (
  * 后端已给出权威结果（``resolved_voice``，与 Stage 5 同一套解析）；这里再按当前
  * 下拉选择做一次**本地预览**，改角色后能立刻看到会换成谁，保存重跑后以服务端为准。
  */
-const beatVoiceInfoOf = (
+const beatVoiceInfoBase = (
   beat: ScriptBeat,
   seriesTts: SeriesTtsConfigResponse | null,
   roleNames: string[]
@@ -562,6 +570,30 @@ const beatVoiceInfoOf = (
   return { ...base, hint: '旧槽位角色，改选角色名可切到专属音色' };
 };
 
+/** Patch v4.27：一条 beat 的「本句配音」说明（含音色的友好中文名）。 */
+type BeatVoiceInfo = ReturnType<typeof beatVoiceInfoBase> & {
+  /** 音色的友好中文名（取不到就回退成音色 ID 本身）。 */
+  voiceName: string;
+};
+
+/**
+ * Patch v4.27：一条 beat 的「本句配音」说明（模块级版本）。
+ *
+ * 与 `beatVoiceInfoBase` 同口径，只是多带一个 `voiceName`：MiniMax 音色 ID
+ * 长且是英文（如 `Chinese (Mandarin)_Radio_Host`），界面上要显示「电台男主播」
+ * 这类中文名才认得出来，所以按 voice_id / id 索引查表。
+ */
+const beatVoiceInfoOf = (
+  beat: ScriptBeat,
+  seriesTts: SeriesTtsConfigResponse | null,
+  roleNames: string[],
+  voiceOptionMap?: Map<string, VoiceOption>
+): BeatVoiceInfo => {
+  const base = beatVoiceInfoBase(beat, seriesTts, roleNames);
+  const friendly = voiceOptionMap?.get(base.voice)?.display_name?.trim();
+  return { ...base, voiceName: friendly || base.voice };
+};
+
 /**
  * Patch v4.25：改说话人角色时要同步落的字段（模块级版本）。
  *
@@ -606,6 +638,12 @@ interface ScriptBeatRowProps {
   ttsModel: string;
   seriesTts: SeriesTtsConfigResponse | null;
   roleNames: string[];
+  /** Patch v4.27：MiniMax 音色分组（按供应商 · 分类渲染 optgroup），引用稳定。 */
+  voiceGroups: VoiceGroup[];
+  /** Patch v4.27：全部 MiniMax 音色（试听样例时按 ID 找条目），引用稳定。 */
+  voiceOptions: VoiceOption[];
+  /** Patch v4.27：音色 ID → 音色条目（按 voice_id / id 双索引），引用稳定。 */
+  voiceOptionMap: Map<string, VoiceOption>;
   regenerateEnabled: boolean;
   playingBeatId: string | null;
   tagPickerOpen: boolean;
@@ -619,6 +657,10 @@ interface ScriptBeatRowProps {
     value: string
   ) => void;
   onChangeRole: (beatId: string, role: string) => void;
+  /** Patch v4.27：逐句指定 MiniMax 音色（voice_override）；传空串表示恢复按角色解析。 */
+  onChangeVoiceOverride: (beatId: string, voiceId: string) => void;
+  /** Patch v4.27：试听这一句的音色样例（静态样例，不消耗 API 额度）。 */
+  onPreviewVoice: (beatId: string, voiceId: string, speed: number) => void;
   onNudgeSpeed: (beatId: string, delta: number) => void;
   onResetSpeed: (beatId: string) => void;
   onChangeMotion: (beatId: string, motion: CameraMotion) => void;
@@ -650,6 +692,9 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
     ttsModel,
     seriesTts,
     roleNames,
+    voiceGroups,
+    voiceOptions,
+    voiceOptionMap,
     regenerateEnabled,
     playingBeatId,
     tagPickerOpen,
@@ -657,6 +702,8 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
     ttsSelections,
     onChangeText,
     onChangeRole,
+    onChangeVoiceOverride,
+    onPreviewVoice,
     onNudgeSpeed,
     onResetSpeed,
     onChangeMotion,
@@ -677,9 +724,27 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
     [beat, seriesTts, roleNames]
   );
   const voiceInfo = useMemo(
-    () => beatVoiceInfoOf(beat, seriesTts, roleNames),
-    [beat, seriesTts, roleNames]
+    () => beatVoiceInfoOf(beat, seriesTts, roleNames, voiceOptionMap),
+    [beat, seriesTts, roleNames, voiceOptionMap]
   );
+  // Patch v4.27：逐句音色覆盖（voice_override）的行内控件。
+  // 「跟随角色」是默认项；选了不在音色表里的 ID（自定义音色）时保留一条兜底选项，
+  // 免得下拉显示空白、用户看不出这一句到底用的哪个音色。
+  const [customVoiceEditing, setCustomVoiceEditing] = useState(false);
+  const [customVoiceDraft, setCustomVoiceDraft] = useState('');
+  const overrideVoiceId = (beat.voice_override ?? '').trim();
+  const overrideKnown = !overrideVoiceId || voiceOptionMap.has(overrideVoiceId);
+  const roleVoiceId = beat.resolved_voice?.voice ?? '';
+  const roleVoiceDisplayName =
+    voiceOptionMap.get(roleVoiceId)?.display_name || roleVoiceId || '按角色解析';
+  const previewOption = findVoiceOption(voiceOptions, voiceInfo.voice);
+  const previewReady = !!previewOption?.sample_ready;
+  const commitCustomVoice = useCallback(() => {
+    const next = customVoiceDraft.trim();
+    setCustomVoiceEditing(false);
+    if (!next || next === overrideVoiceId) return;
+    onChangeVoiceOverride(beat.beat_id, next);
+  }, [customVoiceDraft, overrideVoiceId, onChangeVoiceOverride, beat.beat_id]);
   const { spokenText, matchedRules } = useMemo(
     () => resolveSpokenText(beat, rules),
     [beat, rules]
@@ -874,6 +939,112 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
               {voiceInfo.hint}
             </div>
           )}
+          {/* Patch v4.27：单句音色覆盖 —— 给一次性 / 龙套角色单独指定 MiniMax 音色。
+              只改这一句的 voice_override，不动角色，也不影响其它句。 */}
+          <div className="space-y-1">
+            <div className="flex items-center justify-between gap-1 text-[10px] text-slate-400">
+              <span>单句音色覆盖</span>
+              {overrideVoiceId && (
+                <button
+                  type="button"
+                  onClick={() => onChangeVoiceOverride(beat.beat_id, '')}
+                  aria-label={`${beat.beat_id} 清除单句音色`}
+                  title="清除单句指定，恢复按角色解析音色"
+                  className="rounded border border-slate-200 bg-white px-1 py-0.5 text-[10px] text-slate-500 hover:border-slate-400 hover:text-slate-800"
+                >
+                  清除
+                </button>
+              )}
+            </div>
+            {customVoiceEditing ? (
+              <div className="flex items-center gap-1">
+                <input
+                  value={customVoiceDraft}
+                  autoFocus
+                  onChange={(e) => setCustomVoiceDraft(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      commitCustomVoice();
+                    } else if (e.key === 'Escape') {
+                      e.preventDefault();
+                      setCustomVoiceEditing(false);
+                    }
+                  }}
+                  onBlur={() => commitCustomVoice()}
+                  placeholder="填写 MiniMax 音色 ID"
+                  aria-label={`${beat.beat_id} 自定义音色 ID`}
+                  className="w-full px-1.5 py-0.5 text-[11px] bg-white border border-slate-200 rounded focus:outline-none focus:border-blue-600"
+                />
+                <button
+                  type="button"
+                  onClick={() => setCustomVoiceEditing(false)}
+                  aria-label={`${beat.beat_id} 返回下拉选择音色`}
+                  title="← 返回下拉选择"
+                  className="shrink-0 rounded border border-slate-200 bg-white px-1 py-0.5 text-[10px] text-slate-500 hover:border-slate-400 hover:text-slate-800"
+                >
+                  ←
+                </button>
+              </div>
+            ) : (
+              <div className="flex items-center gap-1">
+                <select
+                  value={customVoiceEditing ? CUSTOM_VOICE : overrideVoiceId}
+                  onChange={(e) => {
+                    const next = e.target.value;
+                    if (next === CUSTOM_VOICE) {
+                      setCustomVoiceDraft(overrideVoiceId);
+                      setCustomVoiceEditing(true);
+                      return;
+                    }
+                    setCustomVoiceEditing(false);
+                    onChangeVoiceOverride(beat.beat_id, next);
+                  }}
+                  aria-label={`${beat.beat_id} 单句音色`}
+                  className="w-full px-1.5 py-0.5 text-[11px] bg-white border border-slate-200 rounded focus:outline-none focus:border-blue-600"
+                >
+                  <option value="">跟随角色（{roleVoiceDisplayName}）</option>
+                  {overrideVoiceId && !overrideKnown && (
+                    <option value={overrideVoiceId}>自定义：{overrideVoiceId}</option>
+                  )}
+                  {voiceGroups.map((group) => (
+                    <optgroup
+                      key={`${group.provider}-${group.category}`}
+                      label={group.label}
+                    >
+                      {group.items.map((item) => {
+                        const id = item.voice_id || item.id;
+                        return (
+                          <option key={id} value={id}>
+                            {item.display_name} ·{' '}
+                            {item.gender === 'female' ? '女' : '男'}
+                          </option>
+                        );
+                      })}
+                    </optgroup>
+                  ))}
+                  <option value={CUSTOM_VOICE}>✎ 自定义音色 ID…</option>
+                </select>
+                <button
+                  type="button"
+                  onClick={() =>
+                    onPreviewVoice(beat.beat_id, voiceInfo.voice, voiceInfo.speed)
+                  }
+                  disabled={!previewReady}
+                  aria-label={`${beat.beat_id} 试听当前音色样例`}
+                  title="播放 MiniMax 静态样例（不消耗 API 额度）"
+                  className="shrink-0 w-6 h-6 flex items-center justify-center rounded border border-slate-200 bg-white text-slate-500 hover:border-slate-400 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <Volume2 className="w-3 h-3" />
+                </button>
+              </div>
+            )}
+            {overrideVoiceId && (
+              <div className="text-[10px] leading-snug text-blue-700">
+                已单独指定：{voiceInfo.voiceName}
+              </div>
+            )}
+          </div>
           {/* Patch v4.13：表格行紧凑语速微调（-/+ 步进 + 数字 + 恢复默认）。 */}
           <div className="flex items-center gap-1 text-[11px] font-mono-tabular">
             <span className="text-slate-400">语速</span>
@@ -1448,6 +1619,48 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   }, [seriesTts]);
 
   /**
+   * Patch v4.27：MiniMax 音色分组（供应商 · 分类）。
+   *
+   * 一话 200~300 句时每行都渲染一份音色下拉，分组必须**只算一次**：
+   * 顶层算好后把引用稳定的数组传给每个 memo 行，行内不再重复 groupVoices。
+   */
+  const voiceGroups = useMemo(() => groupVoices(voiceOptions), [voiceOptions]);
+
+  /**
+   * Patch v4.27：音色 ID → 音色条目。
+   *
+   * 后端给的是 voice_id（个别条目只有 id），两个键都索引一份，查表 O(1)。
+   */
+  const voiceOptionMap = useMemo(() => {
+    const map = new Map<string, VoiceOption>();
+    voiceOptions.forEach((option) => {
+      if (option.voice_id) map.set(option.voice_id, option);
+      if (option.id) map.set(option.id, option);
+    });
+    return map;
+  }, [voiceOptions]);
+
+  /**
+   * Patch v4.27：全表共享的音色试听器。
+   *
+   * 只在顶层挂一个（一个 <audio> 实例），行内按钮都调它，避免 300 行各挂一个。
+   * 换话次或组件卸载时停掉正在播放的样例。
+   */
+  const { preview: previewVoiceSample, stop: stopVoiceSample } = useVoicePreview();
+  useEffect(() => {
+    stopVoiceSample();
+  }, [episode.episode_id, stopVoiceSample]);
+  useEffect(() => () => stopVoiceSample(), [stopVoiceSample]);
+
+  /** Patch v4.27：试听某一句的音色样例（静态样例，不消耗 API 额度）。 */
+  const handlePreviewBeatVoice = useCallback(
+    (beatId: string, voiceId: string, speed: number) => {
+      previewVoiceSample(`beat:${beatId}`, { voice: voiceId, speed }, voiceOptions);
+    },
+    [previewVoiceSample, voiceOptions]
+  );
+
+  /**
    * 角色 → 性别。
    *
    * 改角色时必须同步 speaker_gender：Stage 4 留下的性别属于**原来那个角色**
@@ -1496,7 +1709,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
    * ``speed``（当前生效语速，微调后等于 ``speed_override``）、``speedOverridden``。
    */
   const beatVoiceInfo = (beat: ScriptBeat) =>
-    beatVoiceInfoOf(beat, seriesTts, roleNames);
+    beatVoiceInfoOf(beat, seriesTts, roleNames, voiceOptionMap);
 
   /**
    * Patch v4.25：分镜 ID → 分镜 的查找表。
@@ -2555,6 +2768,19 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
       });
     },
     [updateBeatField, seriesTts]
+  );
+
+  /**
+   * Patch v4.27：逐句指定 MiniMax 音色（voice_override）。
+   *
+   * 只改这一句的音色字段，不动角色，也不清单句语速微调；传空串＝清除指定，
+   * 恢复按角色解析（与后端 ``voice_override`` 为空串的语义一致）。
+   */
+  const handleRowChangeVoiceOverride = useCallback(
+    (beatId: string, voiceId: string) => {
+      updateBeatField(beatId, 'voice_override', voiceId);
+    },
+    [updateBeatField]
   );
 
   const handleRowNudgeSpeed = useCallback(
@@ -3763,6 +3989,9 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                                   ttsModel={config.ttsModel}
                                   seriesTts={seriesTts}
                                   roleNames={roleNames}
+                                  voiceGroups={voiceGroups}
+                                  voiceOptions={voiceOptions}
+                                  voiceOptionMap={voiceOptionMap}
                                   regenerateEnabled={regenerateEnabled}
                                   playingBeatId={playingBeatId}
                                   tagPickerOpen={tagPickerBeatId === beat.beat_id}
@@ -3770,6 +3999,8 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                                   ttsSelections={ttsSelections}
                                   onChangeText={handleRowChangeText}
                                   onChangeRole={handleRowChangeRole}
+                                  onChangeVoiceOverride={handleRowChangeVoiceOverride}
+                                  onPreviewVoice={handlePreviewBeatVoice}
                                   onNudgeSpeed={handleRowNudgeSpeed}
                                   onResetSpeed={handleRowResetSpeed}
                                   onChangeMotion={handleRowChangeMotion}
@@ -4171,6 +4402,9 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         onSelectBeat={handleZoomSelectBeat}
         onChangeNarration={handleZoomNarrationChange}
         onChangeRole={handleZoomRoleChange}
+        onChangeVoiceOverride={(beatId, voiceId) =>
+          updateZoomBeat(beatId, 'voice_override', voiceId)
+        }
         onChangeSpeed={handleZoomSpeedChange}
         onQuickSave={flushSave}
       />
@@ -4272,10 +4506,10 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
           }}
         >
           <div
-            className="w-full max-w-2xl max-h-[85vh] flex flex-col rounded-xl border border-slate-200 bg-white shadow-xl"
+            className="w-full max-w-2xl max-h-[85vh] flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-xl"
             onClick={(event) => event.stopPropagation()}
           >
-            <div className="flex items-start gap-2 border-b border-slate-100 px-4 py-3">
+            <div className="flex shrink-0 items-start gap-2 border-b border-slate-100 px-4 py-3">
               <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600" />
               <div className="flex-1 space-y-1">
                 <p className="text-sm font-semibold text-slate-900">
@@ -4286,133 +4520,148 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                   选择「按建议统一为规范名并保存」才会把下面这些写法替换成规范名。
                 </p>
               </div>
+              {/* Patch v4.27：右上角关闭按钮（保存进行中时禁用，避免中断落盘）。 */}
+              <button
+                type="button"
+                disabled={charPrompt.busy}
+                onClick={() => setCharPrompt(null)}
+                aria-label="关闭角色名写法确认"
+                title="关闭"
+                className="shrink-0 w-6 h-6 flex items-center justify-center rounded text-slate-400 hover:bg-slate-100 hover:text-slate-700 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <X className="w-4 h-4" />
+              </button>
             </div>
-            <div className="flex-1 overflow-y-auto space-y-2 px-4 py-3 text-xs text-slate-700">
-              {charPrompt.warnings.map((warning, index) => (
-                <div
-                  key={`${warning.beat_id}-${warning.field}-${warning.found_name}-${index}`}
-                  className="rounded-lg bg-slate-50 px-2.5 py-2"
-                >
-                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-                    <span className="font-medium text-slate-800">
-                      第 {warning.beat_index + 1} 句（{warning.beat_id}）
-                    </span>
-                    <span className="text-[11px] text-slate-500">
-                      {CHARACTER_FIELD_LABELS[warning.field] ?? warning.field}
-                    </span>
-                    <span className="text-[11px] text-slate-500">
-                      {CHARACTER_REASON_LABELS[warning.reason] ?? warning.reason}
-                    </span>
-                  </div>
-                  <div className="mt-1 flex flex-wrap items-center gap-2">
-                    <span className="rounded bg-white px-1.5 py-0.5 font-mono-tabular text-slate-700 ring-1 ring-slate-200">
-                      {warning.found_name}
-                    </span>
-                    {warning.suggested_canonical ? (
-                      <>
-                        <span className="text-slate-400">→</span>
-                        <span className="rounded bg-blue-50 px-1.5 py-0.5 font-mono-tabular text-blue-700 ring-1 ring-blue-200">
-                          {warning.suggested_canonical}
-                        </span>
-                      </>
-                    ) : (
-                      <span className="text-[11px] text-slate-500">（没有建议名）</span>
-                    )}
-                  </div>
-                  {warning.snippet && (
-                    <div className="mt-1 break-words text-[11px] leading-4 text-slate-500">
-                      上下文：{warning.snippet}
-                    </div>
-                  )}
-                  <div className="mt-1 text-[11px] leading-4 text-slate-500">
-                    {warning.message}
-                  </div>
-                </div>
-              ))}
-            </div>
-            {/* Patch v4.25：角色档案同步选项。
-                默认全部「仅本次放行，不改档案」——用户明确勾选后，
-                「仍按我的修改保存」才会带上 sync_character_updates 提交。 */}
-            <div className="border-t border-slate-100 px-4 py-3 space-y-2">
-              <div className="flex items-baseline gap-2">
-                <p className="text-xs font-semibold text-slate-800">
-                  要不要顺手把作品角色档案一起改掉？
-                </p>
-                <p className="text-[11px] text-slate-500">
-                  默认不改档案，只放行这一次保存；勾选后按「仍按我的修改保存」才会写入作品设定。
-                </p>
-              </div>
-              {buildCharacterSyncGroups(charPrompt.warnings).length === 0 && (
-                <p className="text-[11px] text-slate-500">没有可同步的角色名写法。</p>
-              )}
-              {buildCharacterSyncGroups(charPrompt.warnings).map((group, groupIndex) => (
-                <div
-                  key={group.key}
-                  className="rounded-lg border border-slate-200 bg-white px-2.5 py-2 space-y-1.5"
-                >
-                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                    <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono-tabular text-slate-700">
-                      {group.found_name}
-                    </span>
-                    {group.suggested_canonical ? (
-                      <>
-                        <span className="text-slate-400">→</span>
-                        <span className="rounded bg-blue-50 px-1.5 py-0.5 font-mono-tabular text-blue-700 ring-1 ring-blue-200">
-                          {group.suggested_canonical}
-                        </span>
-                      </>
-                    ) : (
+            {/* Patch v4.27：明细列表与「档案同步」合并进同一个滚动容器，
+                否则下面的档案同步区会把上面的明细压扁、底部按钮被挤出屏幕。 */}
+            <div className="flex-1 min-h-0 overflow-y-auto px-4 py-3 text-xs text-slate-700">
+              <div className="space-y-2">
+                {charPrompt.warnings.map((warning, index) => (
+                  <div
+                    key={`${warning.beat_id}-${warning.field}-${warning.found_name}-${index}`}
+                    className="rounded-lg bg-slate-50 px-2.5 py-2"
+                  >
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                      <span className="font-medium text-slate-800">
+                        第 {warning.beat_index + 1} 句（{warning.beat_id}）
+                      </span>
                       <span className="text-[11px] text-slate-500">
-                        {CHARACTER_REASON_LABELS[group.reason] ?? group.reason}（没有建议名）
+                        {CHARACTER_FIELD_LABELS[warning.field] ?? warning.field}
                       </span>
+                      <span className="text-[11px] text-slate-500">
+                        {CHARACTER_REASON_LABELS[warning.reason] ?? warning.reason}
+                      </span>
+                    </div>
+                    <div className="mt-1 flex flex-wrap items-center gap-2">
+                      <span className="rounded bg-white px-1.5 py-0.5 font-mono-tabular text-slate-700 ring-1 ring-slate-200">
+                        {warning.found_name}
+                      </span>
+                      {warning.suggested_canonical ? (
+                        <>
+                          <span className="text-slate-400">→</span>
+                          <span className="rounded bg-blue-50 px-1.5 py-0.5 font-mono-tabular text-blue-700 ring-1 ring-blue-200">
+                            {warning.suggested_canonical}
+                          </span>
+                        </>
+                      ) : (
+                        <span className="text-[11px] text-slate-500">（没有建议名）</span>
+                      )}
+                    </div>
+                    {warning.snippet && (
+                      <div className="mt-1 break-words text-[11px] leading-4 text-slate-500">
+                        上下文：{warning.snippet}
+                      </div>
                     )}
-                    <span className="text-[11px] text-slate-500">
-                      涉及 {group.beatIds.length} 句
-                    </span>
+                    <div className="mt-1 text-[11px] leading-4 text-slate-500">
+                      {warning.message}
+                    </div>
                   </div>
-                  <div className="space-y-1">
-                    <label className="flex items-start gap-2 cursor-pointer">
-                      <input
-                        type="radio"
-                        name={`char-sync-${groupIndex}`}
-                        className="mt-0.5 accent-blue-600"
-                        checked={!charSyncChoices[group.key]}
-                        onChange={() =>
-                          setCharSyncChoices((prev) => {
-                            const next = { ...prev };
-                            delete next[group.key];
-                            return next;
-                          })
-                        }
-                      />
-                      <span className="text-[11px] text-slate-700">
-                        仅本次放行，不改档案
+                ))}
+              </div>
+              {/* Patch v4.25：角色档案同步选项。
+                  默认全部「仅本次放行，不改档案」——用户明确勾选后，
+                  「仍按我的修改保存」才会带上 sync_character_updates 提交。 */}
+              <div className="mt-4 border-t border-slate-200 pt-3 space-y-2">
+                <div className="flex items-baseline gap-2">
+                  <p className="text-xs font-semibold text-slate-800">
+                    要不要顺手把作品角色档案一起改掉？
+                  </p>
+                  <p className="text-[11px] text-slate-500">
+                    默认不改档案，只放行这一次保存；勾选后按「仍按我的修改保存」才会写入作品设定。
+                  </p>
+                </div>
+                {buildCharacterSyncGroups(charPrompt.warnings).length === 0 && (
+                  <p className="text-[11px] text-slate-500">没有可同步的角色名写法。</p>
+                )}
+                {buildCharacterSyncGroups(charPrompt.warnings).map((group, groupIndex) => (
+                  <div
+                    key={group.key}
+                    className="rounded-lg border border-slate-200 bg-white px-2.5 py-2 space-y-1.5"
+                  >
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                      <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono-tabular text-slate-700">
+                        {group.found_name}
                       </span>
-                    </label>
-                    {group.actions.map((action) => (
-                      <label key={action} className="flex items-start gap-2 cursor-pointer">
+                      {group.suggested_canonical ? (
+                        <>
+                          <span className="text-slate-400">→</span>
+                          <span className="rounded bg-blue-50 px-1.5 py-0.5 font-mono-tabular text-blue-700 ring-1 ring-blue-200">
+                            {group.suggested_canonical}
+                          </span>
+                        </>
+                      ) : (
+                        <span className="text-[11px] text-slate-500">
+                          {CHARACTER_REASON_LABELS[group.reason] ?? group.reason}（没有建议名）
+                        </span>
+                      )}
+                      <span className="text-[11px] text-slate-500">
+                        涉及 {group.beatIds.length} 句
+                      </span>
+                    </div>
+                    <div className="space-y-1">
+                      <label className="flex items-start gap-2 cursor-pointer">
                         <input
                           type="radio"
                           name={`char-sync-${groupIndex}`}
                           className="mt-0.5 accent-blue-600"
-                          checked={charSyncChoices[group.key] === action}
+                          checked={!charSyncChoices[group.key]}
                           onChange={() =>
-                            setCharSyncChoices((prev) => ({
-                              ...prev,
-                              [group.key]: action,
-                            }))
+                            setCharSyncChoices((prev) => {
+                              const next = { ...prev };
+                              delete next[group.key];
+                              return next;
+                            })
                           }
                         />
                         <span className="text-[11px] text-slate-700">
-                          {CHARACTER_SYNC_ACTION_LABELS[action]}
+                          仅本次放行，不改档案
                         </span>
                       </label>
-                    ))}
+                      {group.actions.map((action) => (
+                        <label key={action} className="flex items-start gap-2 cursor-pointer">
+                          <input
+                            type="radio"
+                            name={`char-sync-${groupIndex}`}
+                            className="mt-0.5 accent-blue-600"
+                            checked={charSyncChoices[group.key] === action}
+                            onChange={() =>
+                              setCharSyncChoices((prev) => ({
+                                ...prev,
+                                [group.key]: action,
+                              }))
+                            }
+                          />
+                          <span className="text-[11px] text-slate-700">
+                            {CHARACTER_SYNC_ACTION_LABELS[action]}
+                          </span>
+                        </label>
+                      ))}
+                    </div>
                   </div>
-                </div>
-              ))}
+                ))}
+              </div>
             </div>
-            <div className="flex flex-wrap items-center justify-end gap-2 border-t border-slate-100 px-4 py-3">
+            <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 bg-white border-t border-slate-100 px-4 py-3">
               <button
                 type="button"
                 disabled={charPrompt.busy}

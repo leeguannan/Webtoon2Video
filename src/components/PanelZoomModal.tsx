@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useMemo, useRef } from 'react';
 import {
   AlertCircle,
   Check,
@@ -8,7 +8,7 @@ import {
   X,
 } from 'lucide-react';
 import type { PanelItem, ScriptBeat, VoiceOption } from '../types/studio';
-import { VoicePreviewButton, findVoiceOption, useVoicePreview } from './VoicePicker';
+import { VoicePreviewButton, findVoiceOption, groupVoices, useVoicePreview } from './VoicePicker';
 
 /** 字幕原文自动保存的状态机。 */
 export type SaveStatus = 'idle' | 'dirty' | 'saving' | 'saved' | 'error';
@@ -41,6 +41,12 @@ interface PanelZoomModalProps {
   onChangeNarration: (beatId: string, text: string) => void;
   /** 改本句说话人；音色由角色自动带出，不直接挑音色。 */
   onChangeRole: (beatId: string, role: string) => void;
+  /**
+   * Patch v4.27：逐句指定 MiniMax 音色（voice_override）。
+   *
+   * 传空串表示清除单句指定，恢复按角色解析；缺省时本弹窗不显示该控件。
+   */
+  onChangeVoiceOverride?: (beatId: string, voiceId: string) => void;
   /** Patch v4.4：改本句语速（传 null = 清空微调，恢复角色默认语速）。 */
   onChangeSpeed: (beatId: string, speed: number | null) => void;
   /**
@@ -86,11 +92,14 @@ export const PanelZoomModal: React.FC<PanelZoomModalProps> = ({
   onSelectBeat,
   onChangeNarration,
   onChangeRole,
+  onChangeVoiceOverride,
   onChangeSpeed,
   onQuickSave,
 }) => {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const { playingKey, preview, stop } = useVoicePreview();
+  // Patch v4.27：MiniMax 音色按「供应商 · 分类」分组，整幕共用一份。
+  const voiceGroups = useMemo(() => groupVoices(voiceOptions), [voiceOptions]);
 
   const index = beats.findIndex((b) => b.beat_id === activeBeatId);
   const beat = index >= 0 ? beats[index] : undefined;
@@ -176,6 +185,10 @@ export const PanelZoomModal: React.FC<PanelZoomModalProps> = ({
   // voiceOverride 只用于提示历史遗留的强制指定（改角色时会被清掉）。
   const voiceOverride = beat.voice_override ?? '';
   const previewOption = findVoiceOption(voiceOptions, voiceInfo.voice);
+  // Patch v4.27：按角色解析时用的音色（单句未指定时的兜底说明）。
+  const roleVoiceId = beat.resolved_voice?.voice ?? '';
+  const roleVoiceName =
+    findVoiceOption(voiceOptions, roleVoiceId)?.display_name || roleVoiceId || '按角色解析';
   const isLengthWarn = charLen < 8 || charLen > 30;
   const canPrev = index > 0;
   const canNext = index < beats.length - 1;
@@ -292,7 +305,7 @@ export const PanelZoomModal: React.FC<PanelZoomModalProps> = ({
                     本句配音：{voiceInfo.label} · {voiceInfo.voice}
                     {voiceOverride && (
                       <span className="text-amber-600">
-                        （本句曾被强制指定音色 {voiceOverride}，改角色后将按角色解析）
+                        （本句已单独指定音色 {voiceOverride}，改角色后将按角色解析）
                       </span>
                     )}
                   </p>
@@ -320,6 +333,53 @@ export const PanelZoomModal: React.FC<PanelZoomModalProps> = ({
                   </p>
                 )}
               </div>
+
+              {/* Patch v4.27：单句指定 MiniMax 音色（一次性 / 龙套角色单独配音）。
+                  只改这一句的 voice_override，不动角色；选回「跟随角色」即清除指定。 */}
+              {onChangeVoiceOverride && (
+                <div>
+                  <label
+                    htmlFor="zoom-voice-override-select"
+                    className="block text-xs font-medium text-slate-700 mb-1.5"
+                  >
+                    单句指定 MiniMax 音色（可选）
+                  </label>
+                  <select
+                    id="zoom-voice-override-select"
+                    aria-label="本句指定 MiniMax 音色"
+                    value={voiceOverride}
+                    onChange={(event) =>
+                      onChangeVoiceOverride(beat.beat_id, event.target.value)
+                    }
+                    className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 focus:border-blue-600 focus:outline-none cursor-pointer"
+                  >
+                    <option value="">跟随角色（{roleVoiceName}）</option>
+                    {voiceOverride && !findVoiceOption(voiceOptions, voiceOverride) && (
+                      <option value={voiceOverride}>自定义：{voiceOverride}</option>
+                    )}
+                    {voiceGroups.map((group) => (
+                      <optgroup
+                        key={`${group.provider}-${group.category}`}
+                        label={group.label}
+                      >
+                        {group.items.map((item) => {
+                          const id = item.voice_id || item.id;
+                          return (
+                            <option key={id} value={id}>
+                              {item.display_name} ·{' '}
+                              {item.gender === 'female' ? '女' : '男'}
+                            </option>
+                          );
+                        })}
+                      </optgroup>
+                    ))}
+                  </select>
+                  <p className="mt-1 text-[11px] text-slate-400 leading-relaxed">
+                    指定后这一句固定用该音色合成（用于一次性 / 龙套角色）；
+                    「试听当前音色」会跟着切换。改说话人角色会清除这里的指定。
+                  </p>
+                </div>
+              )}
 
               {/* Patch v4.4：单句语速微调（只作用于本句 TTS 合成，不碰角色默认配置） */}
               <div className="space-y-1.5">

@@ -165,9 +165,12 @@ _SLOT_GENDER: dict[str, str] = {
     "male": "male",
     "male_lead": "male",
     "male_antagonist": "male",
+    # Patch v4.27：Stage 4 也会写这两个槽位，缺一项就会按「未知性别」兜底。
+    "male_mature": "male",
     "female": "female",
     "female_lead": "female",
     "female_mature": "female",
+    "female_antagonist": "female",
 }
 
 #: 旁白角色名（大小写无关）。

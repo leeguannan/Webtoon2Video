@@ -74,9 +74,13 @@ _GENERIC_ROLE_NAMES: frozenset[str] = frozenset(
         "male",
         "male_lead",
         "male_antagonist",
+        # Patch v4.27：Stage 4 还会写这两个槽位，漏掉就会在保存时误报
+        # 「未登记的角色」。
+        "male_mature",
         "female",
         "female_lead",
         "female_mature",
+        "female_antagonist",
         "unknown",
         "未知",
         "众人",
@@ -540,6 +544,13 @@ class CharacterNameCanonicalizer:
                 )
             ]
         if self.canonical_names and simplified not in self.canonical_names:
+            # Patch v4.27：这一句已经单独指定了 MiniMax 音色（voice_override），
+            # Stage 5 会直接用这个音色合成，不会回退旁白、也不需要作品角色表里有
+            # 这个人——一次性 / 龙套角色正是这么用的。这种情况不该再报
+            # 「未登记的角色」。
+            override = str(getattr(beat, "voice_override", "") or "").strip()
+            if override:
+                return []
             return [
                 CharacterCheckWarning(
                     beat_id=beat_id,
