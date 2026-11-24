@@ -26,6 +26,8 @@ import {
   Sparkles,
 } from 'lucide-react';
 import type {
+  AutoMotionResponse,
+  AutoMotionSummary,
   AutoPacingResponse,
   AutoPacingSummary,
   BeatRegenerateTTSResponse,
@@ -105,6 +107,8 @@ interface EpisodeStudioViewProps {
   ) => Promise<CharacterCheckResponse | null>;
   /** Patch v4.6：一键叙事节奏留白（后端改写 pause_after_ms 并同步 audio_manifest）。 */
   onAutoPacing?: (episodeId: string) => Promise<AutoPacingResponse | null>;
+  /** Patch v4.28：一键自动分配画面动效（后端改写 motion；不碰配音）。 */
+  onAutoMotions?: (episodeId: string) => Promise<AutoMotionResponse | null>;
   /** Patch v4.5：保存本话封页/结尾片包选项（写入 render_options.json，仅重跑 S7 生效）。 */
   onUpdateEpisodeRenderOptions?: (
     episodeId: string,
@@ -340,6 +344,9 @@ const MOTION_LABELS: Record<CameraMotion, string> = {
   zoom_out: 'ZOOM_OUT 缓拉',
   pan_down: 'PAN_DOWN 竖扫',
   pan_up: 'PAN_UP 上移',
+  // Patch v4.28：横向扫镜。
+  pan_left: 'PAN_LEFT 左横扫',
+  pan_right: 'PAN_RIGHT 右横扫',
   shake: 'SHAKE 震动',
   static: 'STATIC 静止',
 };
@@ -1188,6 +1195,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   onAutoSaveBeats,
   onCheckCharacters,
   onAutoPacing,
+  onAutoMotions,
   onUpdateEpisodeRenderOptions,
   onExportEpisode,
   onCleanupIntermediates,
@@ -1208,6 +1216,11 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   const [autoPacingLoading, setAutoPacingLoading] = useState(false);
   const [autoPacingSummary, setAutoPacingSummary] = useState<AutoPacingSummary | null>(null);
   const [autoPacingError, setAutoPacingError] = useState<string | null>(null);
+
+  // ---- Patch v4.28：全自动分配画面动效（后端按分镜几何 / 情绪改写 motion） ----
+  const [autoMotionLoading, setAutoMotionLoading] = useState(false);
+  const [autoMotionSummary, setAutoMotionSummary] = useState<AutoMotionSummary | null>(null);
+  const [autoMotionError, setAutoMotionError] = useState<string | null>(null);
 
   // 外部数据刷新（如切换话次、保存回包）后同步本地草稿。
   useEffect(() => {
@@ -1267,6 +1280,42 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
       setAutoPacingLoading(false);
     }
   }, [autoPacingLoading, episode.episode_id, onAutoPacing]);
+
+  /* ------------------------------------------------------------------
+   * Patch v4.28：一键自动分配画面动效
+   * 后端按分镜几何（超长竖格 / 横向宽格）与情绪（冲击 / 紧张）改写
+   * 每句的 motion；只改运镜，不动配音，因此用户只需重跑 S6~S7。
+   * ---------------------------------------------------------------- */
+  const handleRunAutoMotions = useCallback(async () => {
+    if (!onAutoMotions || autoMotionLoading) return;
+    if (tableDirtyRef.current) {
+      setSaveHint('请先保存解说稿再执行自动分配动效');
+      return;
+    }
+    setAutoMotionLoading(true);
+    setAutoMotionError(null);
+    try {
+      const result = await onAutoMotions(episode.episode_id);
+      if (!result) {
+        setAutoMotionError('自动分配动效执行失败，请查看后端日志后重试');
+        return;
+      }
+      draftBeatsRef.current = result.beats;
+      setDraftBeats(result.beats);
+      tableDirtyRef.current = false;
+      setTableDirty(false);
+      setSaveHint('');
+      setAutoMotionSummary(result.summary);
+      // Patch v4.28：运镜被后端改写过 → 必须重建时间轴与成片（S6~S7）。
+      if (result.summary.updated_count > 0) {
+        setNeedsTimelineRebuild(true);
+      }
+    } catch (err) {
+      setAutoMotionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setAutoMotionLoading(false);
+    }
+  }, [autoMotionLoading, episode.episode_id, onAutoMotions]);
 
   // ---- Patch v4.7：按幕 BGM（storyboard 幕配乐 + 作品曲库） ----
   const [sceneStoryboard, setSceneStoryboard] = useState<EpisodeStoryboard | null>(null);
@@ -2871,6 +2920,15 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
       const y = -16 + 32 * progress;
       return { transform: `scale(1.12) translateY(${y.toFixed(1)}px)` };
     }
+    // Patch v4.28：横向扫镜（左右横扫）预览。
+    if (motion === 'pan_right') {
+      const x = -16 + 32 * progress;
+      return { transform: `scale(1.12) translateX(${x.toFixed(1)}px)` };
+    }
+    if (motion === 'pan_left') {
+      const x = 16 - 32 * progress;
+      return { transform: `scale(1.12) translateX(${x.toFixed(1)}px)` };
+    }
     return { transform: 'scale(1)' };
   };
 
@@ -3479,6 +3537,21 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                 )}
                 自动节奏留白
               </button>
+              {/* Patch v4.28：一键自动分配画面动效（按分镜几何 + 情绪自动挑运镜）。 */}
+              <button
+                type="button"
+                disabled={autoMotionLoading || !onAutoMotions}
+                onClick={() => void handleRunAutoMotions()}
+                title={tableDirty ? '请先保存解说稿再执行自动分配动效' : '按分镜尺寸与情绪自动分配运镜（pan_down / pan_left / shake 等）'}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
+              >
+                {autoMotionLoading ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Wand2 className="w-3.5 h-3.5" />
+                )}
+                自动分配动效
+              </button>
               <button
                 type="button"
                 onClick={() => setBgmDrawerOpen(true)}
@@ -3611,6 +3684,47 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
           <div className="mt-2 flex items-start gap-2 px-3 py-2 text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg">
             <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
             <span>{autoPacingError}</span>
+          </div>
+        )}
+
+        {/* Patch v4.28：自动分配动效结果条——只改运镜，配音不动。 */}
+        {activeTab === 'script' && autoMotionSummary && (
+          <div className="mt-2 flex items-start gap-2 px-3 py-2 text-xs text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg">
+            <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0" />
+            <div className="space-y-0.5 flex-1">
+              {autoMotionSummary.updated_count > 0 ? (
+                <>
+                  <p>
+                    自动分配动效完成：共调整 {autoMotionSummary.updated_count} 处（横扫{' '}
+                    {autoMotionSummary.wide_pan_count} / 竖扫{' '}
+                    {autoMotionSummary.tall_pan_count} / 震动{' '}
+                    {autoMotionSummary.shake_count} / 推拉{' '}
+                    {autoMotionSummary.push_pull_count}），重跑 S6~S7 即可生效，无需重跑配音。
+                  </p>
+                  <button
+                    type="button"
+                    disabled={rerunningStage !== null}
+                    onClick={() => void handleStageRerunClick('s6_timeline')}
+                    className="mt-1.5 inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-emerald-600 rounded hover:bg-emerald-700 transition-colors cursor-pointer disabled:opacity-50"
+                  >
+                    {rerunningStage === 's6_timeline' ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <Film className="w-3.5 h-3.5" />
+                    )}
+                    立即从 S6 重跑成片（0 TTS 费用）
+                  </button>
+                </>
+              ) : (
+                <p>自动分配动效检查完成：现有运镜已符合分配规则，未做调整。</p>
+              )}
+            </div>
+          </div>
+        )}
+        {activeTab === 'script' && autoMotionError && (
+          <div className="mt-2 flex items-start gap-2 px-3 py-2 text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg">
+            <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+            <span>{autoMotionError}</span>
           </div>
         )}
 

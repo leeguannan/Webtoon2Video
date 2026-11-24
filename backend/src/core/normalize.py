@@ -36,6 +36,9 @@ MOTION_VALUES: tuple[str, ...] = (
     "zoom_out",
     "pan_down",
     "pan_up",
+    # Patch v4.28：新增横向扫镜（左右横扫）。
+    "pan_left",
+    "pan_right",
     "shake",
 )
 PLOT_THREAD_STATUS: tuple[str, ...] = ("open", "resolved")

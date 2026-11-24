@@ -2619,6 +2619,79 @@ def create_app(
             },
         }
 
+    @app.post("/api/episodes/{episode_id}/auto-motions")
+    async def auto_assign_episode_motions(episode_id: str) -> dict[str, Any]:
+        """Patch v4.28：按分镜几何与情绪自动分配画面动效（不碰音频清单、不触发 S5）。"""
+        located = view.find_episode(episode_id)
+        if located is None:
+            raise HTTPException(status_code=404, detail=f"找不到话次：{episode_id}")
+        series_id, episode_no = located
+        episode_dir = view.episode_dir(series_id, episode_no)
+        script_dir = episode_dir / "04_script"
+        script_path = script_dir / "script.json"
+        if not script_path.is_file():
+            raise HTTPException(status_code=404, detail="该话还没有 Stage 4 剧本")
+        script = load_model(NarrationScript, script_path)
+
+        # 启用幕：优先读已落盘 storyboard；缺失但有 vision 时内存自动编排，
+        # 结果只用于本次动效判定，绝不落盘覆盖用户的镜头编排。
+        storyboard = s3b_scenes.load_storyboard(
+            s3b_scenes.storyboard_path_for(episode_dir)
+        )
+        if storyboard is None:
+            vision = _load_episode_vision(episode_dir)
+            if vision is not None:
+                try:
+                    storyboard = s3b_scenes.auto_build_storyboard(episode_id, vision)
+                except Exception:  # noqa: BLE001 - 自动编排失败退化为无幕模式
+                    storyboard = None
+        active_scenes = (
+            [scene for scene in storyboard.scenes if scene.enabled]
+            if storyboard is not None
+            else []
+        )
+
+        from stages.s4_scriptwriter import (
+            apply_auto_motions,
+            load_episode_panel_metas,
+            render_readable_script,
+        )
+
+        panel_metas = load_episode_panel_metas(episode_dir)
+        beat_dicts = [beat.model_dump() for beat in script.beats]
+        assigned_beats, report = apply_auto_motions(
+            beat_dicts,
+            panel_metas=panel_metas or None,
+            scenes=active_scenes or None,
+        )
+        try:
+            updated_script = NarrationScript.model_validate(
+                {**script.model_dump(), "beats": assigned_beats}
+            )
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"自动分配动效产出非法剧本：{exc}"
+            ) from exc
+        save_model(updated_script, script_path)
+        readable_path = script_dir / "script_readable.md"
+        readable_path.write_text(
+            render_readable_script(updated_script), encoding="utf-8"
+        )
+        # 只改运镜：音频清单与配音产物完全不动，用户仅需重跑 S6~S7。
+        return {
+            "beats": view.beats(series_id, episode_no),
+            "summary": {
+                "updated_count": report.updated_count,
+                "tall_pan_count": report.tall_pan_count,
+                "wide_pan_count": report.wide_pan_count,
+                "shake_count": report.shake_count,
+                "push_pull_count": report.push_pull_count,
+                "static_count": report.static_count,
+                "changed_beat_ids": report.changed_beat_ids,
+                "panel_meta_count": len(panel_metas),
+            },
+        }
+
     # ------------------------------------------------------------------
     # 单句重配 TTS（Patch v4.12）
     # ------------------------------------------------------------------

@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import sys
@@ -25,6 +26,7 @@ from core.character_unify import (
 )
 from core.config import SeriesConfig, load_series_config
 from core.normalize import (
+    EMOTION_VALUES,
     MAX_SPEED_OVERRIDE,
     MIN_NARRATION_CHARS,
     MIN_DIALOGUE_CHARS,
@@ -43,10 +45,12 @@ from core.memory import Stage4Context, StoryBibleManager
 from core.panel_ids import PanelIdResolver, panel_sort_key
 from core.schemas import (
     ArcSummary,
+    CameraMotion,
     CharacterProfile,
     EpisodeStoryDraft,
     EpisodeStoryboard,
     NarrationScript,
+    PanelMeta,
     PanelVisionInfo,
     StoryboardScene,
     StoryChapter,
@@ -1073,6 +1077,315 @@ def apply_narrative_pacing(
     return paced, report
 
 
+# ---------------------------------------------------------------------------
+# Patch v4.28：全自动分配画面动效
+# ---------------------------------------------------------------------------
+
+#: 超长竖格判定阈值（高 / 宽）。
+MOTION_TALL_RATIO: float = 1.5
+#: 横向宽格判定阈值（宽 / 高）。
+MOTION_WIDE_RATIO: float = 1.25
+#: 冲击类音效关键词（``sfx_cue`` 命中即视为高燃瞬间）。
+MOTION_IMPACT_SFX: frozenset[str] = frozenset(
+    {
+        "impact",
+        "punch",
+        "explosion",
+        "slash",
+        "crash",
+        "boom",
+        "smash",
+        "thud",
+        "strike",
+        "撞击",
+        "重击",
+        "爆炸",
+        "斩",
+        "轰",
+        "砰",
+    }
+)
+#: 视作「物理冲击」的标准音效标签（``core.normalize.SFX_CUE_KEYS`` 里的物理动作音）。
+MOTION_IMPACT_SFX_CUES: frozenset[str] = frozenset(
+    {"crash", "heart_thump", "door_slam", "whoosh", "footstep"}
+)
+#: 触发震动镜头的情绪（愤怒 / 震惊）。
+MOTION_IMPACT_EMOTIONS: frozenset[str] = frozenset({"angry", "shocked"})
+#: 倾向推近（``zoom_in``）的情绪。
+MOTION_PUSH_EMOTIONS: frozenset[str] = frozenset({"tense", "whisper", "sad"})
+#: 情绪关键词 → 情绪标签。``ScriptBeat`` 没有 ``emotion`` 字段，
+#: 模型只给自由文本 ``emotion_instruction``，只能靠关键词兜底识别。
+MOTION_EMOTION_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "angry",
+        ("angry", "furious", "rage", "愤怒", "震怒", "暴怒", "怒火", "发怒", "怒吼"),
+    ),
+    (
+        "shocked",
+        ("shocked", "shock", "震惊", "惊愕", "吃惊", "惊讶", "愕然"),
+    ),
+    ("tense", ("tense", "紧张", "紧绷", "压抑", "不安")),
+    ("whisper", ("whisper", "低声", "耳语", "轻声", "呢喃", "压低声音")),
+    ("sad", ("sad", "悲伤", "难过", "低落", "失落", "哽咽", "心酸")),
+    ("happy", ("happy", "开心", "愉快", "轻松", "爽快")),
+    ("calm", ("calm", "平静", "冷静", "淡然")),
+)
+#: 冲击镜头要求短句（去标点后的字数上限）。
+MOTION_IMPACT_SHORT_MAX: int = 14
+#: 连续震动上限——不得连震 3 拍以上。
+MOTION_MAX_SHAKE_STREAK: int = 2
+#: 分镜尺寸缺失时的兜底尺寸（普通竖格 3:4——刻意避开长竖格 / 宽格阈值，
+#: 保证「拿不到尺寸」时按普通竖格处理，不会误判成超长格）。
+MOTION_FALLBACK_SIZE: tuple[int, int] = (900, 1200)
+
+
+@dataclass(slots=True)
+class MotionAssignReport:
+    """自动分配画面动效的执行明细（供接口回显与 Stage 4 日志）。"""
+
+    #: 被改动的 beat 数。
+    updated_count: int = 0
+    #: 竖扫（``pan_down`` / ``pan_up``）处数。
+    tall_pan_count: int = 0
+    #: 横扫（``pan_left`` / ``pan_right``）处数。
+    wide_pan_count: int = 0
+    #: 震动（``shake``）处数。
+    shake_count: int = 0
+    #: 推拉（``zoom_in`` / ``zoom_out``）处数。
+    push_pull_count: int = 0
+    #: 静止（``static``）处数。
+    static_count: int = 0
+    changed_beat_ids: list[str] = field(default_factory=list)
+
+
+def _index_panel_metas(
+    panel_metas: Sequence[PanelMeta] | Mapping[str, PanelMeta] | None,
+) -> dict[str, PanelMeta]:
+    """把分镜尺寸清单统一成 ``panel_id → PanelMeta`` 索引。"""
+    if not panel_metas:
+        return {}
+    index: dict[str, PanelMeta] = {}
+    if isinstance(panel_metas, Mapping):
+        for key, meta in panel_metas.items():
+            if meta is None:
+                continue
+            panel_id = str(key or getattr(meta, "panel_id", "") or "").strip()
+            if panel_id:
+                index[panel_id] = meta
+        return index
+    for meta in panel_metas:
+        if meta is None:
+            continue
+        panel_id = str(getattr(meta, "panel_id", "") or "").strip()
+        if panel_id:
+            index[panel_id] = meta
+    return index
+
+
+def _panel_geometry(meta: PanelMeta | None) -> tuple[int, int, bool]:
+    """返回 ``(宽, 高, 是否超长竖格)``；尺寸缺失时按普通竖格兜底。"""
+    width = int(getattr(meta, "width", 0) or 0)
+    height = int(getattr(meta, "height", 0) or 0)
+    if width <= 0 or height <= 0:
+        aspect = float(getattr(meta, "aspect_ratio", 0) or 0)
+        if aspect > 0:
+            height = MOTION_FALLBACK_SIZE[1]
+            width = max(1, int(round(aspect * height)))
+        else:
+            width, height = MOTION_FALLBACK_SIZE
+    tall = bool(getattr(meta, "is_tall_panel", False)) or (
+        height / width >= MOTION_TALL_RATIO
+    )
+    return width, height, tall
+
+
+def _beat_emotion(beat: Mapping[str, Any]) -> str:
+    """取 beat 的情绪标签。
+
+    ``ScriptBeat`` 没有独立的 ``emotion`` 字段，模型只给自由文本
+    ``emotion_instruction``；这里先看 ``emotion``（外部直喂的 beat 可能带），
+    再按关键词兜底识别。
+    """
+    raw = str(beat.get("emotion") or "").strip().lower()
+    if raw in EMOTION_VALUES:
+        return raw
+    text = f"{beat.get('emotion_instruction') or ''} {beat.get('sfx_cue') or ''}".lower()
+    for label, keywords in MOTION_EMOTION_KEYWORDS:
+        if any(keyword in text for keyword in keywords):
+            return label
+    return ""
+
+
+def _beat_is_impact(beat: Mapping[str, Any]) -> bool:
+    """规则 C 判定：音效命中冲击动作词，或愤怒 / 震惊情绪且句子够短。"""
+    sfx = str(beat.get("sfx_cue") or "").strip().lower()
+    if sfx:
+        if sfx in MOTION_IMPACT_SFX_CUES:
+            return True
+        if any(word in sfx for word in MOTION_IMPACT_SFX):
+            return True
+    if _beat_emotion(beat) in MOTION_IMPACT_EMOTIONS:
+        core = re.sub(r"[^\w\u4e00-\u9fff]", "", _beat_text(beat))
+        return len(core) <= MOTION_IMPACT_SHORT_MAX
+    return False
+
+
+def apply_auto_motions(
+    beats: Sequence[dict[str, Any]],
+    *,
+    panel_metas: Sequence[PanelMeta] | Mapping[str, PanelMeta] | None = None,
+    scenes: Sequence[StoryboardScene] | None = None,
+) -> tuple[list[dict[str, Any]], MotionAssignReport]:
+    """按分镜几何 + 情绪自动分配画面运镜（纯函数，不改入参）。
+
+    规则（自上而下判定）：
+
+    * **规则 A｜超长竖格**（``is_tall_panel`` 或 高/宽 >= 1.5）：该格首拍给
+      ``pan_down``；同一长格的连续后续拍改为 ``zoom_in``（命中冲击时给 ``shake``）。
+    * **规则 B｜横向宽格**（宽/高 >= 1.25）：给 ``pan_right`` / ``pan_left``，
+      连续宽格交替左右横扫；同一宽格的连续后续拍改为 ``zoom_in``。
+    * **规则 C｜高燃冲击**：``sfx_cue`` 命中冲击动作词，或情绪为愤怒 / 震惊
+      且句子短（<= 14 字）时给 ``shake``——**不得连震 3 拍以上**。
+    * **规则 D｜定场与防单调**：新幕首拍（非长 / 宽格）优先 ``zoom_out``；
+      ``tense`` / ``whisper`` / ``sad`` 倾向 ``zoom_in``；
+      连续 2 拍同动效时第 3 拍自动打散（竖扫改反向、震动改 ``zoom_out``、
+      推拉改 ``zoom_out`` / ``static``）。
+
+    只改 ``motion`` 字段，``narration_text`` / ``tts_text`` / ``pause_after_ms`` /
+    ``voice_override`` 等字段原样保留。
+    """
+    metas = _index_panel_metas(panel_metas)
+    panel_to_scene = _scene_panel_index(scenes)
+    scene_ordinals = _scene_ordinal_index(scenes)
+
+    assigned: list[dict[str, Any]] = [dict(beat) for beat in beats]
+    report = MotionAssignReport()
+
+    prev_panel_id: str | None = None
+    prev_motion: str | None = None
+    prev_prev_motion: str | None = None
+    prev_scene_ordinal: int | None = None
+    wide_flip = 0
+    shake_streak = 0
+
+    for beat in assigned:
+        panel_id = _beat_first_panel_id(beat) or ""
+        meta = metas.get(panel_id)
+        width, height, is_tall = _panel_geometry(meta)
+        is_wide = (not is_tall) and width / height >= MOTION_WIDE_RATIO
+        impact = _beat_is_impact(beat)
+        emotion = _beat_emotion(beat)
+        scene_ordinal = _beat_scene_ordinal(beat, panel_to_scene, scene_ordinals)
+        is_scene_open = (
+            scene_ordinal is not None and scene_ordinal != prev_scene_ordinal
+        )
+        first_beat_of_panel = panel_id != prev_panel_id
+
+        motion = ""
+        if is_tall:
+            if first_beat_of_panel:
+                motion = CameraMotion.PAN_DOWN.value
+            elif impact and shake_streak < MOTION_MAX_SHAKE_STREAK:
+                motion = CameraMotion.SHAKE.value
+            else:
+                motion = CameraMotion.ZOOM_IN.value
+        elif is_wide:
+            if first_beat_of_panel:
+                motion = (
+                    CameraMotion.PAN_RIGHT.value
+                    if wide_flip % 2 == 0
+                    else CameraMotion.PAN_LEFT.value
+                )
+                wide_flip += 1
+            elif impact and shake_streak < MOTION_MAX_SHAKE_STREAK:
+                motion = CameraMotion.SHAKE.value
+            else:
+                motion = CameraMotion.ZOOM_IN.value
+        elif impact and shake_streak < MOTION_MAX_SHAKE_STREAK:
+            motion = CameraMotion.SHAKE.value
+        elif is_scene_open:
+            motion = CameraMotion.ZOOM_OUT.value
+        elif emotion in MOTION_PUSH_EMOTIONS:
+            motion = CameraMotion.ZOOM_IN.value
+        else:
+            motion = CameraMotion.ZOOM_IN.value
+
+        # 规则 D 防单调：连续 2 拍同动效时，第 3 拍必须换掉。
+        if motion == prev_motion == prev_prev_motion:
+            if motion in (CameraMotion.PAN_DOWN.value, CameraMotion.PAN_UP.value):
+                # 竖扫不浪费长图几何：改成反向竖扫。
+                motion = (
+                    CameraMotion.PAN_UP.value
+                    if motion == CameraMotion.PAN_DOWN.value
+                    else CameraMotion.PAN_DOWN.value
+                )
+            elif motion == CameraMotion.SHAKE.value:
+                motion = CameraMotion.ZOOM_OUT.value
+            elif motion == CameraMotion.ZOOM_OUT.value:
+                motion = CameraMotion.STATIC.value
+            else:
+                motion = CameraMotion.ZOOM_OUT.value
+
+        old_motion = str(beat.get("motion") or "")
+        if old_motion != motion:
+            beat["motion"] = motion
+            report.updated_count += 1
+            report.changed_beat_ids.append(str(beat.get("beat_id") or ""))
+            if motion in (CameraMotion.PAN_DOWN.value, CameraMotion.PAN_UP.value):
+                report.tall_pan_count += 1
+            elif motion in (CameraMotion.PAN_LEFT.value, CameraMotion.PAN_RIGHT.value):
+                report.wide_pan_count += 1
+            elif motion == CameraMotion.SHAKE.value:
+                report.shake_count += 1
+            elif motion in (CameraMotion.ZOOM_IN.value, CameraMotion.ZOOM_OUT.value):
+                report.push_pull_count += 1
+            elif motion == CameraMotion.STATIC.value:
+                report.static_count += 1
+
+        shake_streak = shake_streak + 1 if motion == CameraMotion.SHAKE.value else 0
+        prev_prev_motion = prev_motion
+        prev_motion = motion
+        prev_panel_id = panel_id
+        if scene_ordinal is not None:
+            prev_scene_ordinal = scene_ordinal
+
+    return assigned, report
+
+
+def load_episode_panel_metas(episode_dir: str | Path) -> list[PanelMeta]:
+    """读取某话的分镜尺寸清单。
+
+    依次尝试 ``02_panels/panels_meta.json`` → ``02_panels/panels.json``
+    → 直接扫描 ``02_panels/*.png`` 的图片尺寸（Stage 2 的事实来源是
+    ``panels.json``，这里按优先级兜底，保证自动分配动效在各种历史产物上都能跑）。
+    """
+    root = Path(episode_dir)
+    panels_dir = root / "02_panels"
+    for name in ("panels_meta.json", "panels.json"):
+        path = panels_dir / name
+        if not path.is_file():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 - 历史产物格式异常时继续兜底
+            continue
+        items = payload.get("panels") if isinstance(payload, dict) else payload
+        metas: list[PanelMeta] = []
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                metas.append(PanelMeta.model_validate(item))
+            except Exception:  # noqa: BLE001 - 单条脏数据不影响其余面板
+                continue
+        if metas:
+            return metas
+    # 兜底：直接扫描面板图片尺寸（本地导入避免与 s6 形成模块级循环）。
+    from stages.s6_timeline import scan_panels
+
+    return scan_panels(panels_dir)
+
+
 class ScriptWriterError(RuntimeError):
     """Stage 4 撰稿失败。"""
 
@@ -1080,6 +1393,11 @@ class ScriptWriterError(RuntimeError):
 def script_dir_for(series_dir: str | Path, episode_no: int) -> Path:
     """``04_script`` 目录路径。"""
     return Path(series_dir) / "episodes" / f"ep_{episode_no:03d}" / SCRIPT_DIR_NAME
+
+
+def episode_dir_for(series_dir: str | Path, episode_no: int) -> Path:
+    """某话根目录：``episodes/ep_XXX/``（Patch v4.28 自动分配动效要读 ``02_panels``）。"""
+    return Path(series_dir) / "episodes" / f"ep_{episode_no:03d}"
 
 
 def load_prompt_template(name: str) -> str:
@@ -3204,6 +3522,33 @@ async def write_episode_script(
                 f"换气 {pacing_report.breath_count} / "
                 f"切分镜 {pacing_report.panel_switch_count}），"
                 f"beat={pacing_report.changed_beat_ids}",
+                file=sys.stderr,
+            )
+
+    # Patch v4.28：全自动分配画面动效。按分镜几何（超长竖格 / 横向宽格）与
+    # 情绪（冲击 / 紧张）自动挑运镜，用户不必再手工调动效。分镜尺寸从本话
+    # ``02_panels`` 的清单读取（拿不到就退回普通竖格兜底）。
+    if merged_beats:
+        auto_panel_metas: list[PanelMeta] = []
+        if series_dir is not None:
+            auto_panel_metas = load_episode_panel_metas(
+                episode_dir_for(series_dir, context.episode_no)
+            )
+        merged_beats, motion_report = apply_auto_motions(
+            merged_beats,
+            panel_metas=auto_panel_metas,
+            scenes=active_scenes if scene_mode else None,
+        )
+        if motion_report.updated_count > 0:
+            print(
+                "[s4_scriptwriter] 自动分配动效："
+                f"共调整 {motion_report.updated_count} 处"
+                f"（横扫 {motion_report.wide_pan_count} / "
+                f"竖扫 {motion_report.tall_pan_count} / "
+                f"震动 {motion_report.shake_count} / "
+                f"推拉 {motion_report.push_pull_count} / "
+                f"静止 {motion_report.static_count}），"
+                f"beat={motion_report.changed_beat_ids}",
                 file=sys.stderr,
             )
 

@@ -220,6 +220,9 @@ def test_camera_motion_values() -> None:
         "zoom_out",
         "pan_down",
         "pan_up",
+        # Patch v4.28：新增真正的横向扫镜。
+        "pan_left",
+        "pan_right",
         "shake",
     }
 

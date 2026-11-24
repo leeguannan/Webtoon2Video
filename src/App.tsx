@@ -19,6 +19,7 @@ import {
 } from 'lucide-react';
 import type {
   ArcSummary,
+  AutoMotionResponse,
   AutoPacingResponse,
   BeatRegenerateTTSResponse,
   CharacterCheckResponse,
@@ -1221,6 +1222,27 @@ export default function App() {
     [patchEpisode]
   );
 
+  /* Patch v4.28：一键自动分配画面动效（后端按分镜几何 / 情绪改写 motion）。 */
+  const handleAutoMotions = useCallback(
+    async (episodeId: string): Promise<AutoMotionResponse | null> => {
+      try {
+        const result = await apiFetch<AutoMotionResponse>(
+          `/episodes/${encodeURIComponent(episodeId)}/auto-motions`,
+          { method: 'POST' }
+        );
+        patchEpisode(episodeId, (ep) => ({
+          ...ep,
+          beats: result.beats as ScriptBeat[],
+        }));
+        return result;
+      } catch (err) {
+        reportError('自动分配动效失败', err);
+        return null;
+      }
+    },
+    [patchEpisode]
+  );
+
   const handleExportEpisode = async (
     episodeId: string,
     format: 'mp4' | 'ass' | 'script'
@@ -1818,6 +1840,7 @@ export default function App() {
               onAutoSaveBeats={handleAutoSaveBeats}
               onCheckCharacters={handleCheckCharacters}
               onAutoPacing={handleAutoPacing}
+              onAutoMotions={handleAutoMotions}
               onUpdateEpisodeRenderOptions={handleUpdateEpisodeRenderOptions}
               onExportEpisode={handleExportEpisode}
               onCleanupIntermediates={handleCleanupIntermediates}

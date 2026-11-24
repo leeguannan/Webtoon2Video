@@ -4,6 +4,9 @@ export type CameraMotion =
   | 'zoom_out'
   | 'pan_down'
   | 'pan_up'
+  /** Patch v4.28：横向扫镜（左右横扫）。 */
+  | 'pan_left'
+  | 'pan_right'
   | 'shake';
 
 export type StageId =
@@ -538,6 +541,34 @@ export interface AutoPacingSummary {
 export interface AutoPacingResponse {
   beats: ScriptBeat[];
   summary: AutoPacingSummary;
+}
+
+// ---------------------------------------------------------------------------
+// Patch v4.28：全自动分配画面动效（auto-motions）
+// ---------------------------------------------------------------------------
+/** 自动分配画面动效的执行明细（与后端 MotionAssignReport 对齐）。 */
+export interface AutoMotionSummary {
+  /** 被改动的分句数。 */
+  updated_count: number;
+  /** 竖扫（pan_down / pan_up）处数。 */
+  tall_pan_count: number;
+  /** 横扫（pan_left / pan_right）处数。 */
+  wide_pan_count: number;
+  /** 震动（shake）处数。 */
+  shake_count: number;
+  /** 推拉（zoom_in / zoom_out）处数。 */
+  push_pull_count: number;
+  /** 静止（static）处数。 */
+  static_count: number;
+  changed_beat_ids: string[];
+  /** 参与判定的分镜尺寸条目数。 */
+  panel_meta_count?: number;
+}
+
+/** POST /api/episodes/{id}/auto-motions 的完整响应。 */
+export interface AutoMotionResponse {
+  beats: ScriptBeat[];
+  summary: AutoMotionSummary;
 }
 
 // ---------------------------------------------------------------------------

@@ -296,7 +296,9 @@ async def test_run_stage4_writes_script_and_readable(tmp_path) -> None:
     assert saved.episode_digest.episode_no == 2  # 同理
     assert len(saved.beats) == 2
     assert saved.beats[0].pause_after_ms == 320
-    assert saved.beats[1].motion.value == "static"
+    # Patch v4.28：Stage 4 出稿后自动分配画面动效，模型给的 static 会被
+    # 自动分配结果覆盖（普通竖格兜底 → 推近 zoom_in）。
+    assert saved.beats[1].motion.value == "zoom_in"
 
     readable = readable_path.read_text(encoding="utf-8")
     assert "旁白（字幕）" in readable

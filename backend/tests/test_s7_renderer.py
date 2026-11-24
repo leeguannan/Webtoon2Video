@@ -776,8 +776,11 @@ def test_foreground_overlay_never_crosses_safe_bottom(tmp_path: Path) -> None:
 
 
 def test_tall_panel_pan_down_scans_inside_safe_window(tmp_path: Path) -> None:
-    """超长竖格（高 > 1.5×宽）的 pan_down：宽度铺满 1020，在 1020×1220 视窗内从顶扫到底。"""
-    from stages import s7_renderer
+    """超长竖格的 pan_down：宽度铺满 2040，在 2040×2440 超采样视窗内从顶扫到底。
+
+    Patch v4.28：扫镜不再用 zoompan（它会把长图压扁、并把 y 取样坐标夹死），
+    改为「等比缩放 → 2x 超采样 → 滑动 crop → 缩回 1020×1220」。
+    """
 
     def _pan_fragment(source_size: tuple[int, int]) -> str:
         scene = TimelineScene(
@@ -801,20 +804,24 @@ def test_tall_panel_pan_down_scans_inside_safe_window(tmp_path: Path) -> None:
             scene, timeline, work_dir=tmp_path, fps=30, source_size=source_size
         )
 
-    # 800×2400（比例 3.0）触发专用链路：scale 到宽 1020，zoompan 定焦 1.0、视窗内扫底。
+    # 800×2400（比例 3.0）触发长竖格链路：宽度铺满 2040，超采样视窗内匀速扫底。
     tall_fragment = _pan_fragment((800, 2400))
-    assert "scale=1020:-2" in tall_fragment
-    assert "zoompan=z='1.0':x=0:y='(ih-1220)*on/29'" in tall_fragment
-    assert "s=1020x1220" in tall_fragment
-    # 不再走旧的「缩小 + pad + 1.12 倍放大」链路。
+    assert "scale=2040:-2" in tall_fragment
+    assert "setsar=1" in tall_fragment
+    assert "crop=w=2040:h=2440" in tall_fragment
+    assert "y='(ih-2440)*n/29'" in tall_fragment
+    assert "scale=1020:1220:flags=lanczos" in tall_fragment
+    # 不再走旧的「缩小 + pad + 1.12 倍放大」链路，也不再有会压扁长图的 zoompan。
     assert "1.12" not in tall_fragment
     assert "force_original_aspect_ratio=decrease" not in tall_fragment
+    assert "zoompan=" not in tall_fragment
 
-    # 普通竖格（比例 1.25 < 1.5）保持通用 pan_down 链路。
+    # 普通竖格（比例 1.25）改走「等比适配 + 1.16x 余量」的滑动链路。
     normal_fragment = _pan_fragment((800, 1000))
-    assert "scale=1020:-2" not in normal_fragment
-    assert "1.12" in normal_fragment
-    assert f"pad={s7_renderer.SAFE_WIDTH}:{s7_renderer.SAFE_BOX_HEIGHT}" in normal_fragment
+    assert "scale=2040:-2" not in normal_fragment
+    assert "1.16" in normal_fragment
+    assert "crop=w=2040:h=2440" in normal_fragment
+    assert "zoompan=" not in normal_fragment
 
     # static 场景即使源图超长也不触发扫底链路。
     static_scene = TimelineScene(

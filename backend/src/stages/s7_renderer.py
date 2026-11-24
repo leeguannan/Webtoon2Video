@@ -91,7 +91,23 @@ SAFE_ZONE_HEIGHT = 1260
 #: 主画面下沿硬上限：overlay 纵向终点必须 <= 1440（实测最大 1420）。
 SAFE_BOTTOM_LIMIT = 1440
 #: Patch v3.0-8：高宽比超过该阈值视为「超长竖格」，pan_down 改为宽度铺满 + 视窗内扫底。
+#:
+#: Patch v4.28 起该阈值只保留给外部引用：平移运镜改用「2x 超采样 + 滑动 crop」，
+#: 长竖格判定改为按超采样后的高度（``TALL_PAN_SS_MARGIN``）计算。
 TALL_PANEL_RATIO = 1.5
+#: Patch v4.28：平移运镜的 2x 超采样画布尺寸（安全框 1020×1220 的 2 倍）。
+#:
+#: 滑动取景在超采样画布上进行，最后一次性缩回安全框，滑动过程不出现锯齿抖动。
+SS_WIDTH = SAFE_WIDTH * 2
+SS_HEIGHT = SAFE_BOX_HEIGHT * 2
+#: Patch v4.28：长竖格判定余量（按宽 2040 等比缩放后，高度 > 视窗高 × 该系数才算长竖格）。
+TALL_PAN_SS_MARGIN = 1.06
+#: Patch v4.28：非长竖格的运镜余量（等比适配安全框后额外放大该倍数，留出滑动空间）。
+PAN_MARGIN = 1.16
+#: Patch v4.28：超窄横幅判定阈值（宽高比超过该值即视为横幅）。
+PAN_BANNER_RATIO = 2.8
+#: Patch v4.28：超窄横幅的放大倍率上限（防止过度放大导致画面发糊）。
+PAN_MAX_BANNER_SCALE = 2.2
 #: 背景固定质感滤镜（规范明文）：同图放大铺满后高斯模糊 + 暗化降饱和，
 #: 营造沉浸暗调，彻底消除黑/白边生硬感。
 BACKGROUND_BLUR_FILTER = "boxblur=30:4"
@@ -433,22 +449,19 @@ def _motion_expressions(motion: str, frames: int) -> tuple[str, str, str]:
 
     **为什么 x/y 要除以 zoom**：zoompan 的 x/y 是「从放大后的输入里取样的左上角坐标」，
     取 ``(iw-iw/zoom)/2`` 才是放大后的**居中**取样，否则画面会偏向左上角。
-    ``pan_*`` 与 ``shake`` 额外放大到 1.12 作为运镜余量，
-    否则位移/抖动会把画布边缘拉出空白。
+    ``shake`` 额外放大到 1.12 作为运镜余量，否则抖动会把画布边缘拉出空白。
+
+    **Patch v4.28**：``pan_down`` / ``pan_up`` / ``pan_left`` / ``pan_right``
+    已不再走 zoompan（它会把长图压扁并把 y 夹死），改由
+    :func:`_pan_filter_chain` 处理，这里只保留缩放类与抖动类运镜
+    （``frames`` 参数保留只为调用方签名稳定）。
     """
     center_x = "(iw-iw/zoom)/2"
     center_y = "(ih-ih/zoom)/2"
-    span = max(1, int(frames))
     if motion == "zoom_in":
         return ("min(zoom+0.0008,1.12)", center_x, center_y)
     if motion == "zoom_out":
         return ("if(lte(zoom,1.0),1.12,max(1.001,zoom-0.0008))", center_x, center_y)
-    if motion == "pan_down":
-        # 镜头向下移动：取样点从画幅顶端移到底端。
-        return ("1.12", center_x, f"(ih-ih/zoom)*(on/{span})")
-    if motion == "pan_up":
-        # 镜头向上移动：取样点从画幅底端移回顶端。
-        return ("1.12", center_x, f"(ih-ih/zoom)*(1-on/{span})")
     if motion == "shake":
         return ("1.12", f"{center_x}+sin(on*1.7)*6", f"{center_y}+cos(on*2.3)*6")
     return ("1.0", center_x, center_y)
@@ -477,6 +490,160 @@ def _focus_band_crop(scene: TimelineScene) -> str:
     )
 
 
+# --------------------------------------------------------------------------
+# Patch v4.28：平移运镜（上下扫 / 左右横扫）——2x 超采样 + 滑动 crop
+# --------------------------------------------------------------------------
+def _even(value: float) -> int:
+    """把缩放尺寸对齐到偶数（``yuva420p`` 要求宽高均为偶数）。"""
+    number = int(round(float(value)))
+    if number % 2:
+        number += 1
+    return max(2, number)
+
+
+def _effective_source_size(
+    scene: TimelineScene,
+    source_size: tuple[int, int] | None,
+) -> tuple[int, int] | None:
+    """返回 ``focus_band`` 裁切后的等效源尺寸。
+
+    ``focus_band=True`` 时前景链会先按 ``focus_region`` 裁切，真正参与运镜的是
+    裁切后的画面；运镜比例判定必须基于裁切后的宽高比，否则会把长条取景误判成
+    普通竖格（进而走错缩放分支）。
+    """
+    if source_size is None:
+        return None
+    width = max(1, int(source_size[0]))
+    height = max(1, int(source_size[1]))
+    if bool(getattr(scene, "focus_band", False)):
+        region = getattr(scene, "focus_region", None)
+        if region and len(region) == 4:
+            _, _, region_w, region_h = (float(value) for value in region)
+            if region_w > 0.01 and region_h > 0.01:
+                width = max(1, int(round(width * region_w)))
+                height = max(1, int(round(height * region_h)))
+    return (width, height)
+
+
+def _pan_plan(
+    motion: str,
+    source_size: tuple[int, int] | None,
+) -> tuple[str, str | None, int | None, int | None]:
+    """计算平移运镜的「等比缩放 + 透明边补齐」方案。
+
+    返回 ``(scale 片段, pad 片段或 None, 画布宽, 画布高)``；
+    画布尺寸为 ``None`` 表示运行期才能确定（此时 crop 用居中表达式自适应）。
+
+    * **长竖格（纵向扫镜）**：按宽 ``2040`` 等比缩放，高度远超视窗，可全程匀速扫过；
+    * **普通宽图（横向扫镜）**：按高 ``2440`` 等比缩放，宽度必然超过 ``2040``，
+      可横向滑动；超窄横幅额外限制放大倍率（<= 2.2x）并补透明边，防止发糊；
+    * **其余画面**：等比适配安全框后额外放大 ``1.16`` 倍，留出滑动余量。
+    """
+    vertical = motion in ("pan_down", "pan_up")
+    fit_expr = f"min({SS_WIDTH}.0/iw,{SS_HEIGHT}.0/ih)"
+    fit_scale = (
+        f"scale=w='trunc({fit_expr}*{PAN_MARGIN}*iw/2)*2'"
+        f":h='trunc({fit_expr}*{PAN_MARGIN}*ih/2)*2':flags=lanczos"
+    )
+    fit_pad = (
+        f"pad=w='max({SS_WIDTH},iw)':h='max({SS_HEIGHT},ih)'"
+        f":x='(ow-iw)/2':y='(oh-ih)/2':color=black@0.0"
+    )
+
+    if source_size is None:
+        # 尺寸未知：退回「等比适配 + 1.16x 余量」的表达式方案（任何比例都不压扁）。
+        return (fit_scale, fit_pad, None, None)
+
+    src_w = max(1, int(source_size[0]))
+    src_h = max(1, int(source_size[1]))
+    ratio = src_w / src_h
+
+    if vertical:
+        scaled_h = SS_WIDTH * src_h / src_w
+        if scaled_h > 2 * SAFE_BOX_HEIGHT * TALL_PAN_SS_MARGIN:
+            # 超长竖格：宽度铺满 2040，高度等比（必然远超 2440），纵向滑动取景。
+            return (f"scale={SS_WIDTH}:-2:flags=lanczos", None, SS_WIDTH, _even(scaled_h))
+        return (fit_scale, fit_pad, None, None)
+
+    if ratio > SAFE_WIDTH / SAFE_BOX_HEIGHT:
+        if ratio > PAN_BANNER_RATIO:
+            # 超窄横幅：放大倍率封顶 2.2x，避免过度放大发糊；高度不足时补透明边。
+            banner_scale = (
+                f"scale=w='trunc(min({SS_HEIGHT}.0/ih,{PAN_MAX_BANNER_SCALE})*iw/2)*2'"
+                f":h='trunc(min({SS_HEIGHT}.0/ih,{PAN_MAX_BANNER_SCALE})*ih/2)*2'"
+                ":flags=lanczos"
+            )
+            return (banner_scale, fit_pad, None, SS_HEIGHT)
+        # 普通宽图：按高 2440 等比放大，宽度必然 > 2040，可横向滑动。
+        return (f"scale=-2:{SS_HEIGHT}:flags=lanczos", None, None, SS_HEIGHT)
+
+    return (fit_scale, fit_pad, None, None)
+
+
+def _pan_filter_chain(
+    fg_label: str,
+    motion: str,
+    frames: int,
+    fps: int,
+    *,
+    out_label: str,
+    source_size: tuple[int, int] | None,
+) -> str:
+    """生成平移运镜（上下扫 / 左右横扫）的前景滤镜链（Patch v4.28）。
+
+    **为什么不再用 zoompan**：``zoompan`` 会把输入帧直接缩放到输出尺寸
+    （``s=1020x1220``），超长竖格因此被**压扁**成 1020×1220；同时 ``x/y``
+    用的是输入坐标（``ih`` 远大于输出高），越界后被**夹死**在 0，镜头几乎不动。
+
+    **新链路（零压缩 + 2x 超采样）**::
+
+        等比缩放 + setsar=1 → format=yuva420p → 单帧 loop 展开 → trim/setpts
+        → crop=2040×2440 滑动取景 → scale=1020:1220:flags=lanczos,setsar=1
+
+    滑动窗口在 2040×2440 的 2x 超采样画布上移动，最后一次性缩回安全框，
+    因此画面既不会被压扁，滑动过程也不会出现锯齿抖动。
+
+    ``pan_down`` 取样点自顶向下移动，``pan_up`` 自底向上；``pan_right`` 自左向右，
+    ``pan_left`` 自右向左。
+    """
+    span = max(1, int(frames) - 1)
+    scale, pad, canvas_w, canvas_h = _pan_plan(motion, source_size)
+    if motion in ("pan_down", "pan_up"):
+        x_expr = "0" if canvas_w == SS_WIDTH else f"(iw-{SS_WIDTH})/2"
+        y_expr = (
+            f"(ih-{SS_HEIGHT})*n/{span}"
+            if motion == "pan_down"
+            else f"(ih-{SS_HEIGHT})*(1-n/{span})"
+        )
+    else:
+        x_expr = (
+            f"(iw-{SS_WIDTH})*n/{span}"
+            if motion == "pan_right"
+            else f"(iw-{SS_WIDTH})*(1-n/{span})"
+        )
+        y_expr = "0" if canvas_h == SS_HEIGHT else f"(ih-{SS_HEIGHT})/2"
+
+    parts: list[str] = [
+        "trim=end_frame=1",
+        "setpts=PTS-STARTPTS",
+        scale,
+        "setsar=1",
+        "format=yuva420p",
+    ]
+    if pad:
+        parts.append(pad)
+    parts += [
+        "loop=loop=-1:size=1:start=0",
+        f"trim=end_frame={frames}",
+        f"setpts=N/({fps}*TB)",
+        f"crop=w={SS_WIDTH}:h={SS_HEIGHT}:x='{x_expr}':y='{y_expr}'",
+        f"scale={SAFE_WIDTH}:{SAFE_BOX_HEIGHT}:flags=lanczos",
+        "setsar=1",
+        f"fps={fps}",
+    ]
+    return f"[{fg_label}]{','.join(parts)}[{out_label}]"
+
+
 def build_scene_filter(
     scene: TimelineScene,
     timeline: RenderTimeline,
@@ -497,8 +664,9 @@ def build_scene_filter(
        1080×1920，再 ``boxblur=30:4`` 模糊 + ``eq=brightness=-0.38:saturation=0.75``
        暗化降饱和——这一层只负责氛围，不承载信息；
     2. **前景链（主画面安全区）**：等比缩放进 ``1020×1220`` 安全框（**不裁内容**），
-       ``format=yuva420p`` + ``pad=…:color=black@0.0`` 补透明边到安全框大小，
-       再用 ``zoompan`` 做运镜；运镜严格在安全框内完成，输出尺寸即 1020×1220；
+       ``format=yuva420p`` + ``pad=…:color=black@0.0`` 补透明边到安全框大小；
+       缩放类运镜用 ``zoompan`` 完成，平移类运镜（Patch v4.28）改用
+       「2x 超采样 + 滑动 crop」，运镜严格在安全框内完成，输出尺寸即 1020×1220；
     3. **合成链**：``overlay=x=(W-w)/2:y=180+(1260-h)/2`` 把前景叠到背景的
        居中偏上安全区，下沿最高只到 y=1420，**绝不越过 y=1440**。
 
@@ -519,11 +687,11 @@ def build_scene_filter(
     背景滤镜规格已由规范固定为 ``boxblur=30:4`` 与 ``eq=brightness=-0.38:saturation=0.75``，
     不再受这两个参数驱动。
 
-    ``source_size`` 为源分镜 ``(宽, 高)`` 像素尺寸。``pan_down`` 遇到超长竖格
-    （``高 > 1.5 × 宽``）时不再走「缩小 + pad + 1.12 倍放大」的旧链路（窄图在安全框里
-    只产生约 130px 的假运镜），改为**宽度铺满 1020、高度等比放大后在 1020×1220 视窗内
-    从顶匀速扫到底**（``z=1.0``、``y=(ih-1220)*on/(frames-1)``），符合规范对超长竖格的
-    明确要求；``None`` 或尺寸不达标时保持原链路，离线单测不传也能工作。
+    ``source_size`` 为源分镜 ``(宽, 高)`` 像素尺寸。Patch v4.28 起，四个平移运镜
+    （``pan_down`` / ``pan_up`` / ``pan_left`` / ``pan_right``）统一走
+    :func:`_pan_filter_chain`：**等比缩放 + 2x 超采样（2040×2440）滑动 crop →
+    缩回 1020×1220**，画面零压缩、滑动无抖动；``source_size`` 缺失时退回
+    「等比适配安全框 + 1.16x 余量」的表达式方案，离线单测不传也能工作。
     """
     width = int(getattr(timeline, "width", DEFAULT_WIDTH) or DEFAULT_WIDTH)
     height = int(getattr(timeline, "height", DEFAULT_HEIGHT) or DEFAULT_HEIGHT)
@@ -553,35 +721,34 @@ def build_scene_filter(
         chains.append(f"[{fg_label}]{crop}[c{index}]")
         fg_label = f"c{index}"
 
-    # Patch v3.0-8：超长竖格的 pan_down 走「宽度铺满 + 视窗内扫底」专用链路。
-    # focus_band 已自行取景裁切，不与超长格链路叠加；source_size 缺失时退回通用链路。
-    is_tall_pan = (
-        motion == "pan_down"
-        and not crop
-        and source_size is not None
-        and int(source_size[1]) > TALL_PANEL_RATIO * int(source_size[0])
-    )
-    if is_tall_pan:
-        # scale 到宽 1020 后高必然 > 1530（源高宽比 > 1.5），zoompan 在 1220 高视窗内
-        # 从 y=0 匀速扫到 y=ih-1220；frames=1 时 span 取 1 防除零，单帧定格在顶端。
-        span = max(1, frames - 1)
+    # Patch v4.28：平移运镜（上下扫 / 左右横扫）统一走「2x 超采样 + 滑动 crop」链路。
+    #
+    # 旧链路用 ``zoompan=z='1.0':x=0:y='(ih-1220)*on/span':s=1020x1220``，
+    # zoompan 会把整张长图直接缩放压扁到 1020×1220，且 y 取样坐标越界后被夹死，
+    # 结果是「画面被压扁 + 镜头几乎不动」。新链路等比缩放后用 crop 滑动取景，
+    # 画面零压缩，滑动过程也没有抖动。
+    if motion in ("pan_down", "pan_up", "pan_left", "pan_right"):
         chains.append(
-            f"[{fg_label}]trim=end_frame=1,setpts=PTS-STARTPTS,"
-            f"scale={SAFE_WIDTH}:-2,format=yuva420p,"
-            f"zoompan=z='1.0':x=0:y='(ih-{SAFE_BOX_HEIGHT})*on/{span}':"
-            f"d={frames}:s={SAFE_WIDTH}x{SAFE_BOX_HEIGHT}:fps={fps}[f{index}]"
+            _pan_filter_chain(
+                fg_label,
+                motion,
+                frames,
+                fps,
+                out_label=f"f{index}",
+                source_size=_effective_source_size(scene, source_size),
+            )
         )
     elif motion == "static":
         # static 不加 zoompan：直接用输入的每一帧，保证长度与场景时长一致。
         chains.append(
-            f"[{fg_label}]scale={SAFE_WIDTH}:{SAFE_BOX_HEIGHT}:force_original_aspect_ratio=decrease,"
+            f"[{fg_label}]scale={SAFE_WIDTH}:{SAFE_BOX_HEIGHT}:force_original_aspect_ratio=decrease,setsar=1,"
             f"format=yuva420p,pad={SAFE_WIDTH}:{SAFE_BOX_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black@0.0[f{index}]"
         )
     else:
         zoom, pan_x, pan_y = _motion_expressions(motion, frames)
         chains.append(
             f"[{fg_label}]trim=end_frame=1,setpts=PTS-STARTPTS,"
-            f"scale={SAFE_WIDTH}:{SAFE_BOX_HEIGHT}:force_original_aspect_ratio=decrease,"
+            f"scale={SAFE_WIDTH}:{SAFE_BOX_HEIGHT}:force_original_aspect_ratio=decrease,setsar=1,"
             f"format=yuva420p,pad={SAFE_WIDTH}:{SAFE_BOX_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black@0.0,"
             f"zoompan=z='{zoom}':x='{pan_x}':y='{pan_y}':d={frames}:s={SAFE_WIDTH}x{SAFE_BOX_HEIGHT}:fps={fps}[f{index}]"
         )

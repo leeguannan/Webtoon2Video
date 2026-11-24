@@ -23,6 +23,9 @@ class CameraMotion(str, Enum):
     ZOOM_OUT = "zoom_out"
     PAN_DOWN = "pan_down"
     PAN_UP = "pan_up"
+    #: Patch v4.28：真正的横向扫镜（左 / 右横扫），Stage 7 走 2x 超采样滑动 crop。
+    PAN_LEFT = "pan_left"
+    PAN_RIGHT = "pan_right"
     SHAKE = "shake"
 
 
