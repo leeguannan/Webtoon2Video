@@ -144,5 +144,7 @@
 - 写了就写一句，不要堆砌形容词；宁缺毋滥，全话 **0~6 处**即可。
 
 【运镜与焦点可选值】
-- `motion`：`static` / `zoom_in` / `zoom_out` / `pan_down` / `pan_up` / `pan_left` / `pan_right` / `shake`
+- `motion`：`static` / `zoom_in` / `zoom_out` / `pan_left` / `pan_right` / `shake`
+  （Patch v4.31：**竖扫 `pan_down` / `pan_up` 已下线**，长图不要硬扫；长句用 `zoom_in`，
+  短句用 `static`，横幅才用 `pan_left` / `pan_right`）
 - `focus_hint`：`full`（整格）/ `top`（上半，取景带偏高）/ `bottom`（下半，取景带偏低）/ `center`

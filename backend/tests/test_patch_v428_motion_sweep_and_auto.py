@@ -321,7 +321,7 @@ def _beat(
 
 
 def test_auto_motions_assigns_by_panel_geometry() -> None:
-    """长竖格 → 竖扫（Patch v4.30 起同格第 2 拍接力竖扫）；宽格 → 左右横扫。"""
+    """Patch v4.31：取消竖扫 → 长竖格走推拉/静止，宽格才左右横扫。"""
     metas = [
         _panel_meta("p_tall", 800, 2400, tall=True),
         _panel_meta("p_wide_a", 1600, 900),
@@ -337,24 +337,28 @@ def test_auto_motions_assigns_by_panel_geometry() -> None:
     ]
     assigned, report = apply_auto_motions(beats, panel_metas=metas)
     motions = {beat["beat_id"]: beat["motion"] for beat in assigned}
-    # 规则 A：长竖格首拍竖扫；Patch v4.30 起同格第 2 拍继续竖扫（接力扫镜）。
-    assert motions["b1"] == "pan_down"
-    assert motions["b2"] == "pan_down"
+    # 规则 A：长竖格不再竖扫，第 1 拍推近、第 2 拍（同图）强制静止。
+    assert motions["b1"] == "zoom_in"
+    assert motions["b2"] == "static"
     # 规则 B：宽格左右横扫交替。
     assert motions["b3"] == "pan_right"
     assert motions["b4"] == "pan_left"
     # 规则 D：普通竖格默认推近。
     assert motions["b5"] == "zoom_in"
-    # updated_count 只统计「被改动」的拍（b5 原本就是 zoom_in，未变）。
-    assert report.updated_count == 4
-    assert report.changed_beat_ids == ["b1", "b2", "b3", "b4"]
-    assert report.tall_pan_count == 2
+    # 竖扫彻底下线：自动分配永不产出 pan_down / pan_up。
+    assert "pan_down" not in motions.values()
+    assert "pan_up" not in motions.values()
+    # updated_count 只统计「被改动」的拍（b1 / b5 原本就是 zoom_in，未变）。
+    assert report.updated_count == 3
+    assert report.changed_beat_ids == ["b2", "b3", "b4"]
+    assert report.tall_pan_count == 0
     assert report.wide_pan_count == 2
     assert report.push_pull_count == 0
+    assert report.static_count == 1
 
 
 def test_auto_motions_assigns_shake_on_impact() -> None:
-    """规则 C：冲击音效或愤怒 / 震惊短句配 shake，且不得连震 3 拍。"""
+    """规则 C：冲击音效或愤怒 / 震惊短句配 shake，且不得连震。"""
     metas = [_panel_meta("p_normal", 1000, 1200)]
     beats = [
         _beat("b1", "砰！一拳砸在桌上。", "p_normal", sfx="crash"),
@@ -365,12 +369,14 @@ def test_auto_motions_assigns_shake_on_impact() -> None:
     assigned, report = apply_auto_motions(beats, panel_metas=metas)
     motions = [beat["motion"] for beat in assigned]
     assert motions[0] == "shake"
-    assert motions[1] == "shake"
-    # 连震上限 2 拍：第 3 拍必须换掉。
-    assert motions[2] != "shake"
-    # 全程不得出现 3 连震。
-    for index in range(2, len(motions)):
-        assert len(set(motions[index - 2 : index + 1])) > 1
+    # 刚震完的下一拍优先泄力（静止），不给连震。
+    assert motions[1] == "static"
+    # 同图第 3 拍、上一拍已静 → 允许再震一次（仍不与上一拍相邻连震）。
+    assert motions[2] == "shake"
+    assert motions[3] == "static"
+    # 全程不得出现相邻连震。
+    for index in range(1, len(motions)):
+        assert not (motions[index - 1] == "shake" and motions[index] == "shake")
     assert report.shake_count == sum(1 for m in motions if m == "shake")
 
 
@@ -414,14 +420,15 @@ def test_auto_motions_preserves_other_fields() -> None:
         )
     ]
     assigned, report = apply_auto_motions(beats, panel_metas=metas)
-    assert assigned[0]["motion"] == "pan_down"
+    assert assigned[0]["motion"] == "zoom_in"
     assert assigned[0]["narration_text"] == "超长竖格第一句。"
     assert assigned[0]["tts_text"] == "超长竖格第一句。"
     assert assigned[0]["pause_after_ms"] == 765
     assert assigned[0]["voice_override"] == "voice_x"
     # 入参不被就地修改（纯函数）。
     assert beats[0]["motion"] == "zoom_in"
-    assert report.changed_beat_ids == ["b1"]
+    # 本拍原本就是 zoom_in，未被改动。
+    assert report.changed_beat_ids == []
 
 
 def test_load_episode_panel_metas_falls_back_to_scan(tmp_path: Path) -> None:
@@ -533,20 +540,20 @@ def test_auto_motions_endpoint_writes_script(
     payload = response.json()
     summary = payload["summary"]
     assert summary["updated_count"] == 2
-    assert summary["tall_pan_count"] == 1
+    assert summary["tall_pan_count"] == 0
     assert summary["wide_pan_count"] == 1
 
     motions = {beat["beat_id"]: beat["motion"] for beat in payload["beats"]}
-    assert motions["b1"] == "pan_down"
+    assert motions["b1"] == "zoom_in"
     assert motions["b2"] == "pan_right"
 
     # 落盘：script.json 写入新运镜，script_readable.md 同步更新。
     script = load_model(NarrationScript, episode_dir / "04_script" / "script.json")
-    assert [beat.motion.value for beat in script.beats] == ["pan_down", "pan_right"]
+    assert [beat.motion.value for beat in script.beats] == ["zoom_in", "pan_right"]
     readable = (episode_dir / "04_script" / "script_readable.md").read_text(
         encoding="utf-8"
     )
-    assert "PAN_DOWN" in readable or "pan_down" in readable
+    assert "ZOOM_IN" in readable or "zoom_in" in readable
 
     # 不破坏 voice_override 与 pause_after_ms，也不碰音频清单。
     assert script.beats[0].voice_override == "voice_custom"

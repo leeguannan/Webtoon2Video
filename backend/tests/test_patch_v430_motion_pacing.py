@@ -315,24 +315,29 @@ def test_relay_ratio_is_consumed_by_pan_filter(tmp_path: Path) -> None:
 # 4. 推拉自适应
 # ---------------------------------------------------------------------------
 def test_zoom_motions_adapt_to_duration() -> None:
-    """zoom_in / zoom_out 随句长自适应：1.0↔1.10 之间完整推到位。"""
+    """zoom_in / zoom_out 随句长自适应：1.0↔1.08 之间完整推到位。
+
+    Patch v4.31：幅度由 1.10 微收紧到 1.08（推得太满与静帧对比生硬）。
+    """
     zoom_in, _, _ = _motion_expressions("zoom_in", 30)
     zoom_out, _, _ = _motion_expressions("zoom_out", 30)
-    assert zoom_in.startswith("1.0+0.10*(")
-    assert zoom_out.startswith("1.10-0.10*(")
+    assert zoom_in.startswith("1.0+0.08*(")
+    assert zoom_out.startswith("1.08-0.08*(")
     # 进度按帧序号计算，短句也能推到位。
     assert "clip(on/29.0,0,1)" in zoom_in
     assert "3-2*(clip(on/29.0,0,1))" in zoom_in
     # 长句用更长的时间轴，但推拉幅度恒定。
     long_in, _, _ = _motion_expressions("zoom_in", 120)
     assert "clip(on/119.0,0,1)" in long_in
-    assert long_in.startswith("1.0+0.10*(")
+    assert long_in.startswith("1.0+0.08*(")
 
 
 def test_zoom_motion_fragment_has_adaptive_expression(tmp_path: Path) -> None:
     fragment = _fragment(tmp_path, CameraMotion.ZOOM_IN, (800, 1000), duration_ms=1000)
-    assert "zoompan=z='1.0+0.10*(" in fragment
+    assert "zoompan=z='1.0+0.08*(" in fragment
     assert "0.0008" not in fragment
+    # Patch v4.31：不再使用旧的 1.10 幅度。
+    assert "0.10*(" not in fragment
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +434,10 @@ def test_real_ffmpeg_render_zoom_scene(tmp_path: Path) -> None:
 # 6. 自动动效：长竖格接力竖扫
 # ---------------------------------------------------------------------------
 def test_auto_motions_keeps_pan_down_for_relay_beats() -> None:
-    """同一张超长竖格连续 2~3 句：继续 pan_down（接力），第 4 句才回到推近。"""
+    """Patch v4.31：取消竖扫 → 同一张长竖格连拍「第 1 拍动、第 2 拍静」交替。
+
+    同图第 3 拍在上一拍已静的前提下补一次轻动，第 4 拍再静回去。
+    """
     from core.schemas import PanelMeta
 
     meta = PanelMeta(
@@ -455,15 +463,19 @@ def test_auto_motions_keeps_pan_down_for_relay_beats() -> None:
     ]
     assigned, _ = apply_auto_motions(beats, panel_metas=[meta])
     motions = [beat["motion"] for beat in assigned]
-    assert motions[0] == "pan_down"
-    assert motions[1] == "pan_down"
-    assert motions[2] == "pan_down"
-    # 超过接力上限后不再继续竖扫（长图被缩成细竖条也不好看）。
-    assert motions[3] != "pan_down"
+    # 竖扫彻底下线：自动分配永不产出 pan_down / pan_up。
+    assert "pan_down" not in motions
+    assert "pan_up" not in motions
+    # 同图防跳变：第 1 拍动、第 2 拍静。
+    assert motions[0] != "static"
+    assert motions[1] == "static"
+    # 第 3 拍补一次轻动，第 4 拍再静。
+    assert motions[2] != "static"
+    assert motions[3] == "static"
 
 
 def test_auto_motions_relay_keeps_panel_content_untouched() -> None:
-    """接力竖扫只改 motion，不动解说文本与停顿。"""
+    """自动分配只改 motion，不动解说文本与停顿（Patch v4.31 取消竖扫后依然成立）。"""
     from core.schemas import PanelMeta
 
     meta = PanelMeta(
@@ -498,7 +510,7 @@ def test_auto_motions_relay_keeps_panel_content_untouched() -> None:
         },
     ]
     assigned, _ = apply_auto_motions(beats, panel_metas=[meta])
-    assert [beat["motion"] for beat in assigned] == ["pan_down", "pan_down"]
+    assert [beat["motion"] for beat in assigned] == ["zoom_in", "static"]
     assert [beat["narration_text"] for beat in assigned] == ["第一句。", "第二句。"]
     assert [beat["pause_after_ms"] for beat in assigned] == [480, 520]
     assert all(beat["voice_override"] == "voice_custom" for beat in assigned)

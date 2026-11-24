@@ -839,22 +839,39 @@ def _motion_of(beat: Any) -> CameraMotion:
 _PAN_MOTIONS = ("pan_down", "pan_up", "pan_left", "pan_right")
 #: Patch v4.30：相邻接力段之间的衔接余量（两侧各留一半，避免切镜时硬跳）。
 _PAN_RELAY_OVERLAP = 0.05
+#: Patch v4.31：反向平移——行程方向与「0 → 1」相反，接力段必须倒序切分。
+#:
+#: ``pan_right`` / ``pan_down`` 从 0 走向 1；``pan_left`` / ``pan_up`` 从 1 走向 0，
+#: 若仍按正序切段，镜头会在切句时「跳回开头」，观感是折返而不是接力。
+_REVERSE_PAN_MOTIONS = ("pan_left", "pan_up")
+
+
+def _scene_pan_motion(scene: TimelineScene) -> str:
+    """取场景的平移运镜名（小写）；非平移返回空串。"""
+    raw = getattr(scene.motion, "value", scene.motion)
+    return str(raw or "").strip().lower()
 
 
 def _assign_pan_relay(scenes: list[TimelineScene]) -> None:
-    """为「连续共享同一分镜且均为平移」的相邻场景组切分接力区间。
+    """为「连续共享同一分镜且**同一平移方向**」的相邻场景组切分接力区间。
 
-    **为什么要接力**：同一张长竖格连续讲两三句时，如果每句都从头顶重新扫一遍，
+    **为什么要接力**：同一张图连续讲两三句时，如果每句都从头顶重新扫一遍，
     观众看到的就是「一句一甩」，画面被割裂。这里把整条行程按各句时长比例切成
     若干段，逐句写入 ``pan_start_ratio`` / ``pan_end_ratio``；Stage 7 让每句
-    从自己那一段的起点出发，于是镜头顺着长图一路往下走，首尾相接。
+    从自己那一段的起点出发，于是镜头一路往下走，首尾相接。
 
     相邻段之间留 :data:`_PAN_RELAY_OVERLAP` 的衔接余量：下一段略微提前起手，
     切镜时画面是「接上」而不是「跳一下」。
 
-    只有同一张分镜的连续平移场景才接力；换了分镜就重新从整段行程开始。
+    **Patch v4.31 的两条收紧**：
+
+    1. 只对「同方向」的连续平移接力——``pan_right`` 接 ``pan_right`` 可以接，
+       但 ``pan_right`` 后面接 ``pan_left`` 是折返，必须断开各自从整段开始。
+    2. 反向运镜（``pan_left`` / ``pan_up``）按 ``1.0 → 0.0`` **倒序**切段，
+       避免接力时镜头跳回开头。
     """
     group: list[TimelineScene] = []
+    group_motion: str = ""
 
     def flush() -> None:
         if len(group) < 2:
@@ -863,25 +880,31 @@ def _assign_pan_relay(scenes: list[TimelineScene]) -> None:
         durations = [max(1, int(scene.duration_ms)) for scene in group]
         total = float(sum(durations)) or 1.0
         cursor = 0.0
+        reverse = group_motion in _REVERSE_PAN_MOTIONS
         for scene, duration in zip(group, durations):
             start = cursor / total
             cursor += duration
             end = min(1.0, cursor / total)
+            if reverse:
+                # 反向运镜：整条行程是 1 → 0，接力段必须倒序切。
+                start, end = 1.0 - end, 1.0 - start
             scene.pan_start_ratio = max(0.0, start - _PAN_RELAY_OVERLAP / 2)
             scene.pan_end_ratio = min(1.0, end + _PAN_RELAY_OVERLAP / 2)
         group.clear()
 
     for scene in scenes:
-        raw = getattr(scene.motion, "value", scene.motion)
-        motion = str(raw or "").strip().lower()
+        motion = _scene_pan_motion(scene)
         if motion in _PAN_MOTIONS and (
-            not group or group[-1].panel_id == scene.panel_id
+            not group
+            or (group[-1].panel_id == scene.panel_id and group_motion == motion)
         ):
             group.append(scene)
+            group_motion = motion
             continue
         flush()
         if motion in _PAN_MOTIONS:
             group.append(scene)
+            group_motion = motion
     flush()
 
 

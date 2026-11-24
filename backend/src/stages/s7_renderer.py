@@ -473,19 +473,21 @@ def _motion_expressions(motion: str, frames: int) -> tuple[str, str, str]:
     已不再走 zoompan（它会把长图压扁并把 y 夹死），改由
     :func:`_pan_filter_chain` 处理，这里只保留缩放类与抖动类运镜。
 
-    **Patch v4.30**：``zoom_in`` / ``zoom_out`` 改为**随句长自适应**的 Smoothstep 推拉
-    （``1.0 → 1.10`` / ``1.10 → 1.00``）。旧的「每帧 ±0.0008」写死步长，
-    30 帧短句只能推到 1.024，肉眼几乎看不出推拉；现在无论多长多短的句子，
-    都会在句内完整推到位，且速度先增后减、不再匀速生硬。
+    **Patch v4.30**：``zoom_in`` / ``zoom_out`` 改为**随句长自适应**的 Smoothstep 推拉。
+    旧的「每帧 ±0.0008」写死步长，30 帧短句只能推到 1.024，肉眼几乎看不出推拉；
+    现在无论多长多短的句子，都会在句内完整推到位，且速度先增后减、不再匀速生硬。
+
+    **Patch v4.31**：推拉幅度由 1.10 **微收紧到 1.08**——推得太满会和静帧
+    对比生硬，1.0 ↔ 1.08 的幅度更自然耐看。
     """
     center_x = "(iw-iw/zoom)/2"
     center_y = "(ih-ih/zoom)/2"
     span = max(1, int(frames) - 1)
     eased = _smoothstep_expr(f"clip(on/{span}.0,0,1)")
     if motion == "zoom_in":
-        return (f"1.0+0.10*({eased})", center_x, center_y)
+        return (f"1.0+0.08*({eased})", center_x, center_y)
     if motion == "zoom_out":
-        return (f"1.10-0.10*({eased})", center_x, center_y)
+        return (f"1.08-0.08*({eased})", center_x, center_y)
     if motion == "shake":
         return ("1.12", f"{center_x}+sin(on*1.7)*6", f"{center_y}+cos(on*2.3)*6")
     return ("1.0", center_x, center_y)

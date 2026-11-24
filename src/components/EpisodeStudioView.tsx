@@ -351,6 +351,25 @@ const MOTION_LABELS: Record<CameraMotion, string> = {
   static: 'STATIC 静止',
 };
 
+// Patch v4.31：下拉里**推荐**的动效清单——竖扫（pan_down / pan_up）已从自动
+// 链路下线，默认不再展示，避免用户被推荐一个系统不会再自动分配的动作。
+// 老剧本里残留的竖扫仍可通过「保留当前值」显示出来（见 motionOptions）。
+const RECOMMENDED_MOTIONS: CameraMotion[] = [
+  'static',
+  'zoom_in',
+  'zoom_out',
+  'pan_left',
+  'pan_right',
+  'shake',
+];
+
+/**
+ * 审核表运镜下拉的选项：推荐的 6 种 + （仅当该句当前值是已下线的旧版竖扫时）
+ * 临时保留当前值，避免 select 找不到匹配项而显示异常。
+ */
+const motionOptions = (current: CameraMotion): CameraMotion[] =>
+  RECOMMENDED_MOTIONS.includes(current) ? RECOMMENDED_MOTIONS : [current, ...RECOMMENDED_MOTIONS];
+
 // ---------------------------------------------------------------------------
 // Patch v4.25：分镜缩略图 / 角色解析工具 / 审核表行组件
 // ---------------------------------------------------------------------------
@@ -1108,9 +1127,9 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
           }
           className="w-full px-2 py-1.5 text-[11px] font-mono-tabular bg-white border border-slate-200 rounded-lg"
         >
-          {Object.entries(MOTION_LABELS).map(([val, label]) => (
+          {motionOptions(beat.motion).map((val) => (
             <option key={val} value={val}>
-              {label}
+              {MOTION_LABELS[val]}
             </option>
           ))}
         </select>
@@ -3723,10 +3742,10 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                 <>
                   <p>
                     自动分配动效完成：共调整 {autoMotionSummary.updated_count} 处（横扫{' '}
-                    {autoMotionSummary.wide_pan_count} / 竖扫{' '}
-                    {autoMotionSummary.tall_pan_count} / 震动{' '}
-                    {autoMotionSummary.shake_count} / 推拉{' '}
-                    {autoMotionSummary.push_pull_count}），重跑 S6~S7 即可生效，无需重跑配音。
+                    {autoMotionSummary.wide_pan_count} / 推拉{' '}
+                    {autoMotionSummary.push_pull_count} / 静止{' '}
+                    {autoMotionSummary.static_count} / 震动{' '}
+                    {autoMotionSummary.shake_count}），重跑 S6~S7 即可生效，无需重跑配音。
                   </p>
                   <button
                     type="button"

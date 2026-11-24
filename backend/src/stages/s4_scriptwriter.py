@@ -1384,14 +1384,14 @@ def apply_narrative_pacing(
 # ---------------------------------------------------------------------------
 
 #: 超长竖格判定阈值（高 / 宽）。
-MOTION_TALL_RATIO: float = 1.5
-#: Patch v4.30：同一张超长竖格最多连续几拍保持竖扫（接力扫镜）。
 #:
-#: 竖格连续讲两三句时，第 2、3 句继续 ``pan_down``，镜头顺着长图一路往下走；
-#: 超过该上限才切 ``zoom_in``，避免长图被缩成屏幕中央的细竖条。
-MOTION_TALL_RELAY_MAX: int = 3
-#: 横向宽格判定阈值（宽 / 高）。
-MOTION_WIDE_RATIO: float = 1.25
+#: Patch v4.31 起竖格**不再自动分配竖扫**（``pan_down`` / ``pan_up`` 已从自动
+#: 链路彻底取消），但仍要区分「竖格」与「宽格」——超长竖格宽高比很小，
+#: 不排除的话会被误判成横幅而拿到横向扫镜。
+MOTION_TALL_RATIO: float = 1.5
+#: 横向宽格判定阈值（宽 / 高）——Patch v4.31 收紧到 1.35，
+#: 只有真正的横幅才配横扫，避免普通偏方图被扫得看不清。
+MOTION_WIDE_RATIO: float = 1.35
 #: 冲击类音效关键词（``sfx_cue`` 命中即视为高燃瞬间）。
 MOTION_IMPACT_SFX: frozenset[str] = frozenset(
     {
@@ -1439,8 +1439,16 @@ MOTION_EMOTION_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 #: 冲击镜头要求短句（去标点后的字数上限）。
 MOTION_IMPACT_SHORT_MAX: int = 14
-#: 连续震动上限——不得连震 3 拍以上。
-MOTION_MAX_SHAKE_STREAK: int = 2
+#: 连续震动上限——Patch v4.31 收紧到 1：**禁止连震**，震完必须泄力。
+MOTION_MAX_SHAKE_STREAK: int = 1
+#: 连续动态拍数上限——Patch v4.31：连续动态最多 3 拍，第 4 拍必须插静止呼吸。
+MOTION_MAX_DYNAMIC_STREAK: int = 3
+#: 短引导句的净字数上限（Patch v4.31）。
+MOTION_GUIDE_SHORT_MAX: int = 10
+#: 短引导句的停顿上限（毫秒，Patch v4.31）——引导句常配很短的停顿。
+MOTION_GUIDE_PAUSE_MAX: int = 80
+#: 情绪平稳的标签（Patch v4.31）——这类句子优先给静止，让画面喘口气。
+MOTION_CALM_EMOTIONS: frozenset[str] = frozenset({"calm", "happy"})
 #: 分镜尺寸缺失时的兜底尺寸（普通竖格 3:4——刻意避开长竖格 / 宽格阈值，
 #: 保证「拿不到尺寸」时按普通竖格处理，不会误判成超长格）。
 MOTION_FALLBACK_SIZE: tuple[int, int] = (900, 1200)
@@ -1453,6 +1461,9 @@ class MotionAssignReport:
     #: 被改动的 beat 数。
     updated_count: int = 0
     #: 竖扫（``pan_down`` / ``pan_up``）处数。
+    #:
+    #: Patch v4.31 起自动分配**不再产出竖扫**，该计数恒为 0；
+    #: 字段保留是为了兼容旧接口回显与旧前端类型。
     tall_pan_count: int = 0
     #: 横扫（``pan_left`` / ``pan_right``）处数。
     wide_pan_count: int = 0
@@ -1523,6 +1534,11 @@ def _beat_emotion(beat: Mapping[str, Any]) -> str:
     return ""
 
 
+def _beat_core_text(beat: Mapping[str, Any]) -> str:
+    """取 beat 的「净文本」——去掉标点与空白，只留文字（用于字数判断）。"""
+    return re.sub(r"[^\w\u4e00-\u9fff]", "", _beat_text(beat))
+
+
 def _beat_is_impact(beat: Mapping[str, Any]) -> bool:
     """规则 C 判定：音效命中冲击动作词，或愤怒 / 震惊情绪且句子够短。"""
     sfx = str(beat.get("sfx_cue") or "").strip().lower()
@@ -1532,9 +1548,22 @@ def _beat_is_impact(beat: Mapping[str, Any]) -> bool:
         if any(word in sfx for word in MOTION_IMPACT_SFX):
             return True
     if _beat_emotion(beat) in MOTION_IMPACT_EMOTIONS:
-        core = re.sub(r"[^\w\u4e00-\u9fff]", "", _beat_text(beat))
-        return len(core) <= MOTION_IMPACT_SHORT_MAX
+        return len(_beat_core_text(beat)) <= MOTION_IMPACT_SHORT_MAX
     return False
+
+
+def _beat_is_guide_short(beat: Mapping[str, Any]) -> bool:
+    """规则 D 判定：短引导句（很短、停顿很短或以冒号收尾）→ 天然静帧。"""
+    text = _beat_text(beat).strip()
+    if len(_beat_core_text(beat)) > MOTION_GUIDE_SHORT_MAX:
+        return False
+    try:
+        pause = int(beat.get("pause_after_ms") or 0)
+    except (TypeError, ValueError):
+        pause = 0
+    if pause <= MOTION_GUIDE_PAUSE_MAX:
+        return True
+    return text.endswith(":") or text.endswith("：")
 
 
 def apply_auto_motions(
@@ -1545,21 +1574,32 @@ def apply_auto_motions(
 ) -> tuple[list[dict[str, Any]], MotionAssignReport]:
     """按分镜几何 + 情绪自动分配画面运镜（纯函数，不改入参）。
 
+    **Patch v4.31：重构为「同画防跳变 + 呼吸节奏」状态机。**
+
+    三条铁律：
+
+    1. **取消竖扫**：自动分配**不再产出** ``pan_down`` / ``pan_up``。
+       超长竖格改用推拉 / 静止处理（底层枚举、归一化与 Stage 7 渲染仍保留，
+       兼容老工程与老剧本）。老剧本里的竖扫在重新自动分配时会被一并替换掉。
+    2. **同画防跳变**：同一张分镜连拍时「第 1 拍动、第 2 拍静」交替，
+       彻底消除同图连动造成的回弹跳帧；同图第 3 拍可在静过之后补一次轻动。
+    3. **张弛有度**：连续动态最多 :data:`MOTION_MAX_DYNAMIC_STREAK` 拍，
+       第 4 拍必须插静止呼吸；**不得连震**（:data:`MOTION_MAX_SHAKE_STREAK` = 1）。
+
     规则（自上而下判定）：
 
-    * **规则 A｜超长竖格**（``is_tall_panel`` 或 高/宽 >= 1.5）：该格首拍给
-      ``pan_down``；**同一长格的连续第 2、3 拍继续保持 ``pan_down``**（Patch v4.30
-      接力扫镜——镜头顺着长图一路往下走，不再一句一甩把长图缩成细竖条），
-      超过 :data:`MOTION_TALL_RELAY_MAX` 拍才回到 ``zoom_in``
-      （命中冲击时给 ``shake``）。
-    * **规则 B｜横向宽格**（宽/高 >= 1.25）：给 ``pan_right`` / ``pan_left``，
-      连续宽格交替左右横扫；同一宽格的连续后续拍改为 ``zoom_in``。
-    * **规则 C｜高燃冲击**：``sfx_cue`` 命中冲击动作词，或情绪为愤怒 / 震惊
-      且句子短（<= 14 字）时给 ``shake``——**不得连震 3 拍以上**。
-    * **规则 D｜定场与防单调**：新幕首拍（非长 / 宽格）优先 ``zoom_out``；
-      ``tense`` / ``whisper`` / ``sad`` 倾向 ``zoom_in``；
-      连续 2 拍同动效时第 3 拍自动打散（竖扫改反向、震动改 ``zoom_out``、
-      推拉改 ``zoom_out`` / ``static``）。
+    * **规则 A｜同画面连拍**：上一拍刚动过 → 本拍**强制静止**（除非命中高燃
+      冲击且允许震动）；同图第 3 拍（上一拍已静）可补一次不同向轻动。
+    * **规则 B｜冲击高燃**：``sfx_cue`` 命中冲击动作词，或愤怒 / 震惊情绪且
+      句子短（<= 14 字）→ ``shake``；刚震完的下一拍优先静止或 ``zoom_out`` 泄力。
+    * **规则 C｜横向宽格**（宽/高 >= 1.35）：给 ``pan_right`` / ``pan_left``，
+      连续宽格交替左右横扫；同格第 2 句按规则 A 必静。
+    * **规则 D｜天然静帧与呼吸上限**：短引导句（净字数 <= 10 且停顿很短或
+      冒号结尾）优先静止；情绪平稳且非新幕开篇也优先静止；连续动态达上限时
+      强制插一拍静止。
+    * **规则 E｜常规与新幕首拍**：新幕首拍优先 ``zoom_out``（刚拉远过则
+      ``zoom_in``）；推进情绪给 ``zoom_in``；连续 2 拍同推拉时第 3 拍换向；
+      连续多拍全静且切入新图时补一次推拉，避免死屏。
 
     只改 ``motion`` 字段，``narration_text`` / ``tts_text`` / ``pause_after_ms`` /
     ``voice_override`` 等字段原样保留。
@@ -1575,11 +1615,22 @@ def apply_auto_motions(
     prev_motion: str | None = None
     prev_prev_motion: str | None = None
     prev_scene_ordinal: int | None = None
-    wide_flip = 0
+    #: 同一张分镜的连续拍数。
+    same_panel_run = 0
+    #: 连续非静止拍数（遇静止清零）——呼吸节奏的计数器。
+    motion_streak = 0
+    #: 连续静止拍数——避免死屏的计数器。
+    static_streak = 0
+    #: 连续震动拍数（Patch v4.31 上限为 1，即禁止连震）。
     shake_streak = 0
-    # Patch v4.30：同一张超长竖格的连续竖扫拍数（接力扫镜）与上一拍的接力拍数。
-    tall_relay_run = 0
-    prev_tall_relay_run = 0
+    #: 宽格左右横扫的交替计数。
+    wide_flip = 0
+
+    static_value = CameraMotion.STATIC.value
+    zoom_in_value = CameraMotion.ZOOM_IN.value
+    zoom_out_value = CameraMotion.ZOOM_OUT.value
+    shake_value = CameraMotion.SHAKE.value
+    push_values = (zoom_in_value, zoom_out_value)
 
     for beat in assigned:
         panel_id = _beat_first_panel_id(beat) or ""
@@ -1592,77 +1643,81 @@ def apply_auto_motions(
         is_scene_open = (
             scene_ordinal is not None and scene_ordinal != prev_scene_ordinal
         )
-        first_beat_of_panel = panel_id != prev_panel_id
-        if first_beat_of_panel:
-            tall_relay_run = 0
+        same_panel = bool(panel_id) and panel_id == prev_panel_id
+        same_panel_run = same_panel_run + 1 if same_panel else 1
+        first_beat_of_panel = not same_panel
 
         motion = ""
-        # Patch v4.30：本拍是否属于「同格接力竖扫」——接力链内不打散方向。
-        relay_pan = False
-        if is_tall:
-            if first_beat_of_panel:
-                motion = CameraMotion.PAN_DOWN.value
-                tall_relay_run = 1
-            elif impact and shake_streak < MOTION_MAX_SHAKE_STREAK:
-                motion = CameraMotion.SHAKE.value
-                tall_relay_run = 0
-            elif tall_relay_run < MOTION_TALL_RELAY_MAX:
-                # 同一张超长竖格的第 2、3 句继续竖扫：镜头顺着长图往下接，
-                # 而不是突然把整条长竖格缩成屏幕中央的细竖条。
-                motion = CameraMotion.PAN_DOWN.value
-                tall_relay_run += 1
-                relay_pan = True
+        if same_panel and prev_motion and prev_motion != static_value:
+            # 规则 A：同一画面刚动过 → 强制静止（高燃冲击例外）。
+            if (
+                impact
+                and prev_motion != shake_value
+                and shake_streak < MOTION_MAX_SHAKE_STREAK
+            ):
+                motion = shake_value
             else:
-                motion = CameraMotion.ZOOM_IN.value
-                tall_relay_run = 0
-        elif is_wide:
-            if first_beat_of_panel:
-                motion = (
-                    CameraMotion.PAN_RIGHT.value
-                    if wide_flip % 2 == 0
-                    else CameraMotion.PAN_LEFT.value
-                )
-                wide_flip += 1
-            elif impact and shake_streak < MOTION_MAX_SHAKE_STREAK:
-                motion = CameraMotion.SHAKE.value
-            else:
-                motion = CameraMotion.ZOOM_IN.value
-        elif impact and shake_streak < MOTION_MAX_SHAKE_STREAK:
-            motion = CameraMotion.SHAKE.value
+                motion = static_value
+        elif (
+            impact
+            and prev_motion != shake_value
+            and shake_streak < MOTION_MAX_SHAKE_STREAK
+        ):
+            # 规则 B：高燃冲击 → 震动（禁止连震）。
+            motion = shake_value
+        elif same_panel and same_panel_run >= 3 and prev_motion == static_value:
+            # 规则 A（续）：同图第 3 拍且上一拍已静 → 补一次不同向轻动。
+            motion = (
+                zoom_out_value
+                if prev_prev_motion != zoom_out_value
+                else zoom_in_value
+            )
+        elif prev_motion == shake_value:
+            # 规则 B（续）：刚震完 → 泄力（静止或拉远）。
+            motion = static_value if same_panel else zoom_out_value
+        elif is_wide and first_beat_of_panel:
+            # 规则 C：横向宽格 → 左右交替横扫。
+            motion = (
+                CameraMotion.PAN_RIGHT.value
+                if wide_flip % 2 == 0
+                else CameraMotion.PAN_LEFT.value
+            )
+            wide_flip += 1
+        elif not impact and (
+            _beat_is_guide_short(beat)
+            or (emotion in MOTION_CALM_EMOTIONS and not is_scene_open)
+        ):
+            # 规则 D：天然静帧（短引导句 / 情绪平稳且非新幕开篇）。
+            motion = static_value
+        elif motion_streak >= MOTION_MAX_DYNAMIC_STREAK and not impact and not is_wide:
+            # 规则 D（续）：连续动态达上限 → 插一拍静止呼吸。
+            motion = static_value
+        elif static_streak >= 3 and first_beat_of_panel:
+            # 规则 E：连续多拍全静且切入新图 → 补一次推拉，避免死屏。
+            motion = zoom_out_value
         elif is_scene_open:
-            motion = CameraMotion.ZOOM_OUT.value
+            # 规则 E（续）：新幕首拍优先拉远定场（刚拉远过则改推近）。
+            motion = zoom_out_value if prev_motion != zoom_out_value else zoom_in_value
         elif emotion in MOTION_PUSH_EMOTIONS:
-            motion = CameraMotion.ZOOM_IN.value
+            # 规则 E（续）：推进情绪 → 推近。
+            motion = zoom_in_value
         else:
-            motion = CameraMotion.ZOOM_IN.value
+            motion = zoom_in_value
 
-        # 规则 D 防单调：连续 2 拍同动效时，第 3 拍必须换掉。
-        if motion == prev_motion == prev_prev_motion:
-            if motion in (CameraMotion.PAN_DOWN.value, CameraMotion.PAN_UP.value):
-                # Patch v4.30：接力竖扫链（同格连续往下扫）不打断方向，
-                # 否则接力扫镜会被改成反向竖扫、长图又从头再来一遍。
-                # 只有互不相干的三连扫（上一拍不是接力链）才换向。
-                if not relay_pan and prev_tall_relay_run < 2:
-                    motion = (
-                        CameraMotion.PAN_UP.value
-                        if motion == CameraMotion.PAN_DOWN.value
-                        else CameraMotion.PAN_DOWN.value
-                    )
-            elif motion == CameraMotion.SHAKE.value:
-                motion = CameraMotion.ZOOM_OUT.value
-            elif motion == CameraMotion.ZOOM_OUT.value:
-                motion = CameraMotion.STATIC.value
-            else:
-                motion = CameraMotion.ZOOM_OUT.value
+        # 规则 E（续）：连续 2 拍同推拉 → 第 3 拍换向，避免一路推到底。
+        if (
+            motion in push_values
+            and prev_motion in push_values
+            and prev_motion == prev_prev_motion
+        ):
+            motion = zoom_out_value if prev_motion == zoom_in_value else zoom_in_value
 
         old_motion = str(beat.get("motion") or "")
         if old_motion != motion:
             beat["motion"] = motion
             report.updated_count += 1
             report.changed_beat_ids.append(str(beat.get("beat_id") or ""))
-            if motion in (CameraMotion.PAN_DOWN.value, CameraMotion.PAN_UP.value):
-                report.tall_pan_count += 1
-            elif motion in (CameraMotion.PAN_LEFT.value, CameraMotion.PAN_RIGHT.value):
+            if motion in (CameraMotion.PAN_LEFT.value, CameraMotion.PAN_RIGHT.value):
                 report.wide_pan_count += 1
             elif motion == CameraMotion.SHAKE.value:
                 report.shake_count += 1
@@ -1671,11 +1726,12 @@ def apply_auto_motions(
             elif motion == CameraMotion.STATIC.value:
                 report.static_count += 1
 
-        shake_streak = shake_streak + 1 if motion == CameraMotion.SHAKE.value else 0
+        shake_streak = shake_streak + 1 if motion == shake_value else 0
+        motion_streak = 0 if motion == static_value else motion_streak + 1
+        static_streak = static_streak + 1 if motion == static_value else 0
         prev_prev_motion = prev_motion
         prev_motion = motion
         prev_panel_id = panel_id
-        prev_tall_relay_run = tall_relay_run
         if scene_ordinal is not None:
             prev_scene_ordinal = scene_ordinal
 
