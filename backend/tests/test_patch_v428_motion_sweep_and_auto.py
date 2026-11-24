@@ -19,6 +19,9 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +44,9 @@ from core.schemas import (
 from stages.s4_scriptwriter import apply_auto_motions, load_episode_panel_metas
 from stages.s7_renderer import build_scene_filter
 from web.server import create_app
+
+#: 允许用环境变量指定 ffmpeg（CI 里可能是绝对路径）。
+FFMPEG_BIN = os.environ.get("S7_FFMPEG_BIN", "ffmpeg")
 
 
 # --------------------------------------------------------------------------
@@ -144,6 +150,119 @@ def test_zoom_motions_keep_setsar(tmp_path: Path) -> None:
     ):
         fragment = _motion_fragment(tmp_path, motion, (800, 1000))
         assert "setsar=1" in fragment, motion.value
+
+
+def _focus_motion_fragment(
+    tmp_path: Path,
+    motion: CameraMotion,
+    source_size: tuple[int, int],
+    focus_region: tuple[float, float, float, float],
+) -> str:
+    """构造带 focus 取景带的场景滤镜片段（越界取景带会被夹逼）。"""
+    scene = TimelineScene(
+        scene_index=0,
+        beat_id="b1",
+        panel_id="panel_001",
+        image_path=str(tmp_path / "panel.png"),
+        start_ms=0,
+        end_ms=1000,
+        duration_ms=1000,
+        motion=motion,
+        focus_region=focus_region,
+        focus_band=True,
+    )
+    timeline = RenderTimeline(
+        episode_id="ep_001",
+        total_duration_ms=1000,
+        scenes=[scene],
+        audios=[],
+        subtitles=[],
+    )
+    return build_scene_filter(
+        scene,
+        timeline,
+        work_dir=tmp_path,
+        fps=30,
+        source_size=source_size,
+    )
+
+
+def test_out_of_bounds_focus_region_does_not_misjudge_tall_panel(
+    tmp_path: Path,
+) -> None:
+    """越界 focus 取景带必须按**裁完后的比例**判定走 fit 分支。
+
+    回归：真实成片曾在 ``focus_region=(0, 0.5, 1, 1)``（下边界越界，ffmpeg 实际
+    只裁到高 0.5）时，被 Python 侧按未夹逼的比例误判成「超长竖格」，
+    ``scale=2040:-2`` 后画面高不足 2440，滑动 crop 越界导致整条渲染失败。
+    """
+    fragment = _focus_motion_fragment(
+        tmp_path,
+        CameraMotion.PAN_DOWN,
+        (690, 1518),
+        (0.0, 0.5, 1.0, 1.0),
+    )
+    # 取景带被夹逼到画面内（高度只剩 0.5）。
+    assert "h='ih*0.5000'" in fragment
+    # 裁完是 690×759（接近方图），不能走超长竖格的定宽缩放。
+    assert "scale=2040:-2" not in fragment
+    # 必须留出 1.16x 余量并补齐画布。
+    assert "1.16" in fragment
+    assert "pad=w='max(2040,iw)'" in fragment
+    assert "pad=w='max(2040,iw)':h='max(2440,ih)'" in fragment
+
+
+def test_pan_chain_always_pads_to_supersampled_canvas(tmp_path: Path) -> None:
+    """四个平移运镜都必须补透明边到 ≥2040×2440，滑动 crop 才不会越界。"""
+    for motion, size in (
+        (CameraMotion.PAN_DOWN, (800, 2400)),
+        (CameraMotion.PAN_UP, (800, 2400)),
+        (CameraMotion.PAN_LEFT, (1800, 1000)),
+        (CameraMotion.PAN_RIGHT, (3000, 400)),
+    ):
+        fragment = _motion_fragment(tmp_path, motion, size)
+        assert "pad=w='max(2040,iw)':h='max(2440,ih)'" in fragment, motion.value
+        assert "crop=w=2040:h=2440" in fragment, motion.value
+
+
+def test_pan_chain_survives_real_ffmpeg_with_clamped_focus(
+    tmp_path: Path,
+) -> None:
+    """真机回归：越界 focus 取景带 + 平移运镜，ffmpeg 不再报 crop 越界。"""
+    if shutil.which(FFMPEG_BIN) is None:
+        pytest.skip("本机没有 ffmpeg，跳过真实渲染回归")
+    panel = tmp_path / "panel.png"
+    Image.new("RGB", (690, 1518), (30, 40, 60)).save(panel)
+    fragment = _focus_motion_fragment(
+        tmp_path,
+        CameraMotion.PAN_DOWN,
+        (690, 1518),
+        (0.0, 0.5, 1.0, 1.0),
+    )
+    completed = subprocess.run(
+        [
+            FFMPEG_BIN,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(panel),
+            "-filter_complex",
+            fragment,
+            "-map",
+            "[s0]",
+            "-frames:v",
+            "2",
+            "-f",
+            "null",
+            "-",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "Invalid too big" not in completed.stderr
 
 
 # --------------------------------------------------------------------------

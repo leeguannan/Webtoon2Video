@@ -274,6 +274,58 @@ merged_beats, motion_report = apply_auto_motions(
 
 ---
 
+## 五之二、热修复补丁 v4.28.1（2026-11-24 14:12 线上渲染失败）
+
+### 现象
+
+第一次真实成片（`wt_3924` 第 1 话，124 场景）在 `s7_renderer` 阶段失败，退出码 234：
+
+```
+[Parsed_crop_10 @ ...] Invalid too big or non positive size for width '2040' or height '2440'
+[Parsed_crop_10 @ ...] Failed to configure input pad on Parsed_crop_10
+[fc#0 @ ...] Error reinitializing filters!  → Task finished with error code: -22
+```
+
+### 根因
+
+**取景带越界时，Python 侧的比例判定与 ffmpeg 侧的实际裁切不一致。**
+
+`focus_region` 可能是越界的（例如 `(0.0, 0.5, 1.0, 1.0)`，下边界已经超出画面）。
+ffmpeg 侧的 `crop` 会把取景带**截进画面内**（实际高度只剩 0.5），
+而 `_effective_source_size()` 当时**没有做同样的夹逼**，仍按原始 `h=1.0` 换算比例：
+
+| 环节 | 用的尺寸 | 结果 |
+| --- | --- | --- |
+| ffmpeg 实际裁切 | 690 × **759** | 接近方图 |
+| Python 比例判定 | 690 × **1518** | 被误判成「超长竖格」 |
+| 误判后 `scale=2040:-2` | 2040 × **2244** | 高度 < 2440 |
+| 滑动 `crop=w=2040:h=2440` | 需要 ≥ 2040×2440 | **越界，整条渲染失败** |
+
+### 修复（`backend/src/stages/s7_renderer.py`）
+
+1. **新增 `_focus_region_clamped(scene)`**：把取景带夹逼逻辑抽成唯一来源，
+   `_focus_band_crop()`（真裁切）与 `_effective_source_size()`（比例判定）共用；
+   换算尺寸时向下取整，与 ffmpeg `crop` 取整方向一致（判定偏保守）。
+2. **所有平移分支统一补 `pad=w='max(2040,iw)':h='max(2440,ih)'`**：
+   滑动 crop 要求输入不小于取景窗，这层兜底保证即使比例判定与实际画面有偏差
+   （例如运行期才知道尺寸的兜底分支），也只会少一点位移，**不会再让整条渲染失败**。
+
+### 回归测试（`backend/tests/test_patch_v428_motion_sweep_and_auto.py`，+3 条 → 15 条）
+
+- `test_out_of_bounds_focus_region_does_not_misjudge_tall_panel`：
+  越界取景带必须走 fit 分支（不含 `scale=2040:-2`），并带 1.16x 余量与 pad 兜底；
+- `test_pan_chain_always_pads_to_supersampled_canvas`：四个平移运镜都必须补齐画布；
+- `test_pan_chain_survives_real_ffmpeg_with_clamped_focus`：
+  真 ffmpeg 跑越界取景带 + `pan_down`，断言不再出现 `Invalid too big`。
+
+### 复盘教训
+
+「ffmpeg 表达式裁切」与「Python 侧尺寸判定」必须共用同一套夹逼规则，
+否则两边看到的不是同一张画面——这类问题只有在**真实素材**上才会暴露
+（单测用的是规整尺寸，取景带不越界）。
+
+---
+
 ## 六、已知限制与后续
 
 - `updated_count` 统计的是**被改动的**分句数；模型原本就分配对的镜头不计入。

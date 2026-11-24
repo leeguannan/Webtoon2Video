@@ -467,24 +467,47 @@ def _motion_expressions(motion: str, frames: int) -> tuple[str, str, str]:
     return ("1.0", center_x, center_y)
 
 
+def _focus_region_clamped(
+    scene: TimelineScene,
+) -> tuple[float, float, float, float] | None:
+    """返回**夹逼后**的 focus 取景带 ``(x, y, w, h)``；没有有效取景带时返回 ``None``。
+
+    **为什么要夹逼**：``focus_region`` 可能越界（例如 ``(0, 0.5, 1, 1)`` 的
+    下边界已经超出画面），ffmpeg 侧只会把取景带截进画面内（实际高度只剩 0.5），
+    而 Python 侧若按原始值算比例，就会把「裁完其实很矮」的图误判成超长竖格，
+    走 ``scale=2040:-2`` 后高度不足 2440，滑动 crop 直接越界报错。
+
+    **Patch v4.28**：裁切（:func:`_focus_band_crop`）与比例判定
+    (:func:`_effective_source_size`) 必须共用这一份夹逼结果，
+    否则「判定用的比例」与「实际裁出来的画面」会对不上。
+    """
+    if not bool(getattr(scene, "focus_band", False)):
+        return None
+    region = getattr(scene, "focus_region", None)
+    if not region or len(region) != 4:
+        return None
+    x, y, w, h = (float(value) for value in region)
+    if w <= 0.01 or h <= 0.01:
+        return None
+    x = min(max(x, 0.0), 0.99)
+    y = min(max(y, 0.0), 0.99)
+    w = min(max(w, 0.01), 1.0 - x)
+    h = min(max(h, 0.01), 1.0 - y)
+    if w <= 0.01 or h <= 0.01:
+        return None
+    return (x, y, w, h)
+
+
 def _focus_band_crop(scene: TimelineScene) -> str:
     """按 ``focus_hint`` 取景带生成 ``crop`` 滤镜（Patch v2.6-5）。
 
     只有 ``focus_band=True`` 的场景才裁切；其余场景保持「原图完整居中未裁切」，
     这是实机验收确认过的构图，不能因为加了对焦就破坏它。
     """
-    if not bool(getattr(scene, "focus_band", False)):
+    clamped = _focus_region_clamped(scene)
+    if clamped is None:
         return ""
-    region = getattr(scene, "focus_region", None)
-    if not region or len(region) != 4:
-        return ""
-    x, y, w, h = (float(value) for value in region)
-    if w <= 0.01 or h <= 0.01:
-        return ""
-    x = min(max(x, 0.0), 0.99)
-    y = min(max(y, 0.0), 0.99)
-    w = min(max(w, 0.01), 1.0 - x)
-    h = min(max(h, 0.01), 1.0 - y)
+    x, y, w, h = clamped
     return (
         f"crop=w='iw*{w:.4f}':h='ih*{h:.4f}':x='iw*{x:.4f}':y='ih*{y:.4f}'"
     )
@@ -510,18 +533,21 @@ def _effective_source_size(
     ``focus_band=True`` 时前景链会先按 ``focus_region`` 裁切，真正参与运镜的是
     裁切后的画面；运镜比例判定必须基于裁切后的宽高比，否则会把长条取景误判成
     普通竖格（进而走错缩放分支）。
+
+    **Patch v4.28**：取景带必须按 :func:`_focus_region_clamped` 夹逼后再换算，
+    否则「越界取景带」会让判定比例与实际裁切结果不一致，
+    进而让 ``scale=2040:-2`` 缩出不足 2440 的画面，滑动 crop 直接越界报错。
+    换算时向下取整，与 ffmpeg ``crop`` 的取整方向一致（判定偏保守，不会崩）。
     """
     if source_size is None:
         return None
     width = max(1, int(source_size[0]))
     height = max(1, int(source_size[1]))
-    if bool(getattr(scene, "focus_band", False)):
-        region = getattr(scene, "focus_region", None)
-        if region and len(region) == 4:
-            _, _, region_w, region_h = (float(value) for value in region)
-            if region_w > 0.01 and region_h > 0.01:
-                width = max(1, int(round(width * region_w)))
-                height = max(1, int(round(height * region_h)))
+    clamped = _focus_region_clamped(scene)
+    if clamped is not None:
+        _, _, region_w, region_h = clamped
+        width = max(1, int(width * region_w))
+        height = max(1, int(height * region_h))
     return (width, height)
 
 
@@ -531,13 +557,17 @@ def _pan_plan(
 ) -> tuple[str, str | None, int | None, int | None]:
     """计算平移运镜的「等比缩放 + 透明边补齐」方案。
 
-    返回 ``(scale 片段, pad 片段或 None, 画布宽, 画布高)``；
+    返回 ``(scale 片段, pad 片段, 画布宽, 画布高)``；
     画布尺寸为 ``None`` 表示运行期才能确定（此时 crop 用居中表达式自适应）。
 
     * **长竖格（纵向扫镜）**：按宽 ``2040`` 等比缩放，高度远超视窗，可全程匀速扫过；
     * **普通宽图（横向扫镜）**：按高 ``2440`` 等比缩放，宽度必然超过 ``2040``，
       可横向滑动；超窄横幅额外限制放大倍率（<= 2.2x）并补透明边，防止发糊；
     * **其余画面**：等比适配安全框后额外放大 ``1.16`` 倍，留出滑动余量。
+
+    **所有分支都统一补 ``pad``**（画布至少 ``2040×2440``）：滑动 crop 要求输入
+    不小于取景窗，一旦比例判定与实际画面有偏差（例如运行期才知道尺寸的兜底分支），
+    少了这层保护就会直接报 ``Invalid too big or non positive size`` 让整条渲染失败。
     """
     vertical = motion in ("pan_down", "pan_up")
     fit_expr = f"min({SS_WIDTH}.0/iw,{SS_HEIGHT}.0/ih)"
@@ -562,7 +592,7 @@ def _pan_plan(
         scaled_h = SS_WIDTH * src_h / src_w
         if scaled_h > 2 * SAFE_BOX_HEIGHT * TALL_PAN_SS_MARGIN:
             # 超长竖格：宽度铺满 2040，高度等比（必然远超 2440），纵向滑动取景。
-            return (f"scale={SS_WIDTH}:-2:flags=lanczos", None, SS_WIDTH, _even(scaled_h))
+            return (f"scale={SS_WIDTH}:-2:flags=lanczos", fit_pad, SS_WIDTH, _even(scaled_h))
         return (fit_scale, fit_pad, None, None)
 
     if ratio > SAFE_WIDTH / SAFE_BOX_HEIGHT:
@@ -575,7 +605,7 @@ def _pan_plan(
             )
             return (banner_scale, fit_pad, None, SS_HEIGHT)
         # 普通宽图：按高 2440 等比放大，宽度必然 > 2040，可横向滑动。
-        return (f"scale=-2:{SS_HEIGHT}:flags=lanczos", None, None, SS_HEIGHT)
+        return (f"scale=-2:{SS_HEIGHT}:flags=lanczos", fit_pad, None, SS_HEIGHT)
 
     return (fit_scale, fit_pad, None, None)
 
