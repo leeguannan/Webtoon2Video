@@ -205,6 +205,28 @@ class StoryBibleV2(BaseModel):
     snapshots_ep_nos: list[int] = Field(default_factory=list)
 
 
+class SfxSuggestion(BaseModel):
+    """Patch v4.43：一句解说上的**音效建议**。
+
+    方案 B（纯 ``[sfx:key]`` 单入口）下，音效不再由 beat 级 ``sfx_cue``
+    粗粒度触发，而是由审核台上的「AI 音效建议栏」提示用户在送音文本的
+    具体位置插入 ``[sfx:key]`` 标签。
+
+    字段：
+
+    * ``key`` —— 音效键（必须是当前生效曲库里的键，含用户自定义音效）；
+    * ``reason`` —— 推荐理由（给人看的中文短句）；
+    * ``source`` —— ``llm`` = 模型直接给的建议；``context_rule`` = 后端
+      上下文规则补出来的建议；
+    * ``anchor_text`` —— 锚点文本：建议把标签插在这段文字之前。
+    """
+
+    key: str
+    reason: str = ""
+    source: Literal["llm", "context_rule"] = "llm"
+    anchor_text: str = ""
+
+
 class ScriptBeat(BaseModel):
     beat_id: str
     narration_text: str = Field(..., min_length=2, max_length=120)
@@ -247,6 +269,16 @@ class ScriptBeat(BaseModel):
     #: 幕编排与分句画面彻底解耦——同一格漫画可以被多句解说复用，所以幕归属
     #: 不再由 ``target_panel_ids`` 推导。``None`` = 尚未归属（上层按分镜回退）。
     scene_id: str | None = None
+    #: Patch v4.43：本句的**音效建议**（方案 B 的建议栏数据源）。
+    #:
+    #: 与 ``sfx_cue`` / ``sfx_position`` 互补：
+    #:
+    #: * ``sfx_cue`` + ``sfx_position`` 是**旧方案**（整句级锚点），保留兼容老剧本；
+    #: * ``sfx_suggestions`` 是**新方案**——每条建议带推荐理由与锚点文本，
+    #:   审核台可以一键把 ``[sfx:key]`` 插进送音文本的对应位置。
+    #:
+    #: 最多 3 条（见 ``core.normalize.normalize_sfx_suggestions``）。
+    sfx_suggestions: list[SfxSuggestion] = Field(default_factory=list)
 
 
 class NarrationScript(BaseModel):

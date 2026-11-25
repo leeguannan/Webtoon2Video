@@ -8,8 +8,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from utils.tts_tags import (
@@ -149,24 +151,312 @@ SFX_CUE_FALLBACKS: dict[str, str] = {
 }
 
 
-def sfx_group_of(sfx_key: str) -> str:
+def sfx_group_of(sfx_key: str, *, assets_dir: str | Path | None = None) -> str:
     """返回音效键的**一级大类**（动作 / 环境 / 转场 / 道具）。
 
     Patch v4.42：音效资源管理器顶部的分段按钮用这一层做粗筛；
     找不到键时返回空串（前端按「未归类」处理，不丢条目）。
+
+    Patch v4.43：改查**动态生效曲库**（内置 24 条 + 用户自定义条目），
+    传入 ``assets_dir`` 可指定另一个资产根目录。
     """
-    for entry in SFX_CUE_CATALOG:
-        if entry["key"] == str(sfx_key or "").strip().lower():
+    key = str(sfx_key or "").strip().lower()
+    for entry in get_effective_sfx_catalog(assets_dir=assets_dir):
+        if entry["key"] == key:
             return entry.get("group") or ""
     return ""
 
 
-def sfx_fallback_key(sfx_key: str) -> str:
+def sfx_fallback_key(sfx_key: str, *, assets_dir: str | Path | None = None) -> str:
     """返回音效键的**兜底键**（没有兜底则返回空串）。
 
     Patch v4.38：Stage 7 找不到 ``sfx/<key>.*`` 真实素材时，用它回源复用通用音效。
+
+    Patch v4.43：改查**动态生效曲库**，自定义音效也能配自己的兜底。
     """
-    return SFX_CUE_FALLBACKS.get(str(sfx_key or "").strip().lower(), "")
+    key = str(sfx_key or "").strip().lower()
+    for entry in get_effective_sfx_catalog(assets_dir=assets_dir):
+        if entry["key"] == key:
+            return entry.get("fallback_key") or ""
+    return ""
+
+
+# --------------------------------------------------------------------------
+# Patch v4.43：全局音效资源库（动态曲库注册表）
+# --------------------------------------------------------------------------
+#: 用户自定义音效的注册表文件名（落在 ``<assets>/sfx/`` 下）。
+#:
+#: 结构：``{"custom": [...], "overrides": {...}, "hidden": [...]}``
+#:
+#: * ``custom`` —— 用户新增的自定义音效条目（与内置条目同构）；
+#: * ``overrides`` —— 对内置条目的元数据覆盖（label / group / category / fallback_key）；
+#: * ``hidden`` —— 被停用的内置音效键（停用后不在生效曲库里，但随时可还原）。
+#:
+#: 文件缺失 / 不是合法 JSON / 结构损坏 —— 一律安全回退成空配置，
+#: **绝不抛异常**：曲库配置坏了不该让整条流水线崩掉。
+SFX_CUSTOM_CONFIG_FILENAME = "custom_sfx.json"
+
+#: 自定义音效键的合法形状：``^[a-z][a-z0-9_]{1,39}$``（小写开头，可含数字与下划线）。
+SFX_CUSTOM_KEY_RE: re.Pattern[str] = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
+
+#: 音效元数据里允许被用户覆盖 / 自定义的字段。
+SFX_EDITABLE_META_FIELDS: tuple[str, ...] = ("label", "group", "category", "fallback_key")
+
+#: 动态曲库缓存：键 = 配置文件路径，值 = (mtime, catalog, keys)。
+#:
+#: 归一化每句都要校验音效标签，逐句读盘太慢；配置文件是静态资产，
+#: 按 mtime 缓存即可，用户一改配置缓存自然失效。
+_SFX_REGISTRY_CACHE: dict[str, tuple[float, list[dict[str, str]], tuple[str, ...]]] = {}
+
+
+def _sfx_assets_root(assets_dir: str | Path | None = None) -> Path:
+    """音效资产根目录（缺省取全局 ``assets_root()``）。
+
+    延迟导入 ``core.config``：``core.config`` 不依赖 ``core.normalize``，
+    但顶层互相 import 容易在测试里踩到循环导入。
+    """
+    if assets_dir is not None:
+        return Path(assets_dir).expanduser()
+    from core.config import assets_root  # 局部导入，避免模块级循环依赖
+
+    return Path(assets_root())
+
+
+def _sfx_config_path(assets_dir: str | Path | None = None) -> Path:
+    """自定义音效注册表文件的绝对路径。"""
+    return _sfx_assets_root(assets_dir) / "sfx" / SFX_CUSTOM_CONFIG_FILENAME
+
+
+def load_custom_sfx_config(assets_dir: str | Path | None = None) -> dict[str, Any]:
+    """读取自定义音效注册表（文件缺失 / 损坏时安全回退空配置）。"""
+    path = _sfx_config_path(assets_dir)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+
+    custom: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in raw.get("custom") or []:
+        if not isinstance(item, Mapping):
+            continue
+        key = str(item.get("key") or "").strip().lower()
+        if not SFX_CUSTOM_KEY_RE.match(key) or key in seen:
+            continue
+        seen.add(key)
+        custom.append(
+            {
+                "key": key,
+                "label": str(item.get("label") or key),
+                "category": str(item.get("category") or "自定义"),
+                "group": str(item.get("group") or "道具"),
+                "fallback_key": str(item.get("fallback_key") or ""),
+            }
+        )
+
+    overrides: dict[str, dict[str, str]] = {}
+    raw_overrides = raw.get("overrides")
+    if isinstance(raw_overrides, Mapping):
+        for key, patch in raw_overrides.items():
+            name = str(key or "").strip().lower()
+            if not name or not isinstance(patch, Mapping):
+                continue
+            overrides[name] = {
+                field: str(patch.get(field) or "")
+                for field in SFX_EDITABLE_META_FIELDS
+                if field in patch
+            }
+
+    hidden: list[str] = []
+    for item in raw.get("hidden") or []:
+        name = str(item or "").strip().lower()
+        if name and name not in hidden:
+            hidden.append(name)
+
+    return {"custom": custom, "overrides": overrides, "hidden": hidden}
+
+
+def save_custom_sfx_config(
+    config: Mapping[str, Any], assets_dir: str | Path | None = None
+) -> None:
+    """写回自定义音效注册表（原子写：先写临时文件再替换）。"""
+    path = _sfx_config_path(assets_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "custom": list(config.get("custom") or []),
+        "overrides": dict(config.get("overrides") or {}),
+        "hidden": list(config.get("hidden") or []),
+    }
+    tmp = path.with_name(f"{path.name}.tmp")
+    tmp.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    tmp.replace(path)
+    _SFX_REGISTRY_CACHE.pop(str(path), None)
+
+
+def get_effective_sfx_catalog(
+    assets_dir: str | Path | None = None,
+) -> list[dict[str, str]]:
+    """返回**当前生效**的音效曲库（内置 24 条 + 覆盖 + 自定义 − 停用）。
+
+    生效顺序：
+
+    1. 内置 :data:`SFX_CUE_CATALOG` 24 条；
+    2. 套上 ``overrides`` 里的元数据覆盖（label / group / category / fallback_key）；
+    3. 追加 ``custom`` 里的自定义条目（同名覆盖内置条目）；
+    4. 剔除 ``hidden`` 里的键（停用的内置音效）。
+
+    返回的每个条目形如
+    ``{"key", "label", "category", "group", "fallback_key"}``。
+    """
+    path = _sfx_config_path(assets_dir)
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = -1.0
+    cached = _SFX_REGISTRY_CACHE.get(str(path))
+    if cached is not None and cached[0] == mtime:
+        return [dict(entry) for entry in cached[1]]
+
+    config = load_custom_sfx_config(assets_dir)
+    overrides = config["overrides"]
+    hidden = set(config["hidden"])
+
+    catalog: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for entry in SFX_CUE_CATALOG:
+        key = entry["key"]
+        if key in hidden:
+            continue
+        patch = overrides.get(key) or {}
+        merged = {
+            "key": key,
+            "label": patch.get("label") or entry["label"],
+            "category": patch.get("category") or entry["category"],
+            "group": patch.get("group") or entry.get("group") or "",
+            "fallback_key": patch.get("fallback_key") or entry.get("fallback_key") or "",
+        }
+        catalog.append(merged)
+        seen.add(key)
+
+    for entry in config["custom"]:
+        key = entry["key"]
+        if key in hidden:
+            continue
+        if key in seen:
+            # 自定义条目与内置同名 —— 以自定义为准（后写覆盖先写）。
+            for index, item in enumerate(catalog):
+                if item["key"] == key:
+                    catalog[index] = dict(entry)
+                    break
+            continue
+        catalog.append(dict(entry))
+        seen.add(key)
+
+    _SFX_REGISTRY_CACHE[str(path)] = (
+        mtime,
+        [dict(entry) for entry in catalog],
+        tuple(entry["key"] for entry in catalog),
+    )
+    return catalog
+
+
+def get_effective_sfx_keys(
+    assets_dir: str | Path | None = None,
+) -> tuple[str, ...]:
+    """返回当前生效的音效键集合（内置 + 自定义 − 停用）。"""
+    return tuple(entry["key"] for entry in get_effective_sfx_catalog(assets_dir=assets_dir))
+
+
+def is_valid_sfx_key(sfx_key: str, assets_dir: str | Path | None = None) -> bool:
+    """判断一个音效键在**当前生效曲库**里是否合法。"""
+    key = str(sfx_key or "").strip().lower()
+    if not key:
+        return False
+    return key in get_effective_sfx_keys(assets_dir=assets_dir)
+
+
+
+#: Patch v4.43：一句解说上最多保留几条音效建议。
+MAX_SFX_SUGGESTIONS: int = 3
+
+#: Patch v4.43：音效建议的合法来源标记。
+SFX_SUGGESTION_SOURCES: tuple[str, ...] = ("llm", "context_rule")
+
+
+def normalize_sfx_suggestions(
+    raw: Any,
+    *,
+    sfx_cue: str | None = None,
+    assets_dir: str | Path | None = None,
+) -> list[dict[str, str]]:
+    """规范化一句解说上的音效建议（Patch v4.43）。
+
+    规则：
+
+    1. 接受 ``list[dict]``（完整建议）或 ``list[str]``（只有 key）；
+    2. **别名收敛**：``slap_face`` → ``slap``（与 :data:`SFX_CUE_ALIASES` 一致）；
+    3. **有效性校验**：key 必须属于**当前生效曲库**（内置 24 条 + 自定义 − 停用），
+       非法的一律丢弃；
+    4. **按 key 去重**：同一个 key 只留第一条；
+    5. **最多 3 条**（:data:`MAX_SFX_SUGGESTIONS`）；
+    6. ``source`` 只认 ``llm`` / ``context_rule``，其余回落 ``llm``；
+    7. **旧数据兼容**：本句只填了旧的整句级 ``sfx_cue`` 时，自动把它转成一条
+       建议（``source="llm"``），让旧剧本在新的建议栏里也看得见。
+    """
+    items: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def _append(key: str, reason: str, source: str, anchor_text: str) -> None:
+        if len(items) >= MAX_SFX_SUGGESTIONS:
+            return
+        if key in seen:
+            return
+        seen.add(key)
+        items.append(
+            {
+                "key": key,
+                "reason": reason,
+                "source": source,
+                "anchor_text": anchor_text,
+            }
+        )
+
+    for entry in coerce_list(raw):
+        if isinstance(entry, Mapping):
+            raw_key = entry.get("key")
+            reason = coerce_str(entry.get("reason"))
+            source = coerce_str(entry.get("source")).strip().lower()
+            anchor_text = coerce_str(entry.get("anchor_text"))
+        else:
+            raw_key = entry
+            reason = ""
+            source = ""
+            anchor_text = ""
+        key = coerce_str(raw_key).strip().lower()
+        if not key:
+            continue
+        key = SFX_CUE_ALIASES.get(key, key)
+        if not is_valid_sfx_key(key, assets_dir=assets_dir):
+            continue
+        _append(
+            key,
+            reason,
+            source if source in SFX_SUGGESTION_SOURCES else "llm",
+            anchor_text,
+        )
+
+    if not items:
+        legacy = coerce_str(sfx_cue).strip().lower()
+        legacy = SFX_CUE_ALIASES.get(legacy, legacy)
+        if legacy and is_valid_sfx_key(legacy, assets_dir=assets_dir):
+            _append(legacy, "旧剧本的整句级音效标记", "llm", "")
+
+    return items
 
 
 # --------------------------------------------------------------------------
@@ -191,14 +481,17 @@ _INLINE_SFX_DUPLICATE_RE: re.Pattern[str] = re.compile(
 )
 
 
-def normalize_inline_sfx_tags(text: str) -> str:
+def normalize_inline_sfx_tags(
+    text: str, *, assets_dir: str | Path | None = None
+) -> str:
     """规范化送音文本里的内联音效标签（Patch v4.40）。
 
     规则：
 
     1. **别名收敛**：``[sfx:slap_face]`` → ``[sfx:slap]``（与 :data:`SFX_CUE_ALIASES` 一致）；
-    2. **白名单校验**：key 不在 :data:`SFX_CUE_KEYS` 里的标签**直接剥离**
-       （既不报错也不保留——模型写错一个键不该让整句配音失败）；
+    2. **白名单校验**：key 不在**当前生效曲库**里的标签**直接剥离**
+       （既不报错也不保留——模型写错一个键不该让整句配音失败）。
+       Patch v4.43 起白名单 = 内置 24 条 + 用户自定义 − 已停用；
     3. **规范写法**：合法标签统一写成 ``[sfx:<key>]``（去掉多余空白）；
     4. **相邻重复折叠**：``[sfx:slap][sfx:slap]`` → ``[sfx:slap]``
        （同一个音效连着响两遍没有意义，反而会挤掉别的音效事件）；
@@ -208,6 +501,8 @@ def normalize_inline_sfx_tags(text: str) -> str:
     ----
     text:
         原始送音文本。
+    assets_dir:
+        音效资产根目录（缺省取全局 ``assets_root()``）。
 
     返回
     ----
@@ -217,9 +512,11 @@ def normalize_inline_sfx_tags(text: str) -> str:
     if not text or "sfx" not in text.lower():
         return text
 
+    valid_keys = set(get_effective_sfx_keys(assets_dir=assets_dir))
+
     def _replace(match: re.Match[str]) -> str:
         key = SFX_CUE_ALIASES.get(match.group(1).strip().lower(), match.group(1).strip().lower())
-        if key not in SFX_CUE_KEYS:
+        if key not in valid_keys:
             return ""
         return f"[sfx:{key}]"
 
@@ -929,15 +1226,21 @@ def normalize_script_payload(
             tts_text = normalize_minimax_pause_tags(tts_text) or None
         # Patch v3.1 Patch 10：可选音效标签（白名单收敛，非法值 / "none" 丢弃）。
         # Patch v4.38：先过一遍**同义别名**表（只收敛明确同义写法），再查白名单。
+        # Patch v4.43：白名单换成**动态生效曲库**（内置 24 条 + 用户自定义）。
         sfx_cue_raw = item.get("sfx_cue")
         sfx_cue = coerce_str(sfx_cue_raw).lower() if sfx_cue_raw is not None else ""
         sfx_cue = SFX_CUE_ALIASES.get(sfx_cue, sfx_cue)
-        if sfx_cue not in SFX_CUE_KEYS:
+        if not is_valid_sfx_key(sfx_cue):
             sfx_cue = None
         # Patch v4.40：音效在本句内的落点（start / mid / end），非法值回落到 start。
         sfx_position = coerce_str(item.get("sfx_position")).strip().lower()
         if sfx_position not in SFX_POSITIONS:
             sfx_position = "start"
+        # Patch v4.43：AI 音效建议（方案 B 的建议栏数据源）。
+        sfx_suggestions = normalize_sfx_suggestions(
+            item.get("sfx_suggestions"),
+            sfx_cue=sfx_cue,
+        )
         # Patch v3.2 Patch 12：说话人性别（male / female / unknown）。
         speaker_gender = coerce_str(item.get("speaker_gender")).lower()
         if speaker_gender not in SPEAKER_GENDERS:
@@ -965,6 +1268,8 @@ def normalize_script_payload(
                 "sfx_cue": sfx_cue,
                 # Patch v4.40：音效落点。
                 "sfx_position": sfx_position,
+                # Patch v4.43：AI 音效建议（最多 3 条）。
+                "sfx_suggestions": sfx_suggestions,
                 "speed_override": speed_override,
                 "scene_id": scene_id,
             }

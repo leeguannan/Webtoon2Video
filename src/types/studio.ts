@@ -108,6 +108,8 @@ export interface ScriptBeat {
   scene_id?: string | null;
   /** Patch v4.40：音效在本句内的落点（默认句首）。 */
   sfx_position?: SfxPosition;
+  /** Patch v4.43：本句的音效建议（模型给的 + 后端上下文规则补的）。 */
+  sfx_suggestions?: SfxSuggestion[];
 }
 
 // ---------------------------------------------------------------------------
@@ -181,10 +183,32 @@ export interface SfxLibraryItem {
   group?: SfxGroupCategory;
   /** Patch v4.42：生效素材的实测时长（毫秒；探测不到为 null）。 */
   duration_ms?: number | null;
-  /** Patch v4.42：素材来源（freesound_cc0 = 采编工具下载；builtin_cc0 = 仓库内置）。 */
-  source_type?: 'freesound_cc0' | 'builtin_cc0';
+  /** Patch v4.42/4.43：素材来源（freesound_cc0 = 采编工具下载；builtin_cc0 = 仓库内置；custom_upload = 用户上传覆盖；custom = 已登记但尚未上传音频的自定义条目）。 */
+  source_type?: 'freesound_cc0' | 'builtin_cc0' | 'custom_upload' | 'custom';
   /** Patch v4.42：CC0 溯源明细（未命中溯源清单时为 null）。 */
   cc0_source?: SfxCc0SourceMeta | null;
+  /** Patch v4.43：是否内置音效键（false = 用户自定义的新音效）。 */
+  is_builtin?: boolean;
+  /** Patch v4.43：用户是否上传过自定义音频（true = 覆盖了仓库默认素材）。 */
+  has_custom_audio?: boolean;
+}
+
+/**
+ * Patch v4.43：一句解说的**音效建议**（审核台「AI 音效建议栏」）。
+ *
+ * 建议只是候选项：用户在审核台点一下才会把 `[sfx:key]` 真正插进 `tts_text`。
+ * - `source`：模型自己给的（llm）还是后端上下文规则补的（context_rule）；
+ * - `anchor_text`：建议插入位置对应的触发词片段（取自本句字幕）。
+ */
+export interface SfxSuggestion {
+  /** 音效键（内置 24 个或用户自定义）。 */
+  key: string;
+  /** 一句话说明为什么建议这个音效。 */
+  reason?: string;
+  /** 建议来源。 */
+  source?: 'llm' | 'context_rule';
+  /** 触发词片段：点击建议时插在这段文字之前。 */
+  anchor_text?: string;
 }
 
 /** 音效曲库响应体。 */
@@ -192,6 +216,10 @@ export interface SfxLibraryResponse {
   items: SfxLibraryItem[];
   aliases: Record<string, string>;
   allowed_suffixes: string[];
+  /** Patch v4.43：被停用的内置音效键（删除时选了「停用」而不是「还原默认」）。 */
+  hidden_builtin_keys?: string[];
+  /** Patch v4.43：用户自定义的音效键。 */
+  custom_keys?: string[];
 }
 
 /** 百炼官方音色的一条配音规格（Patch v3.2 Patch 13）。 */

@@ -27,6 +27,7 @@ from core.character_unify import (
 from core.config import SeriesConfig, load_series_config
 from core.normalize import (
     EMOTION_VALUES,
+    INLINE_SFX_TAG_RE,
     MAX_SPEED_OVERRIDE,
     MIN_NARRATION_CHARS,
     MIN_DIALOGUE_CHARS,
@@ -36,6 +37,7 @@ from core.normalize import (
     coerce_str,
     coerce_str_list,
     deduplicate_adjacent_beats,
+    get_effective_sfx_keys,
     is_psychological_lead,
     normalize_dialogue_quotes,
     normalize_script_payload,
@@ -1439,14 +1441,16 @@ def apply_narrative_pacing(
 
         # ---- 规则 B：转折 / 悬念揭示 / 高潮留白 950ms ----
         if rule_hit is None and gap_ok:
-            sfx_cue = str(beat.get("sfx_cue") or "")
+            # Patch v4.43：转折留白也认句内 ``[sfx:key]`` 标签
+            # （方案 B 下 ``sfx_cue`` 大多为空，只看它会让规则彻底失效）。
+            sfx_keys = _extract_beat_sfx_keys(beat)
             keyword_hit = any(
                 keyword in text for keyword in PACE_TURN_KEYWORDS
             )
             if (
                 keyword_hit
                 or _is_suspense_ending(text)
-                or sfx_cue in PACE_TURN_SFX
+                or any(key in PACE_TURN_SFX for key in sfx_keys)
             ):
                 raised = max(original, PACE_TURN_MS)
                 if raised > original:
@@ -1692,7 +1696,10 @@ def _beat_emotion(beat: Mapping[str, Any]) -> str:
     raw = str(beat.get("emotion") or "").strip().lower()
     if raw in EMOTION_VALUES:
         return raw
-    text = f"{beat.get('emotion_instruction') or ''} {beat.get('sfx_cue') or ''}".lower()
+    # Patch v4.43：情绪兜底也认句内 ``[sfx:key]`` 标签里的音效键。
+    text = (
+        f"{beat.get('emotion_instruction') or ''} {_beat_sfx_keys_text(beat)}"
+    ).lower()
     for label, keywords in MOTION_EMOTION_KEYWORDS:
         if any(keyword in text for keyword in keywords):
             return label
@@ -1704,10 +1711,175 @@ def _beat_core_text(beat: Mapping[str, Any]) -> str:
     return re.sub(r"[^\w\u4e00-\u9fff]", "", _beat_text(beat))
 
 
+def _extract_beat_sfx_keys(beat: Mapping[str, Any]) -> list[str]:
+    """取出这一句里出现的**全部音效键**（内联标签 + 旧整句级 ``sfx_cue``）。
+
+    Patch v4.43（方案 B）：音效改由 ``tts_text`` 里的 ``[sfx:key]`` 标签表达，
+    旧的整句级 ``sfx_cue`` 只作为兼容保留。自动动效 / 自动节奏这两套规则
+    原来只看 ``sfx_cue``，纯 ``[sfx:key]`` 模式下会**完全失效**——
+    高燃句不再震、转折句不再留白。这里统一从两个来源取键，让两条老规则
+    在新方案下继续生效。
+    """
+    keys: list[str] = []
+    tts_text = str(beat.get("tts_text") or "")
+    if tts_text:
+        for match in INLINE_SFX_TAG_RE.finditer(tts_text):
+            key = match.group(1).strip().lower()
+            if key and key not in keys:
+                keys.append(key)
+    cue = str(beat.get("sfx_cue") or "").strip().lower()
+    if cue and cue != "none" and cue not in keys:
+        keys.append(cue)
+    return keys
+
+
+def _beat_sfx_keys_text(beat: Mapping[str, Any]) -> str:
+    """把这一句的音效键拼成一段文本（供情绪关键词兜底识别）。"""
+    return " ".join(_extract_beat_sfx_keys(beat))
+
+
+#: Patch v4.43：上下文规则推荐的「关键词 → 音效键」对照表。
+#:
+#: 只收**解说台词里真的会出现**的动作 / 声音词；画面里才有的声音
+#: （Stage 3 的 ``sfx_list``）走同一张表匹配。
+SFX_CONTEXT_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("slap", ("耳光", "巴掌", "掌掴", "掌摑", "打了一巴掌")),
+    ("punch", ("一拳", "重拳", "拳头", "拳击", "猛击", "重击")),
+    ("door_slam", ("摔门", "撞上门", "砰地关上门", "摔上门")),
+    ("door_open", ("推开门", "推門", "推门", "门开了", "門開了")),
+    ("sword_clash", ("刀剑", "刀劍", "剑锋", "劍鋒", "兵器相撞", "刀剑交击")),
+    ("glass_shatter", ("玻璃碎", "碎裂", "玻璃破", "花瓶碎")),
+    ("crash", ("撞击", "撞上", "砸向", "崩塌", "轰然倒塌")),
+    ("boom_hit", ("轰击", "轟擊", "轰然", "爆炸", "轰鸣", "轟鳴")),
+    ("thunder", ("雷声", "雷聲", "雷鸣", "雷鳴", "打雷", "霹雳", "霹靂")),
+    ("footstep", ("脚步声", "腳步聲", "跑过来", "跑過來", "走近")),
+    ("heart_thump", ("心跳", "心脏狂跳", "心臟狂跳", "心头一紧", "心頭一緊")),
+    ("gasp", ("倒吸", "倒吸一口气", "倒吸一口凉气")),
+    ("whoosh", ("破空", "风声", "呼嘯", "呼啸而过")),
+    ("phone_ringing", ("电话铃", "電話鈴", "来电", "來電", "手机响了")),
+    ("phone_vibrating", ("手机震", "手機震", "震动起来")),
+    ("phone_msg", ("短信", "信息提示", "消息提示")),
+    ("applause", ("掌声", "掌聲", "鼓掌", "喝彩")),
+    ("clock_tick", ("滴答", "嘀嗒", "钟表", "鐘錶", "秒针")),
+    ("page_turn", ("翻页", "翻頁", "翻书", "翻動書頁")),
+    ("camera_shutter", ("快门", "快門", "咔嚓")),
+    ("car_horn", ("鸣笛", "鳴笛", "喇叭声", "汽车喇叭")),
+    ("cloth_rustle", ("衣料", "布料", "窸窣")),
+)
+
+
+def _sfx_key_from_keywords(text: str) -> str:
+    """按关键词从一段文本里猜一个音效键（猜不到返回空串）。"""
+    if not text:
+        return ""
+    for key, keywords in SFX_CONTEXT_HINTS:
+        if any(word in text for word in keywords):
+            return key
+    return ""
+
+
+def enrich_sfx_suggestions(
+    beats: Sequence[dict[str, Any]],
+    vision_panels: Sequence[Any] | None = None,
+    *,
+    scenes: Sequence[StoryboardScene] | None = None,
+) -> list[dict[str, Any]]:
+    """按上下文规则补全每句的**音效建议**（Patch v4.43，方案 B 的规则侧）。
+
+    模型给的建议只是「第一手判断」，它可能漏掉一些明显该配音效的句子
+    （比如台词里写了「一巴掌扇过去」但模型没给音效）。这里用三条确定性规则
+    补全：
+
+    1. **台词关键词**：解说词里出现动作 / 声音词（``一巴掌`` / ``摔门`` /
+       ``雷声`` …）→ 推荐对应音效；
+    2. **画面拟声词**：Stage 3 识图给出的该分镜 ``sfx_list`` 里命中关键词
+       → 推荐对应音效；
+    3. **切幕语境**：新一幕的第一句 → 推荐一个转场音效（``whoosh``）。
+
+    规则：
+
+    * 只从**当前生效曲库**（内置 24 条 + 用户自定义 − 停用）里挑音效；
+    * 句里已有的内联标签 / 旧 ``sfx_cue`` 不再重复推荐；
+    * 按 key 去重，每句最多 3 条（与 ``core.normalize`` 的规则一致）；
+    * 规则补出来的建议 ``source="context_rule"``，模型自己给的保持 ``llm``。
+    """
+    valid_keys = set(get_effective_sfx_keys())
+
+    panel_sfx_text: dict[str, str] = {}
+    for panel in vision_panels or []:
+        panel_id = str(getattr(panel, "panel_id", "") or "").strip()
+        if not panel_id:
+            continue
+        items = [
+            str(item)
+            for item in (getattr(panel, "sfx_list", None) or [])
+            if str(item).strip()
+        ]
+        if items:
+            panel_sfx_text[panel_id] = " ".join(items)
+
+    scene_ordinals = _scene_ordinal_index(scenes)
+    panel_to_scene = _scene_panel_index(scenes)
+
+    enriched: list[dict[str, Any]] = []
+    seen_scenes: set[int] = set()
+    for beat in beats:
+        current = dict(beat)
+        suggestions = [
+            dict(item)
+            for item in (current.get("sfx_suggestions") or [])
+            if isinstance(item, Mapping)
+        ]
+
+        existing_keys = {str(item.get("key") or "") for item in suggestions}
+        existing_keys.update(_extract_beat_sfx_keys(current))
+
+        def _add(key: str, reason: str, anchor_text: str = "") -> None:
+            if not key or key in existing_keys or key not in valid_keys:
+                return
+            if len(suggestions) >= 3:
+                return
+            existing_keys.add(key)
+            suggestions.append(
+                {
+                    "key": key,
+                    "reason": reason,
+                    "source": "context_rule",
+                    "anchor_text": anchor_text,
+                }
+            )
+
+        # 规则 1：台词关键词。
+        text = _beat_text(current)
+        inline_hit = _sfx_key_from_keywords(text)
+        if inline_hit:
+            _add(inline_hit, "台词里有明显的动作 / 声音描述")
+
+        # 规则 2：画面拟声词（Stage 3 的 sfx_list）。
+        if len(suggestions) < 3:
+            for panel_id in current.get("target_panel_ids") or []:
+                panel_key = _sfx_key_from_keywords(
+                    panel_sfx_text.get(str(panel_id), "")
+                )
+                if panel_key:
+                    _add(panel_key, "这一格画面里有对应的声音")
+                    break
+
+        # 规则 3：切幕语境（新幕首句配一个转场音效）。
+        ordinal = _beat_scene_ordinal(beat, panel_to_scene, scene_ordinals)
+        if ordinal is not None and ordinal not in seen_scenes:
+            seen_scenes.add(ordinal)
+            if len(suggestions) < 3:
+                _add("whoosh", "新一幕开始，用一个转场音效起势")
+
+        current["sfx_suggestions"] = suggestions
+        enriched.append(current)
+    return enriched
+
+
 def _beat_is_impact(beat: Mapping[str, Any]) -> bool:
     """规则 C 判定：音效命中冲击动作词，或愤怒 / 震惊情绪且句子够短。"""
-    sfx = str(beat.get("sfx_cue") or "").strip().lower()
-    if sfx:
+    for sfx in _extract_beat_sfx_keys(beat):
         if sfx in MOTION_IMPACT_SFX_CUES:
             return True
         if any(word in sfx for word in MOTION_IMPACT_SFX):
@@ -4165,6 +4337,16 @@ async def write_episode_script(
                 f"beat={motion_report.changed_beat_ids}",
                 file=sys.stderr,
             )
+
+    # Patch v4.43：按上下文规则补全**音效建议**（方案 B 的建议栏数据源）。
+    # 模型给的建议是第一手判断，这里再用「台词关键词 / 画面拟声词 / 切幕语境」
+    # 三条确定性规则补一遍，用户在审核台的建议栏里能直接看到可插入的音效。
+    if merged_beats:
+        merged_beats = enrich_sfx_suggestions(
+            merged_beats,
+            vision.panels if vision is not None else None,
+            scenes=active_scenes if scene_mode else None,
+        )
 
     payload = {
         "hook_title": overview.get("hook_title"),

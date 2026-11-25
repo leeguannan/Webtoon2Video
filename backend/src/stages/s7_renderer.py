@@ -210,6 +210,12 @@ BGM_DIR_NAME = "bgm"
 #: 音效子目录名。
 SFX_DIR_NAME = "sfx"
 
+#: Patch v4.43：用户上传 / 自定义音效的存放子目录（``<assets>/sfx/custom/``）。
+#:
+#: 命中顺序是「用户上传优先、仓库默认其次」：用户替换了某个内置音效的音频，
+#: 成片里就应该响用户那一份；删掉 ``custom/`` 下的文件即可还原默认。
+SFX_CUSTOM_AUDIO_DIRNAME = "custom"
+
 #: 音效默认增益（dB）。Patch v3.2 Patch 14 从 -10dB 提升到 -3.5dB：
 #: 旧值混入后心跳/甩门等音效几乎听不见；混入前另做 ``dynaudnorm`` 峰值归一防破音。
 #: Patch v4.0 Patch 18 再抬到 -2.0dB：扇耳光 / 摔碎这类关键音效要听得见。
@@ -1089,23 +1095,35 @@ def resolve_sfx_asset(
     通用音效（例如 ``slap`` 缺失 → 用 ``door_slam``；``punch`` 缺失 → 用
     ``crash``；``door_open`` 缺失 → 用 ``whoosh``）。
 
+    Patch v4.43：兜底关系改查**动态生效曲库**，用户在全局音效资源库里给
+    自定义音效配的兜底同样生效；自定义音效的素材文件就是
+    ``sfx/<key>.<ext>``，按名字找的那一步天然支持。
+
     规则：
 
-    * ``<sfx_key>.*`` 有真实文件就**优先命中真实文件**（不回落）；
+    * ``custom/<sfx_key>.*``（用户上传）有真实文件就**优先命中**；
+    * 否则 ``<sfx_key>.*``（仓库默认 / 采编素材）命中；
     * 没有就按 catalog 的 ``fallback_key`` 回源，回源同样先找真实文件；
     * 回源链最多两级（``fallback`` 的 fallback 不再追），且不会成环；
     * 两者都没有 → 返回 ``None``（成片里这一条音效就没有，不静默换别的）。
     """
     root = Path(assets_dir).expanduser() if assets_dir else assets_root()
     sfx_dir = root / SFX_DIR_NAME
+    # Patch v4.43：用户上传的音频优先（可在资源库里替换内置音效的素材）。
+    custom = resolve_audio_asset(sfx_dir / SFX_CUSTOM_AUDIO_DIRNAME, sfx_key)
+    if custom is not None:
+        return custom
+
     direct = resolve_audio_asset(sfx_dir, sfx_key)
     if direct is not None:
         return direct
 
-    fallback = sfx_fallback_key(sfx_key)
+    fallback = sfx_fallback_key(sfx_key, assets_dir=root)
     if not fallback:
         return None
-    return resolve_audio_asset(sfx_dir, fallback)
+    return resolve_audio_asset(sfx_dir / SFX_CUSTOM_AUDIO_DIRNAME, fallback) or (
+        resolve_audio_asset(sfx_dir, fallback)
+    )
 
 
 # --------------------------------------------------------------------------
@@ -3008,6 +3026,7 @@ __all__ = [
     "PANEL_DIR_NAME",
     "PLAN_DIR_NAME",
     "SFX_DIR_NAME",
+    "SFX_CUSTOM_AUDIO_DIRNAME",
     "SUBTITLE_DIR_NAME",
     "TIMELINE_FILENAME",
     "RenderError",

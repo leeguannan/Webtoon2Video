@@ -32,6 +32,7 @@ import binascii
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -96,7 +97,11 @@ from core.panel_scope import (
 from core.normalize import (
     SFX_CUE_ALIASES,
     SFX_CUE_CATALOG,
-    SFX_CUE_KEYS,
+    SFX_CUSTOM_KEY_RE,
+    get_effective_sfx_catalog,
+    is_valid_sfx_key,
+    load_custom_sfx_config,
+    save_custom_sfx_config,
     to_simplified_chinese,
 )
 from core.schemas import (
@@ -670,6 +675,8 @@ PRESERVED_BEAT_FIELDS: tuple[str, ...] = (
     "scene_id",
     # Patch v4.40：音效在本句内的落点（首/中/尾）；前端未回传时继承旧值
     "sfx_position",
+    # Patch v4.43：AI 音效建议（前端未回传时继承旧值；显式传 [] = 清空建议）
+    "sfx_suggestions",
 )
 
 #: 上面这些字段里允许显式置 ``None``（清空）的，其余字段 ``None`` 非法，按「未提供」处理。
@@ -1356,6 +1363,34 @@ SFX_UPLOAD_MAX_BYTES = 30 * 1024 * 1024
 #: Patch v4.42：CC0 采编工具写的溯源清单（文件名固定）。
 SFX_SOURCES_FILENAME = "SOURCES_CC0.json"
 
+#: Patch v4.43：全局音效资源库的请求体。
+class SfxCreateRequest(BaseModel):
+    """新增一个自定义音效（Patch v4.43）。"""
+
+    key: str
+    label: str = ""
+    group: str = ""
+    category: str = ""
+    fallback_key: str = ""
+    filename: str = ""
+    content_base64: str = ""
+
+
+class SfxUpdateRequest(BaseModel):
+    """修改音效元数据（Patch v4.43）。"""
+
+    label: str | None = None
+    group: str | None = None
+    category: str | None = None
+    fallback_key: str | None = None
+
+
+#: Patch v4.43：音效上传体积上限（单个音效文件本来都很小，给 30MB 余量）。
+SFX_UPLOAD_MAX_BYTES = 30 * 1024 * 1024
+
+#: Patch v4.42：CC0 采编工具写的溯源清单（文件名固定）。
+SFX_SOURCES_FILENAME = "SOURCES_CC0.json"
+
 #: Patch v4.42：音效时长探测缓存 —— key = (路径, mtime, size)，value = 毫秒。
 #:
 #: 曲库接口每次都要报时长，而探测要走一次 ffprobe；24 条素材逐次起进程
@@ -1406,8 +1441,134 @@ def _sfx_duration_ms(path: Path | None) -> int | None:
     return duration
 
 
+def _sfx_custom_audio_dir() -> Path:
+    """用户上传 / 自定义音效的存放目录（``<assets>/sfx/custom/``）。"""
+    return (
+        s7_renderer.assets_root()
+        / s7_renderer.SFX_DIR_NAME
+        / s7_renderer.SFX_CUSTOM_AUDIO_DIRNAME
+    )
+
+
+def _sfx_custom_audio_path(sfx_key: str) -> Path | None:
+    """用户上传的音频文件（``sfx/custom/<key>.<ext>``）；没有则返回 ``None``。"""
+    return s7_renderer.resolve_audio_asset(_sfx_custom_audio_dir(), sfx_key)
+
+
+def _remove_sfx_custom_audio(sfx_key: str) -> list[str]:
+    """删掉 ``sfx/custom/`` 下某个 key 的全部音频文件，返回被删的文件名。"""
+    removed: list[str] = []
+    directory = _sfx_custom_audio_dir()
+    if not directory.is_dir():
+        return removed
+    for suffix in s7_renderer.ASSET_SUFFIX_PRIORITY:
+        candidate = directory / f"{sfx_key}{suffix}"
+        if candidate.is_file():
+            try:
+                candidate.unlink()
+            except OSError:
+                continue
+            removed.append(candidate.name)
+    return removed
+
+
+def _sfx_preprocess_audio(src: Path, dst: Path, *, ffmpeg_bin: str = "ffmpeg") -> bool:
+    """用 FFmpeg 预处理音效（去首尾静音 + 归一到 -16 LUFS / 44.1kHz）。
+
+    预处理失败（没有 FFmpeg / 编码器不支持 / 文件损坏）时返回 ``False``，
+    调用方**安全直存原始文件**——音效差一点处理总比整条音效用不了强。
+    """
+    ffmpeg_bin = str(ffmpeg_bin or "ffmpeg")
+    suffix = dst.suffix.lower()
+    codec = {
+        ".mp3": ["-c:a", "libmp3lame", "-b:a", "192k"],
+        ".wav": ["-c:a", "pcm_s16le"],
+        ".m4a": ["-c:a", "aac", "-b:a", "192k"],
+        ".ogg": ["-c:a", "libvorbis", "-b:a", "160k"],
+    }.get(suffix)
+    if codec is None:
+        return False
+    filters = (
+        "silenceremove=start_periods=1:start_duration=0.05:start_threshold=-50dB:"
+        "detection=peak,areverse,"
+        "silenceremove=start_periods=1:start_duration=0.05:start_threshold=-50dB:"
+        "detection=peak,areverse,"
+        "loudnorm=I=-16:TP=-1.5:LRA=11"
+    )
+    command = [
+        ffmpeg_bin,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(src),
+        "-af",
+        filters,
+        "-ar",
+        "44100",
+        "-ac",
+        "2",
+        *codec,
+        str(dst),
+    ]
+    try:
+        result = subprocess.run(  # noqa: S603 —— 参数全部由本进程拼装，无 shell
+            command,
+            check=False,
+            capture_output=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if result.returncode != 0 or not dst.is_file() or dst.stat().st_size <= 0:
+        return False
+    return True
+
+
+def _sfx_store_uploaded_audio(
+    sfx_key: str, filename: str, content_base64: str, *, ffmpeg_bin: str = "ffmpeg"
+) -> Path:
+    """把用户上传的音效音频落盘到 ``assets/sfx/custom/<key>.<ext>``。
+
+    * 先删同 key 的旧扩展名文件（避免留下两份同名素材）；
+    * 有 FFmpeg 时做「去首尾静音 + -16 LUFS / 44.1kHz」预处理，
+      预处理不可用（没装 FFmpeg / 编码失败）时**安全直存原始文件**。
+    """
+    raw_name = Path(str(filename or "")).name
+    suffix = Path(raw_name).suffix.lower() if raw_name else ".mp3"
+    if suffix not in SFX_ALLOWED_SUFFIXES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"只支持 {', '.join(SFX_ALLOWED_SUFFIXES)} 音频",
+        )
+    raw_bytes = _decode_base64_audio(content_base64)
+    if len(raw_bytes) > SFX_UPLOAD_MAX_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"音效体积超过 {SFX_UPLOAD_MAX_BYTES // (1024 * 1024)}MB 上限",
+        )
+
+    directory = _sfx_custom_audio_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    _remove_sfx_custom_audio(sfx_key)
+    target = directory / f"{sfx_key}{suffix}"
+    # 临时文件保留正确后缀，FFmpeg 才能识别容器格式。
+    tmp = directory / f".tmp_{sfx_key}{suffix}"
+    tmp.write_bytes(raw_bytes)
+    if _sfx_preprocess_audio(tmp, target, ffmpeg_bin=ffmpeg_bin):
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    else:
+        tmp.replace(target)
+    _SFX_DURATION_CACHE.clear()
+    return target
+
+
 def _sfx_library_payload() -> dict[str, Any]:
-    """音效曲库清单（对应 ``core.normalize.SFX_CUE_CATALOG``）。
+    """音效曲库清单（**动态生效曲库**：内置 24 条 + 用户自定义 − 停用）。
 
     每条包含：key / label / category（细类）/ group（一级大类）/
     available（盘面有没有真实素材）/ resolved_filename（实际会用的文件名）/
@@ -1416,13 +1577,21 @@ def _sfx_library_payload() -> dict[str, Any]:
     Patch v4.42 追加：duration_ms（生效素材的实测时长）/
     source_type（``freesound_cc0`` = 采编工具下载的 CC0 素材，
     ``builtin_cc0`` = 仓库内置资产）/ cc0_source（溯源明细）。
+
+    Patch v4.43 追加：is_builtin（是否内置条目）/ has_custom_audio
+    （是否被用户上传的音频覆盖）/ source_type 新增 ``custom_upload``；
+    顶层追加 hidden_builtin_keys（被停用的内置音效）与 custom_keys。
     """
     sources = _sfx_sources_index()
+    config = load_custom_sfx_config()
+    builtin_keys = {entry["key"] for entry in SFX_CUE_CATALOG}
+    custom_keys = {entry["key"] for entry in config["custom"]}
     items: list[dict[str, Any]] = []
-    for entry in SFX_CUE_CATALOG:
+    for entry in get_effective_sfx_catalog():
         key = entry["key"]
         fallback_key = entry.get("fallback_key") or ""
-        resolved = s7_renderer.resolve_sfx_asset(key)
+        custom_asset = _sfx_custom_audio_path(key)
+        resolved = custom_asset or s7_renderer.resolve_sfx_asset(key)
         resolved_name = resolved.name if resolved is not None else ""
 
         source = sources.get(key)
@@ -1446,6 +1615,16 @@ def _sfx_library_payload() -> dict[str, Any]:
                 "max_duration_s": source.get("max_duration_s"),
             }
 
+        if custom_asset is not None:
+            source_type = "custom_upload"
+        elif key in custom_keys:
+            # 已登记但还没上传音频的自定义条目。
+            source_type = "custom"
+        elif source is not None:
+            source_type = "freesound_cc0"
+        else:
+            source_type = "builtin_cc0"
+
         items.append(
             {
                 "key": key,
@@ -1457,14 +1636,21 @@ def _sfx_library_payload() -> dict[str, Any]:
                 "fallback_key": fallback_key,
                 "url": f"/api/sfx-file/{key}",
                 "duration_ms": duration_ms,
-                "source_type": "freesound_cc0" if source is not None else "builtin_cc0",
+                "source_type": source_type,
                 "cc0_source": cc0_source,
+                # Patch v4.43：内置 / 自定义归属与「是否被用户音频覆盖」。
+                "is_builtin": key in builtin_keys,
+                "has_custom_audio": custom_asset is not None,
             }
         )
     return {
         "items": items,
         "aliases": dict(SFX_CUE_ALIASES),
         "allowed_suffixes": list(SFX_ALLOWED_SUFFIXES),
+        "hidden_builtin_keys": [
+            key for key in config["hidden"] if key in builtin_keys
+        ],
+        "custom_keys": sorted(custom_keys),
     }
 
 
@@ -3439,18 +3625,22 @@ def create_app(
 
     @app.get("/api/sfx-library")
     def get_sfx_library() -> dict[str, Any]:
-        """音效曲库清单（Patch v4.38）：24 个标准音效键 + 盘面可用情况。"""
+        """音效曲库清单（Patch v4.43）。
+
+        动态生效曲库 = 内置 24 条 + 用户自定义 − 已停用；
+        每条带 is_builtin / has_custom_audio / source_type 等归属信息。
+        """
         return _sfx_library_payload()
 
     @app.get("/api/sfx-file/{sfx_key}")
     def get_sfx_file(sfx_key: str) -> FileResponse:
         """回源一个音效素材（试听用）。
 
-        key 必须属于 ``core.normalize.SFX_CUE_KEYS``；盘面没有真实素材时按
-        ``fallback_key`` 回源复用通用音效；都没有则 404。
+        key 必须属于**当前生效曲库**（内置 24 条 + 用户自定义 − 已停用）；
+        盘面没有真实素材时按 ``fallback_key`` 回源复用通用音效；都没有则 404。
         """
         key = Path(str(sfx_key or "")).name.strip().lower()
-        if key not in SFX_CUE_KEYS:
+        if not is_valid_sfx_key(key):
             raise HTTPException(status_code=400, detail=f"不是合法的音效键：{sfx_key}")
         resolved = s7_renderer.resolve_sfx_asset(key)
         if resolved is None or not resolved.is_file():
@@ -3465,24 +3655,179 @@ def create_app(
             content_disposition_type="inline",
         )
 
-    @app.post("/api/sfx-library/upload")
-    def upload_sfx_asset(payload: SfxUploadRequest) -> dict[str, Any]:
-        """上传（覆盖）一个音效素材（Patch v4.38）。"""
-        key = Path(str(payload.sfx_key or "")).name.strip().lower()
-        if key not in SFX_CUE_KEYS:
-            raise HTTPException(status_code=400, detail=f"不是合法的音效键：{payload.sfx_key}")
-        raw_name = Path(payload.filename or "").name
-        suffix = Path(raw_name).suffix.lower() if raw_name else ".mp3"
-        if suffix not in SFX_ALLOWED_SUFFIXES:
+    @app.post("/api/sfx-library")
+    def create_sfx_asset(payload: SfxCreateRequest) -> dict[str, Any]:
+        """新增一个自定义音效（Patch v4.43）。
+
+        key 必须是 ``^[a-z][a-z0-9_]{1,39}$`` 且不与已有生效条目冲突；
+        可同时上传音频（``filename`` + ``content_base64``），音频落在
+        ``assets/sfx/custom/<key>.<ext>``，有 FFmpeg 时顺手做
+        「去首尾静音 + -16 LUFS / 44.1kHz」预处理。
+        """
+        key = str(payload.key or "").strip().lower()
+        if not SFX_CUSTOM_KEY_RE.match(key):
             raise HTTPException(
                 status_code=400,
-                detail=f"只支持 {', '.join(SFX_ALLOWED_SUFFIXES)} 音频",
+                detail=(
+                    "音效键只能用小写字母开头的小写字母 / 数字 / 下划线（2~40 位）："
+                    f"{payload.key}"
+                ),
             )
-        raw_bytes = _decode_base64_audio(payload.content_base64)
-        sfx_dir = s7_renderer.assets_root() / s7_renderer.SFX_DIR_NAME
-        sfx_dir.mkdir(parents=True, exist_ok=True)
-        (sfx_dir / f"{key}{suffix}").write_bytes(raw_bytes)
+        existing = {entry["key"] for entry in get_effective_sfx_catalog()}
+        if key in existing:
+            raise HTTPException(status_code=400, detail=f"音效键已存在：{key}")
+
+        fallback_key = str(payload.fallback_key or "").strip().lower()
+        if fallback_key and not is_valid_sfx_key(fallback_key):
+            raise HTTPException(
+                status_code=400, detail=f"兜底音效键不存在：{fallback_key}"
+            )
+
+        if str(payload.filename or "").strip() and str(payload.content_base64 or "").strip():
+            _sfx_store_uploaded_audio(
+                key,
+                payload.filename,
+                payload.content_base64,
+                ffmpeg_bin=view.config.render.ffmpeg_bin,
+            )
+
+        config = load_custom_sfx_config()
+        config["custom"].append(
+            {
+                "key": key,
+                "label": str(payload.label or "").strip() or key,
+                "category": str(payload.category or "").strip() or "自定义",
+                "group": str(payload.group or "").strip() or "道具",
+                "fallback_key": fallback_key,
+            }
+        )
+        save_custom_sfx_config(config)
         return _sfx_library_payload()
+
+    @app.patch("/api/sfx-library/{sfx_key}")
+    def update_sfx_asset(sfx_key: str, payload: SfxUpdateRequest) -> dict[str, Any]:
+        """修改音效元数据（label / group / category / fallback_key）。"""
+        key = str(sfx_key or "").strip().lower()
+        config = load_custom_sfx_config()
+        builtin_keys = {entry["key"] for entry in SFX_CUE_CATALOG}
+        patch: dict[str, str] = {}
+        if payload.label is not None:
+            patch["label"] = str(payload.label).strip()
+        if payload.group is not None:
+            patch["group"] = str(payload.group).strip()
+        if payload.category is not None:
+            patch["category"] = str(payload.category).strip()
+        if payload.fallback_key is not None:
+            fallback = str(payload.fallback_key).strip().lower()
+            if fallback and not is_valid_sfx_key(fallback):
+                raise HTTPException(
+                    status_code=400, detail=f"兜底音效键不存在：{fallback}"
+                )
+            patch["fallback_key"] = fallback
+        if not patch:
+            raise HTTPException(status_code=400, detail="没有要修改的字段")
+
+        for item in config["custom"]:
+            if item["key"] == key:
+                item.update({field: patch[field] for field in patch if field in item})
+                save_custom_sfx_config(config)
+                return _sfx_library_payload()
+
+        if key in builtin_keys:
+            overrides = dict(config["overrides"])
+            merged = dict(overrides.get(key) or {})
+            merged.update(patch)
+            overrides[key] = merged
+            config["overrides"] = overrides
+            save_custom_sfx_config(config)
+            return _sfx_library_payload()
+
+        raise HTTPException(status_code=404, detail=f"音效不存在：{key}")
+
+    @app.post("/api/sfx-library/upload")
+    def upload_sfx_asset(payload: SfxUploadRequest) -> dict[str, Any]:
+        """上传（替换）一个音效素材（Patch v4.38 / v4.43 放开自定义与内置）。
+
+        音频落在 ``assets/sfx/custom/<key>.<ext>``，**用户上传优先于仓库默认**；
+        替换前先删掉同 key 的旧扩展名文件，避免留下两份同名素材。
+        """
+        key = Path(str(payload.sfx_key or "")).name.strip().lower()
+        if not is_valid_sfx_key(key):
+            raise HTTPException(status_code=400, detail=f"不是合法的音效键：{payload.sfx_key}")
+        _sfx_store_uploaded_audio(
+            key,
+            payload.filename,
+            payload.content_base64,
+            ffmpeg_bin=view.config.render.ffmpeg_bin,
+        )
+        return _sfx_library_payload()
+
+    @app.delete("/api/sfx-library/{sfx_key}")
+    def delete_sfx_asset(
+        sfx_key: str,
+        mode: Literal["delete", "restore_audio", "disable"] = Query("delete"),
+    ) -> dict[str, Any]:
+        """删除 / 还原 / 停用一个音效（Patch v4.43）。
+
+        * ``mode=delete``（默认）：删除**自定义**条目（连同它的音频）；
+          内置条目不能直接删，请改用 ``disable`` 或 ``restore_audio``；
+        * ``mode=restore_audio``：删掉用户上传的音频，还原仓库默认素材；
+        * ``mode=disable``：把内置音效停用（不再出现在生效曲库里，随时可还原）。
+        """
+        key = Path(str(sfx_key or "")).name.strip().lower()
+        config = load_custom_sfx_config()
+        builtin_keys = {entry["key"] for entry in SFX_CUE_CATALOG}
+        is_custom = any(item["key"] == key for item in config["custom"])
+
+        if mode == "restore_audio":
+            removed = _remove_sfx_custom_audio(key)
+            _SFX_DURATION_CACHE.clear()
+            return {
+                **_sfx_library_payload(),
+                "message": (
+                    f"已还原 {key} 的默认素材"
+                    if removed
+                    else f"{key} 没有用户上传的素材，无需还原"
+                ),
+            }
+
+        if mode == "disable":
+            if key not in builtin_keys and not is_custom:
+                raise HTTPException(status_code=404, detail=f"音效不存在：{key}")
+            hidden = list(config["hidden"])
+            if key not in hidden:
+                hidden.append(key)
+            config["hidden"] = hidden
+            save_custom_sfx_config(config)
+            return {**_sfx_library_payload(), "message": f"已停用音效：{key}"}
+
+        if not is_custom:
+            if key in builtin_keys:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"内置音效不能直接删除：{key}。"
+                        "可用 ?mode=disable 停用，或 ?mode=restore_audio 还原自定义音频。"
+                    ),
+                )
+            raise HTTPException(status_code=404, detail=f"音效不存在：{key}")
+
+        config["custom"] = [item for item in config["custom"] if item["key"] != key]
+        save_custom_sfx_config(config)
+        _remove_sfx_custom_audio(key)
+        _SFX_DURATION_CACHE.clear()
+        return {**_sfx_library_payload(), "message": f"已删除自定义音效：{key}"}
+
+    @app.post("/api/sfx-library/{sfx_key}/restore")
+    def restore_sfx_asset(sfx_key: str) -> dict[str, Any]:
+        """把已停用的内置音效重新启用（Patch v4.43）。"""
+        key = Path(str(sfx_key or "")).name.strip().lower()
+        config = load_custom_sfx_config()
+        if key not in config["hidden"]:
+            raise HTTPException(status_code=404, detail=f"音效没有被停用：{key}")
+        config["hidden"] = [item for item in config["hidden"] if item != key]
+        save_custom_sfx_config(config)
+        return {**_sfx_library_payload(), "message": f"已恢复音效：{key}"}
 
     @app.delete("/api/series/{series_id}/bgm-library/{filename}")
     def delete_bgm_track(series_id: str, filename: str) -> dict[str, Any]:

@@ -154,6 +154,8 @@ FIELD_LOCKS: list[tuple[type, tuple[str, ...]]] = [
             "speed_override",
             # Patch v4.13：这条解说归属的镜头组（幕）（默认 None = 尚未归属）
             "scene_id",
+            # Patch v4.43：AI 音效建议（默认空列表 = 无建议）
+            "sfx_suggestions",
         ),
     ),
     (

@@ -39,6 +39,7 @@ import type {
   ScriptUpdateResponse,
   SeriesCleanupResponse,
   SeriesItem,
+  SfxLibraryResponse,
   StageId,
   StageStatus,
   StudioConfig,
@@ -48,6 +49,7 @@ import { CatalogView } from './components/CatalogView';
 import { EpisodeStudioView } from './components/EpisodeStudioView';
 import { ConfigDictView } from './components/ConfigDictView';
 import { MemoryView } from './components/MemoryView';
+import { SfxLibraryView } from './components/SfxLibraryView';import { fetchSfxLibrary } from './api/studioApi';
 import {
   getDesktopNotificationPermission,
   loadRenderNotifyPrefs,
@@ -61,7 +63,7 @@ import {
 } from './utils/notifications';
 import { formatBytes } from './utils/format';
 
-type NavView = 'catalog' | 'studio' | 'memory' | 'config';
+type NavView = 'catalog' | 'studio' | 'memory' | 'config' | 'sfx';
 
 const STAGE_ORDER: StageId[] = [
   's0_catalog',
@@ -397,6 +399,13 @@ export default function App() {
   };
   const [config, setConfig] = useState<StudioConfig | null>(null);
   const [rules, setRules] = useState<PronunciationRule[]>([]);
+  /**
+   * Patch v4.43：全局音效曲库。
+   *
+   * 由 App 统一持有，「音效资源库」页增删改后回传最新曲库，
+   * 审核台与送音标签浮层共用这一份，避免各处各拉一次导致不同步。
+   */
+  const [sfxLibrary, setSfxLibrary] = useState<SfxLibraryResponse | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [showAddSeries, setShowAddSeries] = useState(false);
   const [newSeriesTitle, setNewSeriesTitle] = useState('');
@@ -693,6 +702,21 @@ export default function App() {
     return () => {
       window.removeEventListener('pointerdown', unlock, true);
       window.removeEventListener('keydown', unlock, true);
+    };
+  }, []);
+
+  /* Patch v4.43：拉一次全局音效曲库，审核台与标签浮层共用。 */
+  useEffect(() => {
+    let cancelled = false;
+    fetchSfxLibrary()
+      .then((next) => {
+        if (!cancelled) setSfxLibrary(next);
+      })
+      .catch(() => {
+        /* 后端没起来时静默降级：审核台自己会再拉一次 */
+      });
+    return () => {
+      cancelled = true;
     };
   }, []);
 
@@ -1651,6 +1675,20 @@ export default function App() {
             <Sliders className="w-4 h-4 shrink-0" />
             <span className="whitespace-nowrap">百炼配置与多音字</span>
           </button>
+
+          {/* Patch v4.43：音效资源库提升为全局页，不再塞在单话审核台里。 */}
+          <button
+            type="button"
+            onClick={() => setNavView('sfx')}
+            className={`w-full flex items-center gap-2.5 px-3 py-2 text-sm font-medium rounded-lg transition-colors cursor-pointer ${
+              navView === 'sfx'
+                ? 'bg-slate-900 text-white'
+                : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
+            }`}
+          >
+            <Volume2 className="w-4 h-4 shrink-0" />
+            <span className="whitespace-nowrap">音效资源库</span>
+          </button>
         </nav>
 
         {/* Quick Episode Switcher */}
@@ -1716,6 +1754,8 @@ export default function App() {
                 ? '四层跨话记忆库（StoryBible v2）'
                 : navView === 'config'
                 ? '阿里云百炼模型与多音字词典'
+                : navView === 'sfx'
+                ? '全局音效资源库'
                 : activeEpisode?.title ?? '未选择话次'}
             </span>
             {navView === 'studio' && activeEpisode?.archived && (
@@ -1895,7 +1935,12 @@ export default function App() {
               onExportEpisode={handleExportEpisode}
               onCleanupIntermediates={handleCleanupIntermediates}
               onRegenerateBeatTts={handleRegenerateBeatTts}
+              sfxLibraryItems={sfxLibrary?.items ?? []}
             />
+          )}
+
+          {booted && navView === 'sfx' && (
+            <SfxLibraryView library={sfxLibrary} onLibraryChange={setSfxLibrary} />
           )}
 
           {booted && activeSeries && navView === 'memory' && (

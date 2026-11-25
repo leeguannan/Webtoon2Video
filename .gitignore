@@ -27,3 +27,7 @@ workspace/
 
 # ===== 本机实例配置（含本机绝对路径，模板见 backend/config.example.yaml）=====
 backend/config.yaml
+
+# ===== 用户自定义音效注册表与上传音频（运行时用户数据，属本机状态）=====
+backend/assets/sfx/custom_sfx.json
+backend/assets/sfx/custom/

@@ -55,3 +55,78 @@ export async function uploadSfxAsset(
 export function sfxFileUrl(sfxKey: string): string {
   return `${API_BASE}/sfx-file/${encodeURIComponent(sfxKey)}`;
 }
+
+/* ------------------------------------------------------------------ */
+/* Patch v4.43：全局音效资源库（新增 / 改元数据 / 上传替换 / 删除还原）  */
+/* ------------------------------------------------------------------ */
+
+/** 新增自定义音效时提交的内容（音频可为空 = 先只登记元数据）。 */
+export interface SfxAssetDraft {
+  /** 音效键（后端校验 ^[a-z][a-z0-9_]{1,39}$ 且不与已有条目冲突）。 */
+  key: string;
+  /** 中文名。 */
+  label: string;
+  /** 一级大类（动作 / 环境 / 转场 / 道具）。 */
+  group: string;
+  /** 细分类（自由文本）。 */
+  category: string;
+  /** 缺素材时的兜底音效键（可空）。 */
+  fallback_key?: string;
+  /** 原始文件名（可空）。 */
+  filename?: string;
+  /** 音频内容的 base64（可空）。 */
+  content_base64?: string;
+}
+
+/** 可修改的元数据字段（全部可选，只传要改的）。 */
+export interface SfxAssetMetaPatch {
+  label?: string;
+  group?: string;
+  category?: string;
+  fallback_key?: string;
+}
+
+/** 新增一个自定义音效，返回刷新后的曲库。 */
+export async function createSfxAsset(draft: SfxAssetDraft): Promise<SfxLibraryResponse> {
+  return request<SfxLibraryResponse>('/sfx-library', {
+    method: 'POST',
+    body: JSON.stringify(draft),
+  });
+}
+
+/** 改一个音效的元数据（中文名 / 大类 / 细类 / 兜底），返回刷新后的曲库。 */
+export async function updateSfxAsset(
+  sfxKey: string,
+  patch: SfxAssetMetaPatch,
+): Promise<SfxLibraryResponse> {
+  return request<SfxLibraryResponse>(`/sfx-library/${encodeURIComponent(sfxKey)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  });
+}
+
+/**
+ * 删除一个音效。
+ *
+ * - 自定义音效：移出曲库并删掉音频文件；
+ * - 内置音效：`mode='restore_audio'` 还原成仓库默认素材，
+ *   `mode='disable'` 把它停用（不再出现在曲库里）。
+ */
+export async function deleteSfxAsset(
+  sfxKey: string,
+  mode?: 'restore_audio' | 'disable',
+): Promise<SfxLibraryResponse> {
+  const query = mode ? `?mode=${encodeURIComponent(mode)}` : '';
+  return request<SfxLibraryResponse>(
+    `/sfx-library/${encodeURIComponent(sfxKey)}${query}`,
+    { method: 'DELETE' },
+  );
+}
+
+/** 还原一个被停用的内置音效，返回刷新后的曲库。 */
+export async function restoreSfxAsset(sfxKey: string): Promise<SfxLibraryResponse> {
+  return request<SfxLibraryResponse>(
+    `/sfx-library/${encodeURIComponent(sfxKey)}/restore`,
+    { method: 'POST' },
+  );
+}

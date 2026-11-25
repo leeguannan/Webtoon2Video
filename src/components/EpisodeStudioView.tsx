@@ -51,7 +51,6 @@ import type {
   ScriptSaveOutcome,
   SeriesTtsConfigResponse,
   SfxLibraryItem,
-  SfxPosition,
   StageId,
   StoryboardScene,
   StudioConfig,
@@ -70,11 +69,17 @@ import {
 } from './VoicePicker';
 import { StoryboardEditor } from './StoryboardEditor';
 import { TtsTagPicker } from './TtsTagPicker';
-import SfxExplorerTab from './SfxExplorerTab';
 import BgmLibraryDrawer from './BgmLibraryDrawer';
 
 interface EpisodeStudioViewProps {
   episode: EpisodeItem;
+  /**
+   * Patch v4.43：全局音效资源库的最新曲库（由 App 统一下发）。
+   *
+   * 用户在「音效资源库」页新增 / 改名 / 删除音效后，审核台里的
+   * 音效建议栏与标签浮层要立刻用上新曲库，不必刷新页面。
+   */
+  sfxLibraryItems?: SfxLibraryItem[];
   seriesId: string;
   config: StudioConfig;
   rules: PronunciationRule[];
@@ -271,7 +276,7 @@ const buildCharacterSyncGroups = (
  * 放在 script 之后而不是最末尾，是因为「给这一句加音效」是解说审核的
  * 配套动作，用户在审核台改完字就应该能顺手去曲库里挑一个音效。
  */
-type StudioTab = 'panels' | 'storyboard' | 'script' | 'sfx' | 'timeline' | 'preview';
+type StudioTab = 'panels' | 'storyboard' | 'script' | 'timeline' | 'preview';
 
 /** 单话流水线顺序（S1 ~ S7）；S0 是作品级，不参与「向后清理」。 */
 const STAGE_SEQUENCE: StageId[] = [
@@ -379,11 +384,6 @@ const MOTION_LABELS: Record<CameraMotion, string> = {
  *
  * 这是「整句级」的粗锚点；句中精确落点用送音文本里的 `[sfx:key]` 内联标签。
  */
-const SFX_POSITION_OPTIONS: { value: SfxPosition; label: string }[] = [
-  { value: 'start', label: '首' },
-  { value: 'mid', label: '中' },
-  { value: 'end', label: '尾' },
-];
 
 // Patch v4.31：下拉里**推荐**的动效清单——竖扫（pan_down / pan_up）已从自动
 // 链路下线，默认不再展示，避免用户被推荐一个系统不会再自动分配的动作。
@@ -887,17 +887,21 @@ interface ScriptBeatRowProps {
   highlight?: boolean;
   /** Patch v4.38：音效曲库（24 个标准键 + 盘面可用情况）。 */
   sfxLibrary?: SfxLibraryItem[];
-  /** Patch v4.38：改这一句的音效提示（传 null = 清空）。 */
-  onChangeSfxCue?: (beatId: string, sfxKey: string | null) => void;
-  /** Patch v4.40：改这一句的音效落点（首 / 中 / 尾）。 */
-  onChangeSfxPosition?: (beatId: string, position: SfxPosition) => void;
   /**
-   * Patch v4.42：送音文本框被聚焦 / 光标移动时上报。
+   * Patch v4.43：点「AI 音效建议」里的某个建议 → 把 `[sfx:key]` 插进这句送音文本。
    *
-   * 音效资源管理器要知道自己该往哪一句的哪个位置插 `[sfx:key]`，
-   * 唯一的可靠来源就是「用户在解说台最后碰的是哪一句、光标在哪」。
+   * `legacy=true` 表示这条建议来自历史遗留的整句级 `sfx_cue`，
+   * 插入后要把那个旧字段清掉（否则会响两次）。
    */
-  onTtsActivate?: (beatId: string, start: number, end: number) => void;
+  onApplySfxSuggestion?: (
+    beatId: string,
+    key: string,
+    reason: string,
+    anchorText: string,
+    legacy: boolean
+  ) => void;
+  /** Patch v4.43：点已插入的音效标签 → 从这句送音文本里移除它。 */
+  onRemoveSfxTag?: (beatId: string, key: string) => void;
   onChangeScene: (beatId: string, sceneId: string | null) => void;
   onToggleTagPicker: (beatId: string) => void;
   onPickTag: (beatId: string, snippet: string) => void;
@@ -907,6 +911,173 @@ interface ScriptBeatRowProps {
   onDelete: (beatId: string) => void;
   onZoom: (beatId: string) => void;
 }
+
+/**
+ * Patch v4.43：句内音效标签的解析（与后端 core.normalize 的 INLINE_SFX_TAG_RE 同形）。
+ *
+ * 只用来判断「这句送音文本里已经有哪些 [sfx:key]」，不参与任何写入逻辑。
+ */
+const INLINE_SFX_TAG_PATTERN = /\[\s*sfx\s*:\s*([a-zA-Z0-9_-]+)\s*\]/g;
+
+function inlineSfxKeys(text: string): string[] {
+  const keys: string[] = [];
+  if (!text) return keys;
+  for (const match of text.matchAll(INLINE_SFX_TAG_PATTERN)) {
+    const key = match[1]?.trim().toLowerCase() ?? '';
+    if (key && !keys.includes(key)) keys.push(key);
+  }
+  return keys;
+}
+
+interface SfxSuggestionBarProps {
+  beat: ScriptBeat;
+  sfxLibrary?: SfxLibraryItem[];
+  onApply?: (
+    beatId: string,
+    key: string,
+    reason: string,
+    anchorText: string,
+    legacy: boolean
+  ) => void;
+  onRemove?: (beatId: string, key: string) => void;
+  onPreview?: (sfxKey: string) => void;
+}
+
+/**
+ * Patch v4.43：「AI 音效建议栏」。
+ *
+ * 方案 B 之后音效只有一条入口（送音文本里的 `[sfx:key]` 标签），
+ * 审核台不再有整句级的音效下拉；这一栏把**可用的候选**摆在每句下面：
+ *
+ * - 模型自己给的建议（`source="llm"`）；
+ * - 后端按台词关键词 / 画面拟声词 / 切幕语境补的建议（`source="context_rule"`）；
+ * - 历史遗留的整句级 `sfx_cue`（标注「历史」，插入后会自动清掉那个旧字段）。
+ *
+ * 点标签 = 把 `[sfx:key]` 插进这句送音文本（光标处 → 触发词前 → 句末）；
+ * 已经插进去的标签显示 `✓`，再点一次即移除。
+ */
+const SfxSuggestionBar = React.memo(function SfxSuggestionBar({
+  beat,
+  sfxLibrary,
+  onApply,
+  onRemove,
+  onPreview,
+}: SfxSuggestionBarProps) {
+  const libraryMap = useMemo(() => {
+    const map = new Map<string, SfxLibraryItem>();
+    for (const item of sfxLibrary ?? []) map.set(item.key, item);
+    return map;
+  }, [sfxLibrary]);
+
+  const suggestions = useMemo(() => {
+    const present = inlineSfxKeys(beat.tts_text ?? '');
+    const list: Array<{
+      key: string;
+      reason: string;
+      anchorText: string;
+      legacy: boolean;
+      present: boolean;
+    }> = [];
+    const seen = new Set<string>();
+    for (const item of beat.sfx_suggestions ?? []) {
+      const key = (item?.key ?? '').trim().toLowerCase();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      list.push({
+        key,
+        reason: item.reason ?? '',
+        anchorText: item.anchor_text ?? '',
+        legacy: false,
+        present: present.includes(key),
+      });
+    }
+    const legacy = (beat.sfx_cue ?? '').trim().toLowerCase();
+    if (legacy && !seen.has(legacy)) {
+      seen.add(legacy);
+      list.push({
+        key: legacy,
+        reason: '历史音效（整句级）',
+        anchorText: '',
+        legacy: true,
+        present: present.includes(legacy),
+      });
+    }
+    // 已经写进送音文本里的标签一律补进列表：否则「历史音效」被插入并清空
+    // sfx_cue 之后，这一条就从栏里消失了，用户再也点不到它、也没法一键移除。
+    for (const key of present) {
+      if (seen.has(key)) continue;
+      seen.add(key);
+      list.push({
+        key,
+        reason: '已写入送音文本的音效标签',
+        anchorText: '',
+        legacy: false,
+        present: true,
+      });
+    }
+    return list;
+  }, [beat.sfx_suggestions, beat.sfx_cue, beat.tts_text]);
+
+  if (suggestions.length === 0) return null;
+
+  return (
+    <div className="mt-1 flex flex-wrap items-center gap-1">
+      <span className="shrink-0 text-[10px] text-slate-400">音效建议</span>
+      {suggestions.map((item) => {
+        const meta = libraryMap.get(item.key);
+        const title = [
+          item.reason,
+          meta ? `中文名：${meta.label}` : '',
+          item.legacy ? '这是历史遗留的整句级音效，插入后会清掉旧字段' : '',
+          item.present ? '已插入，点一下移除' : '点一下插入到这句送音文本',
+        ]
+          .filter(Boolean)
+          .join(' · ');
+        return (
+          <span
+            key={item.key}
+            className={`inline-flex items-center gap-0.5 rounded-md border px-1.5 py-0.5 text-[10px] ${
+              item.present
+                ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                : 'border-blue-200 bg-blue-50 text-blue-700'
+            }`}
+          >
+            <button
+              type="button"
+              onClick={() =>
+                item.present
+                  ? onRemove?.(beat.beat_id, item.key)
+                  : onApply?.(
+                      beat.beat_id,
+                      item.key,
+                      item.reason,
+                      item.anchorText,
+                      item.legacy
+                    )
+              }
+              aria-label={`${beat.beat_id} ${item.present ? '移除' : '插入'}音效 ${item.key}`}
+              title={title}
+              className="font-mono hover:underline"
+            >
+              {item.present ? '✓ ' : ''}[sfx:{item.key}]
+            </button>
+            {meta && <span className="text-slate-500">{meta.label}</span>}
+            <button
+              type="button"
+              onClick={() => onPreview?.(item.key)}
+              disabled={!meta?.available}
+              aria-label={`${beat.beat_id} 试听音效 ${item.key}`}
+              title={meta?.available ? '试听这个音效' : '盘面暂无该音效素材'}
+              className="shrink-0 flex items-center justify-center text-slate-500 hover:text-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <Volume2 className="w-3 h-3" />
+            </button>
+          </span>
+        );
+      })}
+    </div>
+  );
+});
 
 /**
  * Patch v4.25：审核表的一行（独立 memo 子组件）。
@@ -948,9 +1119,8 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
     onAddPanelAt,
     highlight,
     sfxLibrary,
-    onChangeSfxCue,
-    onChangeSfxPosition,
-    onTtsActivate,
+    onApplySfxSuggestion,
+    onRemoveSfxTag,
     onChangeScene,
     onToggleTagPicker,
     onPickTag,
@@ -965,30 +1135,7 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
     () => roleOptionsForBeat(beat, seriesTts, roleNames),
     [beat, seriesTts, roleNames]
   );
-  /* Patch v4.38：音效曲库按分类分组；「usedFallback」= 盘面没有该键的素材，
-     实际回源用了兜底音效（前端要标出来，别让人以为听到的是原音效）。 */
-  const sfxGroups = useMemo(() => {
-    const groups: Array<{
-      category: string;
-      items: Array<SfxLibraryItem & { usedFallback: boolean }>;
-    }> = [];
-    const byCategory = new Map<string, Array<SfxLibraryItem & { usedFallback: boolean }>>();
-    for (const item of sfxLibrary ?? []) {
-      const usedFallback =
-        item.resolved_filename !== '' &&
-        !item.resolved_filename.startsWith(item.key);
-      const enriched = { ...item, usedFallback };
-      const bucket = byCategory.get(item.category);
-      if (bucket) bucket.push(enriched);
-      else byCategory.set(item.category, [enriched]);
-    }
-    for (const [category, items] of byCategory) {
-      groups.push({ category, items });
-    }
-    return groups;
-  }, [sfxLibrary]);
-  const currentSfx = (sfxLibrary ?? []).find((item) => item.key === (beat.sfx_cue ?? ''));
-  const currentSfxPlayable = Boolean(currentSfx?.available);
+  /* Patch v4.43：音效建议栏与标签浮层共用的试听入口（全局单一 Audio 实例）。 */
   const previewSfx = useCallback((sfxKey: string) => {
     if (!sfxKey) return;
     playSfxPreview(sfxFileUrl(sfxKey));
@@ -1078,9 +1225,8 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
       };
       /* Patch v4.42：同时上报「用户在解说台最后碰的是哪一句、光标在哪」，
          音效资源管理器据此决定 `[sfx:key]` 插到哪一句的哪个位置。 */
-      onTtsActivate?.(beat.beat_id, el.selectionStart, el.selectionEnd);
     },
-    [beat.beat_id, ttsSelections, onTtsActivate]
+    [beat.beat_id, ttsSelections]
   );
 
   const charLen = beat.narration_text.trim().length;
@@ -1253,11 +1399,11 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
                   <button
                     type="button"
                     onClick={() => onToggleTagPicker(beat.beat_id)}
-                    aria-label={`${beat.beat_id} 插入语气 / 停顿 / 音效标签`}
+                    aria-label={`${beat.beat_id} 插入标签 / 音效`}
                     title="插入 MiniMax 语气词（如 (laughs)）、句中停顿（如 <#0.5#>）或句中音效（如 [sfx:slap]）"
-                    className="rounded-md border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-600 hover:border-blue-400 hover:text-blue-700 transition-colors"
+                    className="rounded-md border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-600 hover:border-blue-400 hover:text-blue-700 transition-colors whitespace-nowrap shrink-0"
                   >
-                    + 语气 / 停顿 / 音效标签
+                    + 标签 / 音效
                   </button>
                   <button
                     type="button"
@@ -1291,9 +1437,6 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
               type="button"
               onClick={() => {
                 setTtsExpanded(true);
-                /* Patch v4.42：点开这一句的送音编辑 = 用户正在处理这一句，
-                   音效资源管理器默认就往这里插标签。 */
-                onTtsActivate?.(beat.beat_id, 0, 0);
               }}
               title="展开送音文本编辑"
               aria-label={`${beat.beat_id} 展开送音文本编辑`}
@@ -1340,6 +1483,16 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
             )}
           </div>
         )}
+        {/* Patch v4.43：AI 音效建议栏。折叠 / 展开态都可见——
+            建议来自模型（llm）、后端上下文规则（context_rule）与历史遗留的
+            整句级 sfx_cue；点一下即把 [sfx:key] 插进这句送音文本。 */}
+        <SfxSuggestionBar
+          beat={beat}
+          sfxLibrary={sfxLibrary}
+          onApply={onApplySfxSuggestion}
+          onRemove={onRemoveSfxTag}
+          onPreview={previewSfx}
+        />
       </td>
 
       <td className="py-3.5 px-3">
@@ -1555,71 +1708,6 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
               </button>
             )}
           </div>
-          {/* Patch v4.38：本句音效提示（sfx_cue）——下拉选 24 个标准音效之一，
-              紧邻一个试听按钮；盘面缺素材时会标注「·通用兜底」。 */}
-          <div className="flex items-center gap-1 pt-1">
-            <span className="shrink-0 text-[10px] text-slate-400">音效</span>
-            <select
-              value={beat.sfx_cue ?? ''}
-              onChange={(e) =>
-                onChangeSfxCue?.(beat.beat_id, e.target.value || null)
-              }
-              aria-label={`${beat.beat_id} 音效`}
-              title="这一句的音效提示；保存后从 S6 重跑即可生效"
-              className="min-w-0 flex-1 px-2 py-1 text-[11px] bg-white border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
-            >
-              <option value="">无音效</option>
-              {sfxGroups.map((group) => (
-                <optgroup key={group.category} label={group.category}>
-                  {group.items.map((item) => (
-                    <option key={item.key} value={item.key}>
-                      {item.label}
-                      {item.usedFallback ? '·通用兜底' : ''}
-                    </option>
-                  ))}
-                </optgroup>
-              ))}
-            </select>
-            <button
-              type="button"
-              onClick={() => previewSfx(beat.sfx_cue ?? '')}
-              disabled={!beat.sfx_cue || !currentSfxPlayable}
-              aria-label={`${beat.beat_id} 试听当前音效`}
-              title={
-                beat.sfx_cue
-                  ? currentSfxPlayable
-                    ? '试听这一句的音效素材'
-                    : '盘面暂无该音效素材'
-                  : '这一句还没有选音效'
-              }
-              className="shrink-0 w-5 h-5 flex items-center justify-center rounded border border-slate-200 bg-white text-slate-500 hover:border-slate-400 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              <Volume2 className="w-3 h-3" />
-            </button>
-            {/* Patch v4.40：音效落点（首 / 中 / 尾）——只有选中音效时才可点。 */}
-            <div className="flex shrink-0 items-center gap-0.5">
-              {SFX_POSITION_OPTIONS.map((option) => {
-                const active = (beat.sfx_position ?? 'start') === option.value;
-                return (
-                  <button
-                    key={option.value}
-                    type="button"
-                    disabled={!beat.sfx_cue}
-                    onClick={() => onChangeSfxPosition?.(beat.beat_id, option.value)}
-                    aria-label={`${beat.beat_id} 音效落点${option.label}`}
-                    title={beat.sfx_cue ? `音效落在句${option.label}` : '先给这一句选一个音效'}
-                    className={`w-4 h-4 flex items-center justify-center rounded border text-[10px] leading-none transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
-                      active
-                        ? 'border-blue-300 bg-blue-50 text-blue-700'
-                        : 'border-slate-200 bg-white text-slate-500 hover:border-slate-400 hover:text-slate-800'
-                    }`}
-                  >
-                    {option.label}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
         </div>
       </td>
 
@@ -1711,6 +1799,7 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
 
 export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   episode,
+  sfxLibraryItems,
   seriesId,
   config,
   rules,
@@ -2037,21 +2126,26 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
    * 这个提示把「改了几句、保存后要重跑什么」一次说清。
    */
   const [multiPanelHint, setMultiPanelHint] = useState('');
-  /* Patch v4.38：音效曲库（24 个标准键 + 盘面可用情况）。 */
-  const [sfxLibrary, setSfxLibrary] = useState<SfxLibraryItem[]>([]);
+  /* Patch v4.38：音效曲库（24 个标准键 + 盘面可用情况）。
+     Patch v4.43：曲库改为全局统一管理（App 持有），这里只保留一份兜底自取，
+     外部没给时自己拉一次；外部给了就以外部为准（资源库改完立刻同步）。 */
+  const [ownSfxLibrary, setOwnSfxLibrary] = useState<SfxLibraryItem[]>([]);
   useEffect(() => {
+    if (sfxLibraryItems && sfxLibraryItems.length > 0) return;
     let cancelled = false;
     fetchSfxLibrary()
       .then((data) => {
-        if (!cancelled) setSfxLibrary(data.items ?? []);
+        if (!cancelled) setOwnSfxLibrary(data.items ?? []);
       })
       .catch(() => {
-        /* 音效曲库拉不到不阻塞审核台：下拉退化成只有「无音效」 */
+        /* 音效曲库拉不到不阻塞审核台：建议栏退化成空 */
       });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [sfxLibraryItems]);
+  const sfxLibrary =
+    sfxLibraryItems && sfxLibraryItems.length > 0 ? sfxLibraryItems : ownSfxLibrary;
   // ---- Patch v4.35：审核台命令栏的本地派生状态 ----
   /** 即时搜索框的关键词（beat_id / 字幕 / 角色 / 目标分镜）。 */
   const [scriptQuery, setScriptQuery] = useState('');
@@ -2119,16 +2213,6 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   const ttsTextareaRefs = useRef<Record<string, HTMLTextAreaElement | null>>({});
   /** 每条分镜最近一次的选区 {start, end}。 */
   const ttsSelections = useRef<Record<string, { start: number; end: number }>>({});
-  /**
-   * Patch v4.42：解说台里「用户最后碰过的送音文本框」。
-   *
-   * 音效资源管理器（sfx 标签页）要决定 `[sfx:key]` 插到哪一句，
-   * 唯一可靠来源就是用户在解说台最后一次点开的句子；
-   * 没碰过就退回草稿里的第一句。
-   */
-  const [activeTtsBeatId, setActiveTtsBeatId] = useState<string | null>(null);
-  /** Patch v4.42：资源管理器里「光标在第几个字符」（用于插入位置与锚点预览）。 */
-  const [sfxCaret, setSfxCaret] = useState(0);
 
   // ---- Patch v4.8：重跑前草稿防残留保护 ----
   /** 句间停顿被改动过：必须先重建时间轴（S6）再出片，跳过 S6 会吃到旧停顿。 */
@@ -2192,6 +2276,17 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     setVideoTimeMs(0);
     setIsPlayingVideo(false);
   }, [episode.episode_id, episode.beats, episode.panels]);
+
+  /**
+   * Patch v4.42.1：话次切换 → 清掉音效资源管理器的目标句与光标。
+   *
+   * `ttsSelections` 记的是「解说台里用户最后碰过的那一句与光标」，
+   * 语义上**只对当前话次成立**。不清理的话，换话后会把上一话的选区带过来，
+   * 插入音效标签时落点全错。
+   */
+  useEffect(() => {
+    ttsSelections.current = {};
+  }, [episode.episode_id]);
 
   /**
    * Patch v4.39：镜头编排到位后，把草稿按「幕归属」排一次。
@@ -3984,56 +4079,28 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   }, [markTableDirty]);
 
   /**
-   * Patch v4.38：改这一句的音效提示。
+   * Patch v4.43：把一条**音效建议**应用到这句解说。
    *
-   * 置空时传 `null`（后端 `NULLABLE_BEAT_FIELDS` 含 sfx_cue，传 null 才是
-   * 真的清空，传空串会被当成「不改」继承旧值）。
-   */
-  const handleRowChangeSfxCue = useCallback(
-    (beatId: string, sfxKey: string | null) => {
-      updateBeatField(beatId, 'sfx_cue', sfxKey);
-    },
-    [updateBeatField]
-  );
-
-  /**
-   * Patch v4.40：改这一句的音效落点（首 / 中 / 尾）。
+   * 插入位置的优先级：
+   * 1. 用户在送音文本框里最后碰过的光标位置；
+   * 2. 建议自带的触发词 `anchor_text` 之前；
+   * 3. 句末。
    *
-   * 落点由 Stage 6 排音效事件时按这一句的音频时长算出，
-   * 所以只重跑 S6~S7（不用重跑配音）。
-   */
-  const handleRowChangeSfxPosition = useCallback(
-    (beatId: string, position: SfxPosition) => {
-      updateBeatField(beatId, 'sfx_position', position);
-    },
-    [updateBeatField]
-  );
-
-  /**
-   * Patch v4.42：解说台里「用户最后碰过的送音文本框」。
-   *
-   * 音效资源管理器要知道 `[sfx:key]` 该插到哪一句的哪个位置，
-   * 唯一可靠来源就是用户在解说台最后一次点开的句子与光标位置。
-   */
-  const handleTtsActivate = useCallback(
-    (beatId: string, start: number, end: number) => {
-      setActiveTtsBeatId(beatId);
-      setSfxCaret(start);
-      ttsSelections.current[beatId] = { start, end };
-    },
-    []
-  );
-
-  /**
-   * Patch v4.42：把 `[sfx:key]` 应用到目标句的光标处。
-   *
-   * 底本口径与资源管理器显示的那份文本一致：
-   * 送音文本非空 → 用送音文本；送音文本留空 → 用字幕原文当底本
+   * 底本口径：送音文本非空 → 用送音文本；送音文本留空 → 用字幕原文当底本
    * （标签必须跟着整句一起写进 tts_text，否则这一句就只剩一个孤零零的标签）。
+   *
+   * `legacy=true`（这条建议来自历史整句级 `sfx_cue`）→ 顺手把旧字段清掉，
+   * 否则同一句会响两次。
    */
-  const handleApplySfxFromExplorer = useCallback(
-    (sfxKey: string, targetBeatId: string) => {
-      const beat = draftBeatsRef.current.find((b) => b.beat_id === targetBeatId);
+  const handleApplySfxSuggestion = useCallback(
+    (
+      beatId: string,
+      sfxKey: string,
+      reason: string,
+      anchorText: string,
+      legacy: boolean
+    ) => {
+      const beat = draftBeatsRef.current.find((b) => b.beat_id === beatId);
       if (!beat) return;
       const snippet = `[sfx:${sfxKey}]`;
       const current = (beat.tts_text ?? '').trim();
@@ -4042,54 +4109,51 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         setSaveHint('这一句既没有送音文本也没有字幕原文，插不了音效标签。');
         return;
       }
-      const at = Math.max(0, Math.min(sfxCaret, base.length));
+      const caret = ttsSelections.current[beatId]?.start;
+      let at =
+        typeof caret === 'number' && caret >= 0 && caret <= base.length ? caret : -1;
+      if (at < 0 && anchorText) {
+        const anchorIndex = base.indexOf(anchorText);
+        if (anchorIndex >= 0) at = anchorIndex;
+      }
+      if (at < 0) at = base.length;
       const next = `${base.slice(0, at)}${snippet}${base.slice(at)}`;
-      updateBeatField(targetBeatId, 'tts_text', next);
-      ttsSelections.current[targetBeatId] = {
+      updateBeatField(beatId, 'tts_text', next);
+      if (legacy) {
+        // 旧字段要真清空：后端 NULLABLE_BEAT_FIELDS 含 sfx_cue，传 null 才是清空。
+        updateBeatField(beatId, 'sfx_cue', null);
+      }
+      ttsSelections.current[beatId] = {
         start: at + snippet.length,
         end: at + snippet.length,
       };
-      setSfxCaret(at + snippet.length);
       setSaveHint(
-        `已在 ${targetBeatId} 插入 ${snippet}；保存后从 Stage 5 重跑配音才会生效。`
+        `已在 ${beatId} 插入 ${snippet}` +
+          (reason ? `（${reason}）` : '') +
+          '；保存后从 Stage 5 重跑配音才会生效。'
       );
-    },
-    [sfxCaret, updateBeatField]
-  );
-
-  /** Patch v4.42：资源管理器里换目标句时，光标回到该句上次的位置。 */
-  const handleSfxExplorerChangeTarget = useCallback((beatId: string) => {
-    setActiveTtsBeatId(beatId);
-    const saved = ttsSelections.current[beatId];
-    setSfxCaret(saved ? saved.start : 0);
-  }, []);
-
-  /** Patch v4.42：资源管理器里直接编辑目标句的送音文本。 */
-  const handleSfxExplorerChangeTargetText = useCallback(
-    (beatId: string, text: string) => {
-      updateBeatField(beatId, 'tts_text', text);
     },
     [updateBeatField]
   );
 
-  /** Patch v4.42：回解说台并定位到那一句。 */
-  const handleSfxExplorerBackToScript = useCallback(
-    (beatId: string) => {
-      jumpToBeatInScript(beatId);
+  /**
+   * Patch v4.43：移除这句里已经插入的某个音效标签。
+   *
+   * 只删 `[sfx:key]` 这一段标签文本，句子本身一个字不动。
+   */
+  const handleRemoveSfxTag = useCallback(
+    (beatId: string, sfxKey: string) => {
+      const beat = draftBeatsRef.current.find((b) => b.beat_id === beatId);
+      if (!beat) return;
+      const pattern = new RegExp(`\\[\\s*sfx\\s*:\\s*${sfxKey}\\s*\\]`, 'gi');
+      const next = (beat.tts_text ?? '').replace(pattern, '');
+      updateBeatField(beatId, 'tts_text', next);
+      setSaveHint(
+        `已从 ${beatId} 移除 [sfx:${sfxKey}]；保存后从 Stage 5 重跑配音才会生效。`
+      );
     },
-    [jumpToBeatInScript]
+    [updateBeatField]
   );
-
-  /** Patch v4.42：保存脚本并从 Stage 5 重跑配音（音效标签由 S5 决定落点）。 */
-  const handleSfxExplorerSaveAndRerunTts = useCallback(() => {
-    void handleSaveBeats(true);
-  }, [handleSaveBeats]);
-
-  /** Patch v4.42：试听音效素材（复用全局单一 Audio 实例）。 */
-  const handleSfxExplorerPreview = useCallback((sfxKey: string) => {
-    if (!sfxKey) return;
-    playSfxPreview(sfxFileUrl(sfxKey));
-  }, []);
 
   const handleRowChangeScene = useCallback(
     (beatId: string, sceneId: string | null) =>
@@ -4961,10 +5025,6 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                       : `镜头编排 (${storyboardSceneCount})`,
                 },
                 { id: 'script', label: `解说与多音字审核 (${draftBeats.length})` },
-                {
-                  id: 'sfx',
-                  label: `音效资源管理器 (${sfxLibrary.length})`,
-                },
                 { id: 'timeline', label: '时间轴与执行日志' },
                 { id: 'preview', label: '成片动态预览' },
               ] as const
@@ -5864,9 +5924,8 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                                   panelsById={panelMap}
                                   onAddPanelAt={handleRowAddPanelAt}
                                   sfxLibrary={sfxLibrary}
-                                  onChangeSfxCue={handleRowChangeSfxCue}
-                                  onChangeSfxPosition={handleRowChangeSfxPosition}
-                                  onTtsActivate={handleTtsActivate}
+                                  onApplySfxSuggestion={handleApplySfxSuggestion}
+                                  onRemoveSfxTag={handleRemoveSfxTag}
                                   onChangeScene={handleRowChangeScene}
                                   onToggleTagPicker={handleRowToggleTagPicker}
                                   onPickTag={handleRowPickTag}
@@ -5884,26 +5943,6 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                     </section>
                   );
                 })}
-              </div>
-            )}
-
-            {/* TAB 3: 音效资源管理器（Patch v4.42） */}
-            {activeTab === 'sfx' && (
-              <div className="p-5">
-                <SfxExplorerTab
-                  beats={draftBeats}
-                  activeBeatId={activeTtsBeatId}
-                  onChangeActiveBeatId={handleSfxExplorerChangeTarget}
-                  caret={sfxCaret}
-                  onChangeCaret={setSfxCaret}
-                  sfxLibrary={sfxLibrary}
-                  onPreviewSfx={handleSfxExplorerPreview}
-                  onApplySfx={handleApplySfxFromExplorer}
-                  onBackToScript={handleSfxExplorerBackToScript}
-                  onSaveAndRerunTts={handleSfxExplorerSaveAndRerunTts}
-                  onChangeTargetText={handleSfxExplorerChangeTargetText}
-                  busy={savingBeats}
-                />
               </div>
             )}
 
