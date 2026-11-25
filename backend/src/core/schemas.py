@@ -390,11 +390,18 @@ class SfxEvent(BaseModel):
 
     Stage 6 依据 ``ScriptBeat.sfx_cue``（或 ``vision.json`` 里的 ``sfx_list``
     关键词兜底）生成，Stage 7 用它把 ``assets/sfx/<sfx_key>.wav`` 混进成片。
+
+    Patch v4.41：新增 ``source`` 区分**来源**——
+    ``beat`` 是整句级 ``sfx_cue`` 兜底（粗锚点），``inline`` 是句内 ``[sfx:key]``
+    内联标签（毫秒级精确落点）。两者在 Stage 7 走**不同增益档**：内联音效更轻，
+    避免在解说正文中压住人声。旧 timeline.json 没有该字段时按 ``beat`` 处理。
     """
 
     sfx_key: str
     start_ms: int
     gain_db: float = -10.0
+    #: Patch v4.41：音效来源（``beat`` = 整句级兜底，``inline`` = 句内精确落点）。
+    source: Literal["beat", "inline"] = "beat"
 
 
 class RenderTimeline(BaseModel):

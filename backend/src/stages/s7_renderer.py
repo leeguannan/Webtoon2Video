@@ -221,6 +221,13 @@ DEFAULT_SFX_GAIN_DB = -2.0
 #: 配置里的新默认值 -2.0dB 永远不生效。
 _SFX_EVENT_SCHEMA_DEFAULT_GAIN = float(SfxEvent.model_fields["gain_db"].default)
 
+#: Patch v4.41：句内内联音效（``tts_text`` 里的 ``[sfx:key]`` 标签）的默认增益（dB）。
+#:
+#: 为什么内联要更轻：内联音效落在解说正文**中间**，和这一句的人声同段共存；
+#: 整句级音效落在句首/句末，前后是干净的空隙，可以给足音量。两者用同一档
+#: 增益时，内联那声会压住正在念的字，听感「听不清词」。
+DEFAULT_INLINE_SFX_GAIN_DB = -6.0
+
 #: 文件名里不允许出现的字符（Windows/macOS 通用安全集）。
 _UNSAFE_NAME_CHARS = re.compile(r'[\\/:*?"<>|\r\n\t]')
 
@@ -1673,6 +1680,7 @@ def _prepare_audio(
     sfx_events: Sequence[SfxEvent] = (),
     enable_sfx: bool = True,
     sfx_gain_db: float = DEFAULT_SFX_GAIN_DB,
+    inline_sfx_gain_db: float = DEFAULT_INLINE_SFX_GAIN_DB,
     assets_dir: Path | None = None,
     audio_offset_ms: int = 0,
     bgm_fade_in_ms: int = 0,
@@ -1736,6 +1744,9 @@ def _prepare_audio(
             ):
                 # 事件显式给了不同于 schema 默认值的音量就用它，否则以渲染配置为准。
                 gain = float(event_gain)
+            elif str(getattr(event, "source", "beat") or "beat") == "inline":
+                # Patch v4.41：句内内联音效降一档——它和人声同段共存。
+                gain = inline_sfx_gain_db
             sfx_inputs.append(
                 (
                     asset,
@@ -1747,9 +1758,15 @@ def _prepare_audio(
     # Patch 14：显性混音日志——bgm 文件名/增益与 sfx 实际可用数/事件总数一眼可查，
     # 素材缺失或 enable_sfx=False 时 usable 会小于 total，配合上方警告定位漏播音效。
     bgm_label = bgm_path.name if bgm_path is not None else "NONE"
+    inline_count = sum(
+        1
+        for event in (sfx_events or ())
+        if str(getattr(event, "source", "beat") or "beat") == "inline"
+    )
     print(
         f"[s7] 音频混合：bgm={bgm_label} ({float(bgm_gain_db):.1f}dB), "
         f"sfx={len(sfx_inputs)}/{len(tuple(sfx_events or ()))} 条"
+        + (f"（其中内联 {inline_count} 条按 {float(inline_sfx_gain_db):.1f}dB 降档）" if inline_count else "")
     )
 
     args: list[str] = ["-y", "-hide_banner"]
@@ -2497,6 +2514,7 @@ def render_timeline(
     work_dir: Path | None = None,
     enable_sfx: bool = True,
     sfx_gain_db: float = DEFAULT_SFX_GAIN_DB,
+    inline_sfx_gain_db: float = DEFAULT_INLINE_SFX_GAIN_DB,
     assets_dir: Path | None = None,
     # ---- Patch v4.10：x264 编码参数（码率提质）----
     video_preset: str = "medium",
@@ -2536,6 +2554,10 @@ def render_timeline(
     Patch v4.37：新增整片母带——备音之后先 ``_mix_and_master_audio`` 把
     人声 / 闪避后 BGM / 音效混成一条 ``master.wav``（-14 LUFS 两遍 loudnorm），
     分段渲染只按时间窗切片并入，消除分段接缝的动态跳变。
+
+    Patch v4.41：``inline_sfx_gain_db`` 是句内内联音效（``[sfx:key]`` 标签，
+    ``SfxEvent.source == "inline"``）专用的增益档，比 ``sfx_gain_db`` 更轻——
+    内联音效落在解说正文中间，与人声同段共存，整句级音效（句首/句末）不受影响。
     """
     episode_dir = Path(episode_dir).expanduser()
     out_path = Path(out_path).expanduser()
@@ -2594,6 +2616,7 @@ def render_timeline(
         sfx_events=list(timeline.sfx_events or []),
         enable_sfx=enable_sfx,
         sfx_gain_db=sfx_gain_db,
+        inline_sfx_gain_db=inline_sfx_gain_db,
         assets_dir=assets_dir,
         audio_offset_ms=eff_cover_ms,
         bgm_fade_in_ms=bgm_fade_in_ms if branding_on else 0,
@@ -2938,6 +2961,7 @@ def render_episode(
             work_dir=work_dir,
             enable_sfx=settings.render.enable_sfx,
             sfx_gain_db=settings.render.sfx_gain_db,
+            inline_sfx_gain_db=settings.render.inline_sfx_gain_db,
             video_preset=settings.render.video_preset,
             video_crf=settings.render.video_crf,
             video_bitrate=settings.render.video_bitrate,

@@ -47,6 +47,14 @@ const PAUSE_FOOTER_HINT = '停顿标签仅用于句中两段文字之间，不�
 /** Patch v4.40：句中音效 Tab 的底部提示。 */
 const SFX_FOOTER_HINT = '只作用于配音句内落点、不印字幕，保存后重跑 S5 生效';
 
+/**
+ * Patch v4.41：句中音效 Tab 的补充提示——内联音效渲染时单独降一档增益。
+ *
+ * 为什么：内联音效落在解说正文**中间**，与这一句的人声同段共存；
+ * 整句级音效落在句首/句末，前后是干净空隙，可以给足音量。
+ */
+const SFX_GAIN_HINT = '句中音效比整句音效轻一档（默认 -6dB），避免压住正在念的词';
+
 /** 停顿秒数输入的合法形状：整数或最多两位小数（允许 ".5" 写法）。 */
 const PAUSE_INPUT_PATTERN = /^(\d+(\.\d{1,2})?|\.\d{1,2})$/;
 
@@ -324,6 +332,9 @@ export const TtsTagPicker: React.FC<TtsTagPickerProps> = ({
         <p className="text-[11px] leading-4 text-slate-500">
           {tab === 'sfx' ? SFX_FOOTER_HINT : PAUSE_FOOTER_HINT}
         </p>
+        {tab === 'sfx' ? (
+          <p className="mt-0.5 text-[11px] leading-4 text-slate-400">{SFX_GAIN_HINT}</p>
+        ) : null}
       </div>
     </div>
   );

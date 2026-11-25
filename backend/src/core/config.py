@@ -137,6 +137,10 @@ class RenderConfig(_StrictModel):
     #: Patch v3.2 Patch 14：音效增益从 -10dB 提升到 -3.5dB（混前再做 dynaudnorm 峰值归一）。
     #: Patch v4.0 Patch 18：再抬到 -2.0dB，让扇耳光 / 摔碎这类关键音效听得见。
     sfx_gain_db: float = -2.0
+    #: Patch v4.41：**句内内联音效**（``tts_text`` 里的 ``[sfx:key]`` 标签）的增益档。
+    #: 比整句级音效（``sfx_gain_db``）更轻——内联音效落在解说正文中间，
+    #: 与人声同段共存，音量压过解说会让人听不清词，所以单独降一档。
+    inline_sfx_gain_db: float = -6.0
     #: Patch v4.10：x264 编码预设（medium 比 veryfast 画质更好，编码略慢）。
     video_preset: str = "medium"
     #: Patch v4.10：``video_bitrate`` 为空时回落到 CRF 模式的取值。

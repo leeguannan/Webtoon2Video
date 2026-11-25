@@ -125,6 +125,21 @@ SFX_MAX_EVENTS = 8
 #: 也避免和下一句的音效撞在一起。
 SFX_POSITION_TAIL_OFFSET_MS = 150
 
+#: Patch v4.41：两条**内联音效**之间的最小间隔（毫秒）。
+#:
+#: 为什么内联要单独一套间隔：内联音效是 ``tts_text`` 里 ``[sfx:key]`` 标签
+#: 显式编排出来的落点，属于「作者明确想要的点睛」，不能被整句级音效那条
+#: 6000ms 的节流规则连坐挤掉。但也不能同一声响起两次，所以给一条更宽松的
+#: 独立间隔（1200ms）——只要不重叠即可。
+SFX_INLINE_MIN_GAP_MS = 1200
+
+#: Patch v4.41：整句级音效与内联音效之间的「让位」距离（毫秒）。
+#:
+#: 内联音效是显式编排出来的点睛，优先级高于整句级的 ``sfx_cue`` 兜底：
+#: 整句级音效如果落在内联音效附近，就让给内联——否则同一句话里会出现
+#: 两声几乎叠在一起的音效，听感浑浊。
+SFX_INLINE_CROSS_GAP_MS = 2000
+
 #: 保守关键词 → 音效键的兜底映射（只认 Stage 3 明确写出的音效描述）。
 #:
 #: 只在 beat 没写 ``sfx_cue`` 时启用，且必须命中关键词才触发，
@@ -607,33 +622,76 @@ def resolve_sfx_key(
 
 
 def select_sfx_events(
-    candidates: Sequence[tuple[int, str]],
+    candidates: Sequence[tuple[int, str] | tuple[int, str, str]],
     *,
     min_gap_ms: int = SFX_MIN_GAP_MS,
     max_events: int = SFX_MAX_EVENTS,
+    inline_min_gap_ms: int = SFX_INLINE_MIN_GAP_MS,
+    inline_cross_gap_ms: int = SFX_INLINE_CROSS_GAP_MS,
 ) -> list[SfxEvent]:
     """把候选音效按时间排序后做节流（最小间隔 + 数量上限）。
 
-    * 任意两条保留的事件间隔必须 ``>= min_gap_ms``（默认 6000ms）；
-    * 整话最多 ``max_events`` 条（默认 8 条）。
+    * 任意两条保留的**整句级**事件间隔必须 ``>= min_gap_ms``（默认 6000ms）；
+    * 整话最多 ``max_events`` 条（默认 8 条，内联与整句级**共享**这个额度）。
 
     这两条限制保证音效是「点睛」而不是「背景」——连着响会把解说压没。
+
+    **Patch v4.41：区分来源，句内内联音效优先。**
+
+    候选可以是 ``(start_ms, key)``（等价于 ``(start_ms, key, "beat")``）
+    或 ``(start_ms, key, source)``，``source`` 取 ``"beat"`` / ``"inline"``。
+
+    * ``inline``（``tts_text`` 里的 ``[sfx:key]`` 标签）是**显式编排**的精确落点，
+      所以它**不与整句级音效共用 6000ms 节流**——否则它会被整句级音效挤掉
+      （整句级落点通常更早，内联落点在句中，更容易被节流丢弃）。
+      内联之间只需间隔 ``inline_min_gap_ms``（默认 1200ms，不重叠即可）。
+    * ``beat``（整句级 ``sfx_cue`` / 关键词兜底）仍走原来的 6000ms 节流，
+      但落在内联音效 ``inline_cross_gap_ms``（默认 2000ms）范围内时会让位——
+      内联是作者明确要的点睛，优先级更高。
+    * 两条规则共享 ``max_events`` 总额度，与「全话 4~8 处音效」的上限一致。
     """
-    ordered = sorted(candidates, key=lambda item: (int(item[0]), str(item[1])))
-    events: list[SfxEvent] = []
-    last_start: int | None = None
+    inline_candidates: list[tuple[int, str]] = []
+    beat_candidates: list[tuple[int, str]] = []
+    for item in candidates:
+        start = int(item[0])
+        key = str(item[1] or "").strip().lower()
+        source = str(item[2]).strip().lower() if len(item) > 2 else "beat"
+        if not key or key == "none":
+            continue
+        if source == "inline":
+            inline_candidates.append((start, key))
+        else:
+            beat_candidates.append((start, key))
+
     limit = max(0, int(max_events))
-    for start_ms, key in ordered:
-        if len(events) >= limit:
+
+    # ---- 第一轮：内联音效（受保护，优先占位）----
+    kept_inline: list[SfxEvent] = []
+    last_inline: int | None = None
+    for start, key in sorted(inline_candidates, key=lambda item: (item[0], item[1])):
+        if len(kept_inline) >= limit:
             break
-        name = str(key or "").strip().lower()
-        if not name or name == "none":
+        if last_inline is not None and start - last_inline < int(inline_min_gap_ms):
             continue
-        start = int(start_ms)
-        if last_start is not None and start - last_start < int(min_gap_ms):
+        kept_inline.append(SfxEvent(sfx_key=key, start_ms=start, source="inline"))
+        last_inline = start
+
+    # ---- 第二轮：整句级音效（原节流规则，遇到内联让位）----
+    kept_beat: list[SfxEvent] = []
+    last_beat: int | None = None
+    for start, key in sorted(beat_candidates, key=lambda item: (item[0], item[1])):
+        if len(kept_inline) + len(kept_beat) >= limit:
+            break
+        if last_beat is not None and start - last_beat < int(min_gap_ms):
             continue
-        events.append(SfxEvent(sfx_key=name, start_ms=start))
-        last_start = start
+        if any(abs(start - event.start_ms) < int(inline_cross_gap_ms) for event in kept_inline):
+            # 内联音效优先：这一处让给它。
+            continue
+        kept_beat.append(SfxEvent(sfx_key=key, start_ms=start, source="beat"))
+        last_beat = start
+
+    events = kept_inline + kept_beat
+    events.sort(key=lambda event: (int(event.start_ms), str(event.sfx_key)))
     return events
 
 
@@ -925,7 +983,7 @@ def build_timeline(
     # 耗时算到了毫秒，比整句级的 ``sfx_position`` 粗锚点精确得多；
     # 一句只要带了内联音效，就不再重复触发 beat 级 ``sfx_cue`` 兜底
     # （否则同一声效会在同一句里响两次）。
-    sfx_candidates: list[tuple[int, str]] = []
+    sfx_candidates: list[tuple[int, str, str]] = []
     for plan in plans:
         beat = plan["beat"]
         if beat is None:
@@ -938,7 +996,7 @@ def build_timeline(
                 if not key:
                     continue
                 offset = max(0, int(getattr(item, "offset_ms", 0) or 0))
-                sfx_candidates.append((int(plan["start"]) + offset, key))
+                sfx_candidates.append((int(plan["start"]) + offset, key, "inline"))
             continue
         key = resolve_sfx_key(beat, panel_sfx_map)
         if key:
@@ -950,7 +1008,7 @@ def build_timeline(
                 offset = max(0, duration_ms - SFX_POSITION_TAIL_OFFSET_MS)
             else:
                 offset = 0
-            sfx_candidates.append((int(plan["start"]) + offset, key))
+            sfx_candidates.append((int(plan["start"]) + offset, key, "beat"))
     sfx_events = select_sfx_events(sfx_candidates)
 
     return RenderTimeline(
@@ -1375,6 +1433,8 @@ __all__ = [
     "AUDIO_MANIFEST_FILENAME",
     "PLAN_DIR_NAME",
     "SFX_KEYWORD_MAP",
+    "SFX_INLINE_CROSS_GAP_MS",
+    "SFX_INLINE_MIN_GAP_MS",
     "SFX_MAX_EVENTS",
     "SFX_MIN_GAP_MS",
     "SUBTITLE_DIR_NAME",

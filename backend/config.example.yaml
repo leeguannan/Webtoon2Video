@@ -70,6 +70,9 @@ render:
   # 音效相对人声的增益（dB）；Patch 14 起混入前先做 dynaudnorm 峰值归一
   # Patch 18：抬到 -2.0dB，让扇耳光 / 摔碎这类关键音效听得见
   sfx_gain_db: -2.0
+  # Patch v4.41：句内内联音效（tts_text 里的 [sfx:key] 标签）单独一档、更轻。
+  # 内联音效落在解说正文中间，与人声同段共存，音量压过解说会让人听不清词。
+  inline_sfx_gain_db: -6.0
 
 tts:
   # 主旁白音色（百炼系统音色 ID；切到 MiniMax 后会被自动换成 MiniMax 旁白音色）
