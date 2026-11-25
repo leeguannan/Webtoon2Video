@@ -90,31 +90,43 @@ SFX_CUE_KEYS: tuple[str, ...] = (
 #: * ``category`` —— 分类（前端按分类分组下拉）；
 #: * ``fallback_key`` —— **盘面暂时没有该素材时回源复用的通用音效键**
 #:   （``None`` 表示没有兜底，缺素材就真缺）。回源链最长两级，不会递归成环。
+#: Patch v4.42：一级筛选大类（音效资源管理器顶部的分段按钮）。
+#:
+#: ``category`` 是**细粒度**标签（生理 / 门 / 击打 / 爆炸 / 通讯 …），共 13 类，
+#: 太碎，不适合做「先按大类缩小范围、再按细类定位」的浏览动线；
+#: ``group`` 是给它加的一层**一级大类**，固定四个取值。
+#:
+#: - 动作：动作本身会发生的打击/脚步/开门类，最常用；
+#: - 转场：承担「翻页/换气/破空」这类节奏衔接的音效；
+#: - 环境：场景底噪类（撞击、碎裂、雷声、钟表、翻页）；
+#: - 道具：具体物件发出的声音（手机、相机、汽车）。
+SFX_GROUP_CATEGORIES: tuple[str, ...] = ("动作", "环境", "转场", "道具")
+
 SFX_CUE_CATALOG: tuple[dict[str, str], ...] = (
-    {"key": "heart_thump", "label": "心跳", "category": "生理", "fallback_key": ""},
-    {"key": "gasp", "label": "倒吸一口气", "category": "生理", "fallback_key": ""},
-    {"key": "door_slam", "label": "摔门", "category": "门", "fallback_key": "crash"},
-    {"key": "door_open", "label": "开门", "category": "门", "fallback_key": "whoosh"},
-    {"key": "footstep", "label": "脚步", "category": "脚步", "fallback_key": ""},
-    {"key": "slap", "label": "耳光", "category": "击打", "fallback_key": "door_slam"},
-    {"key": "punch", "label": "拳击", "category": "击打", "fallback_key": "crash"},
-    {"key": "sword_clash", "label": "刀剑交击", "category": "击打", "fallback_key": "crash"},
-    {"key": "boom_hit", "label": "轰击", "category": "爆炸", "fallback_key": "crash"},
-    {"key": "crash", "label": "撞击", "category": "爆炸", "fallback_key": ""},
-    {"key": "glass_shatter", "label": "玻璃碎裂", "category": "碎裂", "fallback_key": "crash"},
-    {"key": "thunder", "label": "雷声", "category": "爆炸", "fallback_key": "crash"},
-    {"key": "cloth_rustle", "label": "衣料摩擦", "category": "摩擦", "fallback_key": "whoosh"},
-    {"key": "whoosh", "label": "破空", "category": "摩擦", "fallback_key": ""},
-    {"key": "applause", "label": "掌声", "category": "人群", "fallback_key": "gasp"},
-    {"key": "clock_tick", "label": "钟表滴答", "category": "钟表", "fallback_key": ""},
-    {"key": "page_turn", "label": "翻页", "category": "纸页", "fallback_key": "whoosh"},
-    {"key": "camera_shutter", "label": "快门", "category": "相机", "fallback_key": "whoosh"},
-    {"key": "car_horn", "label": "鸣笛", "category": "交通", "fallback_key": "whoosh"},
-    {"key": "phone_msg", "label": "短信提示", "category": "通讯", "fallback_key": ""},
-    {"key": "phone_ringing", "label": "电话铃响", "category": "通讯", "fallback_key": ""},
-    {"key": "phone_vibrating", "label": "手机震动", "category": "通讯", "fallback_key": ""},
-    {"key": "phone_call", "label": "通话接通", "category": "通讯", "fallback_key": "phone_msg"},
-    {"key": "phone_unavailable", "label": "忙音", "category": "通讯", "fallback_key": "phone_msg"},
+    {"key": "heart_thump", "label": "心跳", "category": "生理", "group": "动作", "fallback_key": ""},
+    {"key": "gasp", "label": "倒吸一口气", "category": "生理", "group": "转场", "fallback_key": ""},
+    {"key": "door_slam", "label": "摔门", "category": "门", "group": "动作", "fallback_key": "crash"},
+    {"key": "door_open", "label": "开门", "category": "门", "group": "动作", "fallback_key": "whoosh"},
+    {"key": "footstep", "label": "脚步", "category": "脚步", "group": "动作", "fallback_key": ""},
+    {"key": "slap", "label": "耳光", "category": "击打", "group": "动作", "fallback_key": "door_slam"},
+    {"key": "punch", "label": "拳击", "category": "击打", "group": "动作", "fallback_key": "crash"},
+    {"key": "sword_clash", "label": "刀剑交击", "category": "击打", "group": "动作", "fallback_key": "crash"},
+    {"key": "boom_hit", "label": "轰击", "category": "爆炸", "group": "转场", "fallback_key": "crash"},
+    {"key": "crash", "label": "撞击", "category": "爆炸", "group": "环境", "fallback_key": ""},
+    {"key": "glass_shatter", "label": "玻璃碎裂", "category": "碎裂", "group": "环境", "fallback_key": "crash"},
+    {"key": "thunder", "label": "雷声", "category": "爆炸", "group": "环境", "fallback_key": "crash"},
+    {"key": "cloth_rustle", "label": "衣料摩擦", "category": "摩擦", "group": "动作", "fallback_key": "whoosh"},
+    {"key": "whoosh", "label": "破空", "category": "摩擦", "group": "转场", "fallback_key": ""},
+    {"key": "applause", "label": "掌声", "category": "人群", "group": "转场", "fallback_key": "gasp"},
+    {"key": "clock_tick", "label": "钟表滴答", "category": "钟表", "group": "环境", "fallback_key": ""},
+    {"key": "page_turn", "label": "翻页", "category": "纸页", "group": "环境", "fallback_key": "whoosh"},
+    {"key": "camera_shutter", "label": "快门", "category": "相机", "group": "道具", "fallback_key": "whoosh"},
+    {"key": "car_horn", "label": "鸣笛", "category": "交通", "group": "道具", "fallback_key": "whoosh"},
+    {"key": "phone_msg", "label": "短信提示", "category": "通讯", "group": "道具", "fallback_key": ""},
+    {"key": "phone_ringing", "label": "电话铃响", "category": "通讯", "group": "道具", "fallback_key": ""},
+    {"key": "phone_vibrating", "label": "手机震动", "category": "通讯", "group": "道具", "fallback_key": ""},
+    {"key": "phone_call", "label": "通话接通", "category": "通讯", "group": "道具", "fallback_key": "phone_msg"},
+    {"key": "phone_unavailable", "label": "忙音", "category": "通讯", "group": "道具", "fallback_key": "phone_msg"},
 )
 
 #: Patch v4.38：音效键别名（小规模，只收敛**明确同义**的写法）。
@@ -135,6 +147,18 @@ SFX_CUE_FALLBACKS: dict[str, str] = {
     entry["key"]: (entry.get("fallback_key") or "")
     for entry in SFX_CUE_CATALOG
 }
+
+
+def sfx_group_of(sfx_key: str) -> str:
+    """返回音效键的**一级大类**（动作 / 环境 / 转场 / 道具）。
+
+    Patch v4.42：音效资源管理器顶部的分段按钮用这一层做粗筛；
+    找不到键时返回空串（前端按「未归类」处理，不丢条目）。
+    """
+    for entry in SFX_CUE_CATALOG:
+        if entry["key"] == str(sfx_key or "").strip().lower():
+            return entry.get("group") or ""
+    return ""
 
 
 def sfx_fallback_key(sfx_key: str) -> str:

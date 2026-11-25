@@ -1353,29 +1353,112 @@ SFX_MEDIA_TYPES = {
 #: 音效上传体积上限（单个音效文件本来都很小，给 30MB 余量）。
 SFX_UPLOAD_MAX_BYTES = 30 * 1024 * 1024
 
+#: Patch v4.42：CC0 采编工具写的溯源清单（文件名固定）。
+SFX_SOURCES_FILENAME = "SOURCES_CC0.json"
+
+#: Patch v4.42：音效时长探测缓存 —— key = (路径, mtime, size)，value = 毫秒。
+#:
+#: 曲库接口每次都要报时长，而探测要走一次 ffprobe；24 条素材逐次起进程
+#: 会让这个接口明显变慢。素材是静态资产，按 (mtime, size) 做键缓存即可，
+#: 文件一旦被替换（重新采编 / 用户上传）缓存自然失效。
+_SFX_DURATION_CACHE: dict[tuple[str, float, int], int] = {}
+
+
+def _sfx_sources_index() -> dict[str, dict[str, Any]]:
+    """读取 CC0 采编工具写的溯源清单 ``<assets>/sfx/SOURCES_CC0.json``。
+
+    文件缺失 / 不是合法 JSON / 结构不是字典 —— 一律回退成空字典，
+    **绝不抛异常**：溯源信息只是锦上添花，不能让它把整个曲库接口打挂。
+    """
+    path = assets_root() / s7_renderer.SFX_DIR_NAME / SFX_SOURCES_FILENAME
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(key): value
+        for key, value in raw.items()
+        if isinstance(value, dict)
+    }
+
+
+def _sfx_duration_ms(path: Path | None) -> int | None:
+    """读一个音效文件的时长（毫秒）；读不出来返回 ``None``。"""
+    if path is None:
+        return None
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    cache_key = (str(path), stat.st_mtime, stat.st_size)
+    cached = _SFX_DURATION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        duration = int(s7_renderer.probe_duration_ms(path))
+    except Exception:  # noqa: BLE001 —— 探测失败只影响这一条的时长展示
+        return None
+    if duration <= 0:
+        return None
+    _SFX_DURATION_CACHE[cache_key] = duration
+    return duration
+
 
 def _sfx_library_payload() -> dict[str, Any]:
     """音效曲库清单（对应 ``core.normalize.SFX_CUE_CATALOG``）。
 
-    每条包含：key / label / category / available（盘面有没有真实素材）/
-    resolved_filename（实际会用的文件名）/ fallback_key（兜底音效）/
-    url（前端试听地址）。
+    每条包含：key / label / category（细类）/ group（一级大类）/
+    available（盘面有没有真实素材）/ resolved_filename（实际会用的文件名）/
+    fallback_key（兜底音效）/ url（前端试听地址）。
+
+    Patch v4.42 追加：duration_ms（生效素材的实测时长）/
+    source_type（``freesound_cc0`` = 采编工具下载的 CC0 素材，
+    ``builtin_cc0`` = 仓库内置资产）/ cc0_source（溯源明细）。
     """
+    sources = _sfx_sources_index()
     items: list[dict[str, Any]] = []
     for entry in SFX_CUE_CATALOG:
         key = entry["key"]
         fallback_key = entry.get("fallback_key") or ""
         resolved = s7_renderer.resolve_sfx_asset(key)
         resolved_name = resolved.name if resolved is not None else ""
+
+        source = sources.get(key)
+        duration_ms = _sfx_duration_ms(resolved)
+        if duration_ms is None and source is not None:
+            try:
+                duration_ms = int(round(float(source.get("duration_s") or 0.0) * 1000))
+            except (TypeError, ValueError):
+                duration_ms = None
+
+        cc0_source: dict[str, Any] | None = None
+        if source is not None:
+            cc0_source = {
+                "sound_id": str(source.get("sound_id") or ""),
+                "name": str(source.get("name") or ""),
+                "author": str(source.get("author") or ""),
+                "license": str(source.get("license") or ""),
+                "license_url": str(source.get("license_url") or ""),
+                "freesound_url": str(source.get("freesound_url") or ""),
+                "fetched_at": str(source.get("fetched_at") or ""),
+                "max_duration_s": source.get("max_duration_s"),
+            }
+
         items.append(
             {
                 "key": key,
                 "label": entry["label"],
                 "category": entry["category"],
+                "group": entry.get("group") or "",
                 "available": resolved_name != "",
                 "resolved_filename": resolved_name,
                 "fallback_key": fallback_key,
                 "url": f"/api/sfx-file/{key}",
+                "duration_ms": duration_ms,
+                "source_type": "freesound_cc0" if source is not None else "builtin_cc0",
+                "cc0_source": cc0_source,
             }
         )
     return {

@@ -128,6 +128,39 @@ export type SfxPosition = 'start' | 'mid' | 'end';
 // ---------------------------------------------------------------------------
 // Patch v4.38：音效曲库（24 个标准音效键）
 // ---------------------------------------------------------------------------
+/**
+ * Patch v4.42：音效的一级筛选大类。
+ *
+ * `category`（生理 / 门 / 击打 / 爆炸 / 通讯 …）是细粒度标签，共 13 类；
+ * `group` 是它上面的一层粗筛，固定四个取值，对应资源管理器顶部的分段按钮。
+ */
+export type SfxGroupCategory = '动作' | '环境' | '转场' | '道具';
+
+/**
+ * Patch v4.42：CC0 素材的溯源明细。
+ *
+ * 命中 `backend/assets/sfx/SOURCES_CC0.json` 时由后端带出；
+ * 仓库内置的 CC0 资产没有这条记录，`cc0_source` 为 `null`。
+ */
+export interface SfxCc0SourceMeta {
+  /** Freesound 素材 ID。 */
+  sound_id?: string;
+  /** 素材原始文件名。 */
+  name?: string;
+  /** 上传者。 */
+  author?: string;
+  /** 许可证名（采编工具只收 Creative Commons 0）。 */
+  license?: string;
+  /** 许可证链接。 */
+  license_url?: string;
+  /** Freesound 素材页链接。 */
+  freesound_url?: string;
+  /** 采编时间（ISO 字符串）。 */
+  fetched_at?: string;
+  /** 采编时允许的最长时长（秒）。 */
+  max_duration_s?: number | null;
+}
+
 /** 音效曲库里的一条（对应后端 core.normalize.SFX_CUE_CATALOG）。 */
 export interface SfxLibraryItem {
   /** 标准音效键（如 heart_thump / door_slam / phone_ringing）。 */
@@ -144,6 +177,14 @@ export interface SfxLibraryItem {
   fallback_key: string;
   /** 试听地址。 */
   url: string;
+  /** Patch v4.42：一级大类（旧后端可能不返回 → 视为未归类）。 */
+  group?: SfxGroupCategory;
+  /** Patch v4.42：生效素材的实测时长（毫秒；探测不到为 null）。 */
+  duration_ms?: number | null;
+  /** Patch v4.42：素材来源（freesound_cc0 = 采编工具下载；builtin_cc0 = 仓库内置）。 */
+  source_type?: 'freesound_cc0' | 'builtin_cc0';
+  /** Patch v4.42：CC0 溯源明细（未命中溯源清单时为 null）。 */
+  cc0_source?: SfxCc0SourceMeta | null;
 }
 
 /** 音效曲库响应体。 */

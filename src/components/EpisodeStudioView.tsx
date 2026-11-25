@@ -70,6 +70,7 @@ import {
 } from './VoicePicker';
 import { StoryboardEditor } from './StoryboardEditor';
 import { TtsTagPicker } from './TtsTagPicker';
+import SfxExplorerTab from './SfxExplorerTab';
 import BgmLibraryDrawer from './BgmLibraryDrawer';
 
 interface EpisodeStudioViewProps {
@@ -264,7 +265,13 @@ const buildCharacterSyncGroups = (
   return Array.from(groups.values());
 };
 
-type StudioTab = 'panels' | 'storyboard' | 'script' | 'timeline' | 'preview';
+/**
+ * Patch v4.42：新增 'sfx' 标签页（音效资源管理器）。
+ *
+ * 放在 script 之后而不是最末尾，是因为「给这一句加音效」是解说审核的
+ * 配套动作，用户在审核台改完字就应该能顺手去曲库里挑一个音效。
+ */
+type StudioTab = 'panels' | 'storyboard' | 'script' | 'sfx' | 'timeline' | 'preview';
 
 /** 单话流水线顺序（S1 ~ S7）；S0 是作品级，不参与「向后清理」。 */
 const STAGE_SEQUENCE: StageId[] = [
@@ -884,6 +891,13 @@ interface ScriptBeatRowProps {
   onChangeSfxCue?: (beatId: string, sfxKey: string | null) => void;
   /** Patch v4.40：改这一句的音效落点（首 / 中 / 尾）。 */
   onChangeSfxPosition?: (beatId: string, position: SfxPosition) => void;
+  /**
+   * Patch v4.42：送音文本框被聚焦 / 光标移动时上报。
+   *
+   * 音效资源管理器要知道自己该往哪一句的哪个位置插 `[sfx:key]`，
+   * 唯一的可靠来源就是「用户在解说台最后碰的是哪一句、光标在哪」。
+   */
+  onTtsActivate?: (beatId: string, start: number, end: number) => void;
   onChangeScene: (beatId: string, sceneId: string | null) => void;
   onToggleTagPicker: (beatId: string) => void;
   onPickTag: (beatId: string, snippet: string) => void;
@@ -936,6 +950,7 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
     sfxLibrary,
     onChangeSfxCue,
     onChangeSfxPosition,
+    onTtsActivate,
     onChangeScene,
     onToggleTagPicker,
     onPickTag,
@@ -1061,8 +1076,11 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
         start: el.selectionStart,
         end: el.selectionEnd,
       };
+      /* Patch v4.42：同时上报「用户在解说台最后碰的是哪一句、光标在哪」，
+         音效资源管理器据此决定 `[sfx:key]` 插到哪一句的哪个位置。 */
+      onTtsActivate?.(beat.beat_id, el.selectionStart, el.selectionEnd);
     },
-    [beat.beat_id, ttsSelections]
+    [beat.beat_id, ttsSelections, onTtsActivate]
   );
 
   const charLen = beat.narration_text.trim().length;
@@ -1260,6 +1278,7 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
                 onClick={(e) => rememberSelection(e.currentTarget)}
                 onKeyUp={(e) => rememberSelection(e.currentTarget)}
                 onBlur={(e) => rememberSelection(e.currentTarget)}
+                onFocus={(e) => rememberSelection(e.currentTarget)}
                 onChange={(e) => onChangeText(beat.beat_id, 'tts_text', e.target.value)}
                 placeholder="留空则自动继承字幕 + 词典替换；填写时必须是整句送音文本..."
                 className="w-full p-2 text-xs text-slate-800 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600 resize-none"
@@ -1270,7 +1289,12 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
                一话 120 行表格，每行都挂一个 textarea 会把审核台压到没法看。 */
             <button
               type="button"
-              onClick={() => setTtsExpanded(true)}
+              onClick={() => {
+                setTtsExpanded(true);
+                /* Patch v4.42：点开这一句的送音编辑 = 用户正在处理这一句，
+                   音效资源管理器默认就往这里插标签。 */
+                onTtsActivate?.(beat.beat_id, 0, 0);
+              }}
               title="展开送音文本编辑"
               aria-label={`${beat.beat_id} 展开送音文本编辑`}
               className="w-full text-left px-2 py-1.5 rounded-lg border border-slate-200 bg-slate-50 hover:border-blue-400 transition-colors"
@@ -2095,6 +2119,16 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   const ttsTextareaRefs = useRef<Record<string, HTMLTextAreaElement | null>>({});
   /** 每条分镜最近一次的选区 {start, end}。 */
   const ttsSelections = useRef<Record<string, { start: number; end: number }>>({});
+  /**
+   * Patch v4.42：解说台里「用户最后碰过的送音文本框」。
+   *
+   * 音效资源管理器（sfx 标签页）要决定 `[sfx:key]` 插到哪一句，
+   * 唯一可靠来源就是用户在解说台最后一次点开的句子；
+   * 没碰过就退回草稿里的第一句。
+   */
+  const [activeTtsBeatId, setActiveTtsBeatId] = useState<string | null>(null);
+  /** Patch v4.42：资源管理器里「光标在第几个字符」（用于插入位置与锚点预览）。 */
+  const [sfxCaret, setSfxCaret] = useState(0);
 
   // ---- Patch v4.8：重跑前草稿防残留保护 ----
   /** 句间停顿被改动过：必须先重建时间轴（S6）再出片，跳过 S6 会吃到旧停顿。 */
@@ -3975,6 +4009,88 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     [updateBeatField]
   );
 
+  /**
+   * Patch v4.42：解说台里「用户最后碰过的送音文本框」。
+   *
+   * 音效资源管理器要知道 `[sfx:key]` 该插到哪一句的哪个位置，
+   * 唯一可靠来源就是用户在解说台最后一次点开的句子与光标位置。
+   */
+  const handleTtsActivate = useCallback(
+    (beatId: string, start: number, end: number) => {
+      setActiveTtsBeatId(beatId);
+      setSfxCaret(start);
+      ttsSelections.current[beatId] = { start, end };
+    },
+    []
+  );
+
+  /**
+   * Patch v4.42：把 `[sfx:key]` 应用到目标句的光标处。
+   *
+   * 底本口径与资源管理器显示的那份文本一致：
+   * 送音文本非空 → 用送音文本；送音文本留空 → 用字幕原文当底本
+   * （标签必须跟着整句一起写进 tts_text，否则这一句就只剩一个孤零零的标签）。
+   */
+  const handleApplySfxFromExplorer = useCallback(
+    (sfxKey: string, targetBeatId: string) => {
+      const beat = draftBeatsRef.current.find((b) => b.beat_id === targetBeatId);
+      if (!beat) return;
+      const snippet = `[sfx:${sfxKey}]`;
+      const current = (beat.tts_text ?? '').trim();
+      const base = current !== '' ? (beat.tts_text ?? '') : (beat.narration_text ?? '');
+      if (base.trim() === '') {
+        setSaveHint('这一句既没有送音文本也没有字幕原文，插不了音效标签。');
+        return;
+      }
+      const at = Math.max(0, Math.min(sfxCaret, base.length));
+      const next = `${base.slice(0, at)}${snippet}${base.slice(at)}`;
+      updateBeatField(targetBeatId, 'tts_text', next);
+      ttsSelections.current[targetBeatId] = {
+        start: at + snippet.length,
+        end: at + snippet.length,
+      };
+      setSfxCaret(at + snippet.length);
+      setSaveHint(
+        `已在 ${targetBeatId} 插入 ${snippet}；保存后从 Stage 5 重跑配音才会生效。`
+      );
+    },
+    [sfxCaret, updateBeatField]
+  );
+
+  /** Patch v4.42：资源管理器里换目标句时，光标回到该句上次的位置。 */
+  const handleSfxExplorerChangeTarget = useCallback((beatId: string) => {
+    setActiveTtsBeatId(beatId);
+    const saved = ttsSelections.current[beatId];
+    setSfxCaret(saved ? saved.start : 0);
+  }, []);
+
+  /** Patch v4.42：资源管理器里直接编辑目标句的送音文本。 */
+  const handleSfxExplorerChangeTargetText = useCallback(
+    (beatId: string, text: string) => {
+      updateBeatField(beatId, 'tts_text', text);
+    },
+    [updateBeatField]
+  );
+
+  /** Patch v4.42：回解说台并定位到那一句。 */
+  const handleSfxExplorerBackToScript = useCallback(
+    (beatId: string) => {
+      jumpToBeatInScript(beatId);
+    },
+    [jumpToBeatInScript]
+  );
+
+  /** Patch v4.42：保存脚本并从 Stage 5 重跑配音（音效标签由 S5 决定落点）。 */
+  const handleSfxExplorerSaveAndRerunTts = useCallback(() => {
+    void handleSaveBeats(true);
+  }, [handleSaveBeats]);
+
+  /** Patch v4.42：试听音效素材（复用全局单一 Audio 实例）。 */
+  const handleSfxExplorerPreview = useCallback((sfxKey: string) => {
+    if (!sfxKey) return;
+    playSfxPreview(sfxFileUrl(sfxKey));
+  }, []);
+
   const handleRowChangeScene = useCallback(
     (beatId: string, sceneId: string | null) =>
       updateBeatField(beatId, 'scene_id', sceneId),
@@ -4845,6 +4961,10 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                       : `镜头编排 (${storyboardSceneCount})`,
                 },
                 { id: 'script', label: `解说与多音字审核 (${draftBeats.length})` },
+                {
+                  id: 'sfx',
+                  label: `音效资源管理器 (${sfxLibrary.length})`,
+                },
                 { id: 'timeline', label: '时间轴与执行日志' },
                 { id: 'preview', label: '成片动态预览' },
               ] as const
@@ -5746,6 +5866,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                                   sfxLibrary={sfxLibrary}
                                   onChangeSfxCue={handleRowChangeSfxCue}
                                   onChangeSfxPosition={handleRowChangeSfxPosition}
+                                  onTtsActivate={handleTtsActivate}
                                   onChangeScene={handleRowChangeScene}
                                   onToggleTagPicker={handleRowToggleTagPicker}
                                   onPickTag={handleRowPickTag}
@@ -5766,7 +5887,27 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
               </div>
             )}
 
-            {/* TAB 3: Audio-First Timeline & SSE Logs */}
+            {/* TAB 3: 音效资源管理器（Patch v4.42） */}
+            {activeTab === 'sfx' && (
+              <div className="p-5">
+                <SfxExplorerTab
+                  beats={draftBeats}
+                  activeBeatId={activeTtsBeatId}
+                  onChangeActiveBeatId={handleSfxExplorerChangeTarget}
+                  caret={sfxCaret}
+                  onChangeCaret={setSfxCaret}
+                  sfxLibrary={sfxLibrary}
+                  onPreviewSfx={handleSfxExplorerPreview}
+                  onApplySfx={handleApplySfxFromExplorer}
+                  onBackToScript={handleSfxExplorerBackToScript}
+                  onSaveAndRerunTts={handleSfxExplorerSaveAndRerunTts}
+                  onChangeTargetText={handleSfxExplorerChangeTargetText}
+                  busy={savingBeats}
+                />
+              </div>
+            )}
+
+            {/* TAB 4: Audio-First Timeline & SSE Logs */}
             {activeTab === 'timeline' && (
               <div className="p-5 space-y-6">
                 <div>
