@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Archive,
+  BookOpen,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
@@ -16,6 +17,8 @@ import {
   Play,
   Plus,
   RotateCcw,
+  Search,
+  Square,
   Terminal,
   Trash2,
   Volume2,
@@ -109,6 +112,13 @@ interface EpisodeStudioViewProps {
   onAutoPacing?: (episodeId: string) => Promise<AutoPacingResponse | null>;
   /** Patch v4.28：一键自动分配画面动效（后端改写 motion；不碰配音）。 */
   onAutoMotions?: (episodeId: string) => Promise<AutoMotionResponse | null>;
+  /**
+   * Patch v4.35：就地新增一条多音字词典规则。
+   *
+   * 审核台命令栏的「+ 多音字规则」弹层用它落库；
+   * 父组件负责写盘并刷新 rules 列表（缺省时该入口隐藏）。
+   */
+  onAddRule?: (rule: Omit<PronunciationRule, 'id'>) => void;
   /** Patch v4.5：保存本话封页/结尾片包选项（写入 render_options.json，仅重跑 S7 生效）。 */
   onUpdateEpisodeRenderOptions?: (
     episodeId: string,
@@ -369,6 +379,73 @@ const RECOMMENDED_MOTIONS: CameraMotion[] = [
  */
 const motionOptions = (current: CameraMotion): CameraMotion[] =>
   RECOMMENDED_MOTIONS.includes(current) ? RECOMMENDED_MOTIONS : [current, ...RECOMMENDED_MOTIONS];
+
+// ---------------------------------------------------------------------------
+// Patch v4.35：折叠偏好（localStorage 记忆）
+// ---------------------------------------------------------------------------
+
+/**
+ * 读取折叠偏好。
+ *
+ * 流水线 / 封页两块信息密度高，一话 200~300 分镜时会把首屏撑满，
+ * 用户要滚很久才看到分镜与审核表。折叠态记在 localStorage 里，跨话次保留。
+ * 隐私模式下 localStorage 不可用 → 退化为「不折叠」，不影响功能。
+ */
+function readCollapsePref(key: string): boolean {
+  try {
+    return window.localStorage.getItem(key) === '1';
+  } catch {
+    return false;
+  }
+}
+
+/** 写回折叠偏好。 */
+function writeCollapsePref(key: string, collapsed: boolean): void {
+  try {
+    window.localStorage.setItem(key, collapsed ? '1' : '0');
+  } catch {
+    /* 忽略：仅影响折叠偏好，不影响任何数据 */
+  }
+}
+
+/** Patch v4.35：流水线折叠偏好的 localStorage 键。 */
+const PIPELINE_COLLAPSE_KEY = 'w2v.studio.pipelineCollapsed';
+/** Patch v4.35：封页折叠偏好的 localStorage 键。 */
+const BRANDING_COLLAPSE_KEY = 'w2v.studio.brandingCollapsed';
+
+// ---------------------------------------------------------------------------
+// Patch v4.35：审核台的轻量筛选
+// ---------------------------------------------------------------------------
+
+/**
+ * 审核台的筛选档位。
+ *
+ * 搜索 + 筛选是**定位**手段，不是改稿手段：命中的句子照常可编辑可保存，
+ * 没命中的句子只是暂时不渲染，内容一条都不会丢。
+ */
+type ScriptFilterKey =
+  | 'all'
+  | 'length'
+  | 'multi_panel'
+  | 'custom_tts'
+  | 'voice_tuned';
+
+const SCRIPT_FILTER_LABELS: Record<ScriptFilterKey, string> = {
+  all: '全部',
+  length: '字数预警',
+  multi_panel: '多格轮播',
+  custom_tts: '自定义送音',
+  voice_tuned: '改过音色/语速',
+};
+
+/** 筛选档位的展示顺序（与命令栏从左到右一致）。 */
+const SCRIPT_FILTER_ORDER: ScriptFilterKey[] = [
+  'all',
+  'length',
+  'multi_panel',
+  'custom_tts',
+  'voice_tuned',
+];
 
 // ---------------------------------------------------------------------------
 // Patch v4.25：分镜缩略图 / 角色解析工具 / 审核表行组件
@@ -698,6 +775,12 @@ interface ScriptBeatRowProps {
   onRemovePanelAt: (beatId: string, index: number) => void;
   /** Patch v4.32：镜头编排（启用幕）覆盖的分镜集合；空集合＝不限制。 */
   scopePanelIds: Set<string>;
+  /** Patch v4.35：panel_id → 分镜，用于画第 2..N 格的迷你缩略图。 */
+  panelsById: Map<string, PanelItem>;
+  /** Patch v4.35：给这一句再加一格轮播画面。 */
+  onAddPanelAt?: (beatId: string) => void;
+  /** Patch v4.35：从分镜详情跳到审核台时高亮这一行。 */
+  highlight?: boolean;
   onChangeScene: (beatId: string, sceneId: string | null) => void;
   onToggleTagPicker: (beatId: string) => void;
   onPickTag: (beatId: string, snippet: string) => void;
@@ -744,6 +827,9 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
     onChangePanelAt,
     onRemovePanelAt,
     scopePanelIds,
+    panelsById,
+    onAddPanelAt,
+    highlight,
     onChangeScene,
     onToggleTagPicker,
     onPickTag,
@@ -769,6 +855,21 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
   const [customVoiceDraft, setCustomVoiceDraft] = useState('');
   const overrideVoiceId = (beat.voice_override ?? '').trim();
   const overrideKnown = !overrideVoiceId || voiceOptionMap.has(overrideVoiceId);
+  /**
+   * Patch v4.35：送音文本默认折叠。
+   *
+   * 一话 120 行，每行都挂一个 textarea 会把审核台压得没法看；
+   * 已经有 tts_text 的行默认展开（用户改过的东西要看得见），
+   * 其余只给一行摘要，点一下才展开。
+   */
+  const [ttsExpanded, setTtsExpanded] = useState(() => !!beat.tts_text?.trim());
+  /**
+   * Patch v4.35：单句音色选择框默认折叠。
+   *
+   * 已经指定过音色的行默认展开（要让人看见「这一句被改过」），
+   * 其余只显示落点音色摘要 + 试听，点「换音色」才展开下拉。
+   */
+  const [voicePickerOpen, setVoicePickerOpen] = useState(() => !!overrideVoiceId);
   const roleVoiceId = beat.resolved_voice?.voice ?? '';
   const roleVoiceDisplayName =
     voiceOptionMap.get(roleVoiceId)?.display_name || roleVoiceId || '按角色解析';
@@ -834,30 +935,59 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
   const isLengthWarn = charLen < 8 || charLen > 30;
 
   return (
-    <tr className="hover:bg-slate-50/50">
+    <tr
+      data-beat-id={beat.beat_id}
+      className={`hover:bg-slate-50/50 ${
+        highlight ? 'bg-amber-50 ring-2 ring-inset ring-amber-300' : ''
+      }`}
+    >
       <td className="py-3.5 pl-5 pr-2">
         <div className="space-y-1.5">
           <div className="font-mono-tabular font-semibold text-slate-700">
             {beat.beat_id}
           </div>
-          {panel && (
-            <button
-              type="button"
-              onClick={() => onZoom(beat.beat_id)}
-              title="放大查看分镜并编辑字幕原文"
-              aria-label={`放大查看 ${panel.panel_id} 并编辑字幕原文`}
-              className="block w-12 h-16 rounded border border-slate-200 overflow-hidden hover:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/40 cursor-pointer transition-colors"
-            >
-              <img
-                src={panelThumbUrl(panel.image_url, 140)}
-                alt={panel.panel_id}
-                referrerPolicy="no-referrer"
-                loading="lazy"
-                decoding="async"
-                className="w-12 h-16 object-cover"
-              />
-            </button>
-          )}
+          <div className="flex items-start gap-1.5">
+            {panel && (
+              <button
+                type="button"
+                onClick={() => onZoom(beat.beat_id)}
+                title="放大查看分镜并编辑字幕原文"
+                aria-label={`放大查看 ${panel.panel_id} 并编辑字幕原文`}
+                className="block w-12 h-16 rounded border border-slate-200 overflow-hidden hover:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/40 cursor-pointer transition-colors shrink-0"
+              >
+                <img
+                  src={panelThumbUrl(panel.image_url, 140)}
+                  alt={panel.panel_id}
+                  referrerPolicy="no-referrer"
+                  loading="lazy"
+                  decoding="async"
+                  className="w-12 h-16 object-cover"
+                />
+              </button>
+            )}
+            {/* Patch v4.35：第 2..N 格的迷你缩略图并排跟在主图旁边，
+                「第 2 格到底是哪张」不用再靠下拉猜。 */}
+            {targetPanelIds.length > 1 && (
+              <div className="flex flex-col gap-1">
+                {targetPanelIds.slice(1).map((panelId, index) => {
+                  const extra = panelsById.get(panelId);
+                  if (!extra) return null;
+                  return (
+                    <img
+                      key={`${panelId}-${index}`}
+                      src={panelThumbUrl(extra.image_url, 140)}
+                      alt={extra.panel_id}
+                      title={`第 ${index + 2} 格：${extra.panel_id}`}
+                      referrerPolicy="no-referrer"
+                      loading="lazy"
+                      decoding="async"
+                      className="w-8 h-10 object-cover rounded border border-amber-300"
+                    />
+                  );
+                })}
+              </div>
+            )}
+          </div>
           {/* Patch v4.32：这一句实际会播出的每一格分镜都列出来，可改可删。 */}
           {targetPanelIds.map((panelId, index) => (
             <div key={`${panelId}-${index}`} className="flex items-center gap-1">
@@ -880,8 +1010,8 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
                 aria-label={`${beat.beat_id} 第 ${index + 1} 格分镜`}
                 className={
                   index > 0
-                    ? 'w-16 px-1 py-0.5 text-[11px] font-mono-tabular bg-amber-50/70 border border-amber-300 rounded ring-1 ring-amber-200'
-                    : 'w-16 px-1 py-0.5 text-[11px] font-mono-tabular bg-white border border-slate-200 rounded'
+                    ? 'w-20 px-1 py-0.5 text-[11px] font-mono-tabular bg-amber-50/70 border border-amber-300 rounded ring-1 ring-amber-200'
+                    : 'w-20 px-1 py-0.5 text-[11px] font-mono-tabular bg-white border border-slate-200 rounded'
                 }
               >
                 {scopedPanelOptions.map((option) => (
@@ -903,6 +1033,19 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
               )}
             </div>
           ))}
+          {/* Patch v4.35：给这一句再加一格轮播画面。 */}
+          {onAddPanelAt && scopedPanelOptions.length > 0 && (
+            <button
+              type="button"
+              onClick={() => onAddPanelAt(beat.beat_id)}
+              title="给这一句再加一格轮播画面（成片会按格数均分时长）"
+              aria-label={`${beat.beat_id} 增加一格轮播分镜`}
+              className="w-20 h-5 flex items-center justify-center gap-0.5 text-[10px] text-slate-500 bg-white border border-dashed border-slate-300 rounded hover:border-blue-400 hover:text-blue-700 cursor-pointer"
+            >
+              <Plus className="w-2.5 h-2.5" />
+              加一格
+            </button>
+          )}
           {/* Patch v4.13：归属幕与分镜解耦，这里单独指定这一句讲哪一幕。 */}
           {sceneOptions.length > 0 && (
             <select
@@ -947,33 +1090,72 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
 
       <td className="py-3.5 px-3">
         <div className="relative">
-          <div className="mb-1 flex items-center justify-between gap-2">
-            <span className="text-[10px] text-slate-400">
-              标签只写送音文本，字幕不受影响
-            </span>
-            {/* Patch v4.14：语气词 / 句中停顿标签浮层入口。 */}
+          {ttsExpanded ? (
+            <>
+              <div className="mb-1 flex items-center justify-between gap-2">
+                <span className="text-[10px] text-slate-400">
+                  标签只写送音文本，字幕不受影响
+                </span>
+                <div className="flex items-center gap-1">
+                  {/* Patch v4.14：语气词 / 句中停顿标签浮层入口。 */}
+                  <button
+                    type="button"
+                    onClick={() => onToggleTagPicker(beat.beat_id)}
+                    aria-label={`${beat.beat_id} 插入语气或停顿标签`}
+                    title="插入 MiniMax 语气词（如 (laughs)）或句中停顿（如 <#0.5#>）"
+                    className="rounded-md border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-600 hover:border-blue-400 hover:text-blue-700 transition-colors"
+                  >
+                    + 语气 / 停顿标签
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setTtsExpanded(false)}
+                    title="收起送音编辑"
+                    aria-label={`${beat.beat_id} 收起送音编辑`}
+                    className="rounded-md border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-500 hover:border-slate-400 hover:text-slate-600"
+                  >
+                    收起
+                  </button>
+                </div>
+              </div>
+              <textarea
+                rows={2}
+                value={beat.tts_text}
+                ref={setTextareaRef}
+                onSelect={(e) => rememberSelection(e.currentTarget)}
+                onClick={(e) => rememberSelection(e.currentTarget)}
+                onKeyUp={(e) => rememberSelection(e.currentTarget)}
+                onBlur={(e) => rememberSelection(e.currentTarget)}
+                onChange={(e) => onChangeText(beat.beat_id, 'tts_text', e.target.value)}
+                placeholder="留空则自动继承字幕 + 词典替换；填写时必须是整句送音文本..."
+                className="w-full p-2 text-xs text-slate-800 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600 resize-none"
+              />
+            </>
+          ) : (
+            /* Patch v4.35：tts_text 为空时只给一行摘要，点一下才展开编辑框——
+               一话 120 行表格，每行都挂一个 textarea 会把审核台压到没法看。 */
             <button
               type="button"
-              onClick={() => onToggleTagPicker(beat.beat_id)}
-              aria-label={`${beat.beat_id} 插入语气或停顿标签`}
-              title="插入 MiniMax 语气词（如 (laughs)）或句中停顿（如 <#0.5#>）"
-              className="rounded-md border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-600 hover:border-blue-400 hover:text-blue-700 transition-colors"
+              onClick={() => setTtsExpanded(true)}
+              title="展开送音文本编辑"
+              aria-label={`${beat.beat_id} 展开送音文本编辑`}
+              className="w-full text-left px-2 py-1.5 rounded-lg border border-slate-200 bg-slate-50 hover:border-blue-400 transition-colors"
             >
-              + 语气 / 停顿标签
+              {matchedRules.length > 0 ? (
+                <span className="text-[11px] leading-snug text-blue-700">
+                  词典 {matchedRules.map((r) => `${r.source}→${r.replacement}`).join('、')}
+                  {' · '}送音「{spokenText}」
+                </span>
+              ) : (
+                <span className="text-[11px] leading-snug text-slate-500">
+                  同字幕（未改送音）
+                </span>
+              )}
+              <span className="mt-0.5 block text-[10px] text-blue-600">
+                改送音 / 加标签
+              </span>
             </button>
-          </div>
-          <textarea
-            rows={2}
-            value={beat.tts_text}
-            ref={setTextareaRef}
-            onSelect={(e) => rememberSelection(e.currentTarget)}
-            onClick={(e) => rememberSelection(e.currentTarget)}
-            onKeyUp={(e) => rememberSelection(e.currentTarget)}
-            onBlur={(e) => rememberSelection(e.currentTarget)}
-            onChange={(e) => onChangeText(beat.beat_id, 'tts_text', e.target.value)}
-            placeholder="留空则自动继承字幕 + 词典替换；填写时必须是整句送音文本..."
-            className="w-full p-2 text-xs text-slate-800 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600 resize-none"
-          />
+          )}
           {tagPickerOpen && (
             <div data-tts-tag-popover className="absolute right-0 top-full z-40 mt-1">
               <TtsTagPicker
@@ -986,38 +1168,27 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
             </div>
           )}
         </div>
-        <div className="mt-1 text-[11px] text-slate-500 leading-snug">
-          {matchedRules.length > 0 ? (
-            <span className="text-blue-700">
-              词典命中：{matchedRules.map((r) => `${r.source}→${r.replacement}`).join('、')}
-              {' · '}实际送音：{spokenText}
-            </span>
-          ) : (
-            <span className="text-slate-400">无词典替换 · 直接按字幕语义合成</span>
-          )}
-        </div>
+        {ttsExpanded && (
+          <div className="mt-1 text-[11px] text-slate-500 leading-snug">
+            {matchedRules.length > 0 ? (
+              <span className="text-blue-700">
+                词典命中：{matchedRules.map((r) => `${r.source}→${r.replacement}`).join('、')}
+                {' · '}实际送音：{spokenText}
+              </span>
+            ) : (
+              <span className="text-slate-400">无词典替换 · 直接按字幕语义合成</span>
+            )}
+          </div>
+        )}
       </td>
 
       <td className="py-3.5 px-3">
         {/* Patch v4.18：移除情绪指令输入框——情绪指令不再由前端设置，
-            合成侧固定使用后端契约里的默认/继承值。 */}
-        <div className="text-[11px] font-mono-tabular text-slate-400">
-          {ttsModel}
-        </div>
-        {/* Patch v3.4：显示「本句配音」（角色 + 音色），并可就地改角色。 */}
-        <div className="mt-1.5 space-y-1">
-          <div className="text-[11px] leading-snug text-slate-600">
-            本句配音：{voiceInfo.label} · {voiceInfo.voice} ·{' '}
-            {voiceInfo.speed.toFixed(2)}x
-            {voiceInfo.pending && (
-              <span className="text-amber-600">（保存重跑后生效）</span>
-            )}
-            {voiceInfo.speedOverridden && (
-              <span className="text-slate-400">
-                （已微调，默认 {voiceInfo.roleSpeed.toFixed(2)}x）
-              </span>
-            )}
-          </div>
+            合成侧固定使用后端契约里的默认/继承值。
+            Patch v4.35：默认只展示「角色 + 落点音色 + 语速」，
+            单句音色选择框点「换音色」再展开；ttsModel 提到审核台顶部展示一次。 */}
+        <div className="space-y-1.5">
+          {/* Patch v3.4：显示「本句配音」（角色 + 音色），并可就地改角色。 */}
           <select
             value={beat.speaker_role ?? ''}
             onChange={(e) => onChangeRole(beat.beat_id, e.target.value)}
@@ -1030,117 +1201,155 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
               </option>
             ))}
           </select>
+          <div className="flex items-center gap-1 text-[11px]">
+            <span
+              className="text-slate-600 truncate"
+              title={`本句配音：${voiceInfo.label} · ${voiceInfo.voiceName} · ${voiceInfo.speed.toFixed(2)}x`}
+            >
+              {voiceInfo.label} · {voiceInfo.voiceName}
+            </span>
+            <button
+              type="button"
+              onClick={() => setVoicePickerOpen(true)}
+              title="改这一句的音色（只影响这一句）"
+              aria-label={`${beat.beat_id} 换音色`}
+              className="shrink-0 rounded border border-slate-200 bg-white px-1 py-0.5 text-[10px] text-slate-500 hover:border-slate-400 hover:text-slate-800"
+            >
+              换音色
+            </button>
+            <button
+              type="button"
+              onClick={() => onPreviewVoice(beat.beat_id, voiceInfo.voice, voiceInfo.speed)}
+              disabled={!previewReady}
+              aria-label={`${beat.beat_id} 试听当前音色样例`}
+              title="播放 MiniMax 静态样例（不消耗 API 额度）"
+              className="shrink-0 w-5 h-5 flex items-center justify-center rounded border border-slate-200 bg-white text-slate-500 hover:border-slate-400 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <Volume2 className="w-3 h-3" />
+            </button>
+          </div>
+          {(voiceInfo.pending || voiceInfo.speedOverridden) && (
+            <div className="text-[10px] leading-snug text-slate-400">
+              {voiceInfo.pending && (
+                <span className="text-amber-600">（保存重跑后生效）</span>
+              )}
+              {voiceInfo.speedOverridden && (
+                <span>（已微调，默认 {voiceInfo.roleSpeed.toFixed(2)}x）</span>
+              )}
+            </div>
+          )}
           {voiceInfo.hint && (
             <div className="text-[10px] leading-snug text-slate-400">
               {voiceInfo.hint}
             </div>
           )}
-          {/* Patch v4.27：单句音色覆盖 —— 给一次性 / 龙套角色单独指定 MiniMax 音色。
-              只改这一句的 voice_override，不动角色，也不影响其它句。 */}
-          <div className="space-y-1">
-            <div className="flex items-center justify-between gap-1 text-[10px] text-slate-400">
-              <span>单句音色覆盖</span>
+          {voicePickerOpen && (
+            /* Patch v4.27：单句音色覆盖 —— 给一次性 / 龙套角色单独指定 MiniMax 音色。
+               只改这一句的 voice_override，不动角色，也不影响其它句。 */
+            <div className="space-y-1">
+              <div className="flex items-center justify-between gap-1 text-[10px] text-slate-400">
+                <span>单句音色覆盖</span>
+                <div className="flex items-center gap-1">
+                  {overrideVoiceId && (
+                    <button
+                      type="button"
+                      onClick={() => onChangeVoiceOverride(beat.beat_id, '')}
+                      aria-label={`${beat.beat_id} 清除单句音色`}
+                      title="清除单句指定，恢复按角色解析音色"
+                      className="rounded border border-slate-200 bg-white px-1 py-0.5 text-[10px] text-slate-500 hover:border-slate-400 hover:text-slate-800"
+                    >
+                      清除
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setVoicePickerOpen(false)}
+                    title="收起单句音色选择"
+                    aria-label={`${beat.beat_id} 收起单句音色选择`}
+                    className="rounded border border-slate-200 bg-white px-1 py-0.5 text-[10px] text-slate-500 hover:border-slate-400 hover:text-slate-800"
+                  >
+                    收起
+                  </button>
+                </div>
+              </div>
+              {customVoiceEditing ? (
+                <div className="flex items-center gap-1">
+                  <input
+                    value={customVoiceDraft}
+                    autoFocus
+                    onChange={(e) => setCustomVoiceDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        commitCustomVoice();
+                      } else if (e.key === 'Escape') {
+                        e.preventDefault();
+                        setCustomVoiceEditing(false);
+                      }
+                    }}
+                    onBlur={() => commitCustomVoice()}
+                    placeholder="填写 MiniMax 音色 ID"
+                    aria-label={`${beat.beat_id} 自定义音色 ID`}
+                    className="w-full px-1.5 py-0.5 text-[11px] bg-white border border-slate-200 rounded focus:outline-none focus:border-blue-600"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setCustomVoiceEditing(false)}
+                    aria-label={`${beat.beat_id} 返回下拉选择音色`}
+                    title="← 返回下拉选择"
+                    className="shrink-0 rounded border border-slate-200 bg-white px-1 py-0.5 text-[10px] text-slate-500 hover:border-slate-400 hover:text-slate-800"
+                  >
+                    ←
+                  </button>
+                </div>
+              ) : (
+                <div className="flex items-center gap-1">
+                  <select
+                    value={customVoiceEditing ? CUSTOM_VOICE : overrideVoiceId}
+                    onChange={(e) => {
+                      const next = e.target.value;
+                      if (next === CUSTOM_VOICE) {
+                        setCustomVoiceDraft(overrideVoiceId);
+                        setCustomVoiceEditing(true);
+                        return;
+                      }
+                      setCustomVoiceEditing(false);
+                      onChangeVoiceOverride(beat.beat_id, next);
+                    }}
+                    aria-label={`${beat.beat_id} 单句音色`}
+                    className="w-full px-1.5 py-0.5 text-[11px] bg-white border border-slate-200 rounded focus:outline-none focus:border-blue-600"
+                  >
+                    <option value="">跟随角色（{roleVoiceDisplayName}）</option>
+                    {overrideVoiceId && !overrideKnown && (
+                      <option value={overrideVoiceId}>自定义：{overrideVoiceId}</option>
+                    )}
+                    {voiceGroups.map((group) => (
+                      <optgroup
+                        key={`${group.provider}-${group.category}`}
+                        label={group.label}
+                      >
+                        {group.items.map((item) => {
+                          const id = item.voice_id || item.id;
+                          return (
+                            <option key={id} value={id}>
+                              {item.display_name} ·{' '}
+                              {item.gender === 'female' ? '女' : '男'}
+                            </option>
+                          );
+                        })}
+                      </optgroup>
+                    ))}
+                    <option value={CUSTOM_VOICE}>✎ 自定义音色 ID…</option>
+                  </select>
+                </div>
+              )}
               {overrideVoiceId && (
-                <button
-                  type="button"
-                  onClick={() => onChangeVoiceOverride(beat.beat_id, '')}
-                  aria-label={`${beat.beat_id} 清除单句音色`}
-                  title="清除单句指定，恢复按角色解析音色"
-                  className="rounded border border-slate-200 bg-white px-1 py-0.5 text-[10px] text-slate-500 hover:border-slate-400 hover:text-slate-800"
-                >
-                  清除
-                </button>
+                <div className="text-[10px] leading-snug text-blue-700">
+                  已单独指定：{voiceInfo.voiceName}
+                </div>
               )}
             </div>
-            {customVoiceEditing ? (
-              <div className="flex items-center gap-1">
-                <input
-                  value={customVoiceDraft}
-                  autoFocus
-                  onChange={(e) => setCustomVoiceDraft(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                      e.preventDefault();
-                      commitCustomVoice();
-                    } else if (e.key === 'Escape') {
-                      e.preventDefault();
-                      setCustomVoiceEditing(false);
-                    }
-                  }}
-                  onBlur={() => commitCustomVoice()}
-                  placeholder="填写 MiniMax 音色 ID"
-                  aria-label={`${beat.beat_id} 自定义音色 ID`}
-                  className="w-full px-1.5 py-0.5 text-[11px] bg-white border border-slate-200 rounded focus:outline-none focus:border-blue-600"
-                />
-                <button
-                  type="button"
-                  onClick={() => setCustomVoiceEditing(false)}
-                  aria-label={`${beat.beat_id} 返回下拉选择音色`}
-                  title="← 返回下拉选择"
-                  className="shrink-0 rounded border border-slate-200 bg-white px-1 py-0.5 text-[10px] text-slate-500 hover:border-slate-400 hover:text-slate-800"
-                >
-                  ←
-                </button>
-              </div>
-            ) : (
-              <div className="flex items-center gap-1">
-                <select
-                  value={customVoiceEditing ? CUSTOM_VOICE : overrideVoiceId}
-                  onChange={(e) => {
-                    const next = e.target.value;
-                    if (next === CUSTOM_VOICE) {
-                      setCustomVoiceDraft(overrideVoiceId);
-                      setCustomVoiceEditing(true);
-                      return;
-                    }
-                    setCustomVoiceEditing(false);
-                    onChangeVoiceOverride(beat.beat_id, next);
-                  }}
-                  aria-label={`${beat.beat_id} 单句音色`}
-                  className="w-full px-1.5 py-0.5 text-[11px] bg-white border border-slate-200 rounded focus:outline-none focus:border-blue-600"
-                >
-                  <option value="">跟随角色（{roleVoiceDisplayName}）</option>
-                  {overrideVoiceId && !overrideKnown && (
-                    <option value={overrideVoiceId}>自定义：{overrideVoiceId}</option>
-                  )}
-                  {voiceGroups.map((group) => (
-                    <optgroup
-                      key={`${group.provider}-${group.category}`}
-                      label={group.label}
-                    >
-                      {group.items.map((item) => {
-                        const id = item.voice_id || item.id;
-                        return (
-                          <option key={id} value={id}>
-                            {item.display_name} ·{' '}
-                            {item.gender === 'female' ? '女' : '男'}
-                          </option>
-                        );
-                      })}
-                    </optgroup>
-                  ))}
-                  <option value={CUSTOM_VOICE}>✎ 自定义音色 ID…</option>
-                </select>
-                <button
-                  type="button"
-                  onClick={() =>
-                    onPreviewVoice(beat.beat_id, voiceInfo.voice, voiceInfo.speed)
-                  }
-                  disabled={!previewReady}
-                  aria-label={`${beat.beat_id} 试听当前音色样例`}
-                  title="播放 MiniMax 静态样例（不消耗 API 额度）"
-                  className="shrink-0 w-6 h-6 flex items-center justify-center rounded border border-slate-200 bg-white text-slate-500 hover:border-slate-400 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-40"
-                >
-                  <Volume2 className="w-3 h-3" />
-                </button>
-              </div>
-            )}
-            {overrideVoiceId && (
-              <div className="text-[10px] leading-snug text-blue-700">
-                已单独指定：{voiceInfo.voiceName}
-              </div>
-            )}
-          </div>
+          )}
           {/* Patch v4.13：表格行紧凑语速微调（-/+ 步进 + 数字 + 恢复默认）。 */}
           <div className="flex items-center gap-1 text-[11px] font-mono-tabular">
             <span className="text-slate-400">语速</span>
@@ -1288,6 +1497,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   onCheckCharacters,
   onAutoPacing,
   onAutoMotions,
+  onAddRule,
   onUpdateEpisodeRenderOptions,
   onExportEpisode,
   onCleanupIntermediates,
@@ -1590,6 +1800,19 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
    * 这个提示把「改了几句、保存后要重跑什么」一次说清。
    */
   const [multiPanelHint, setMultiPanelHint] = useState('');
+  // ---- Patch v4.35：审核台命令栏的本地派生状态 ----
+  /** 即时搜索框的关键词（beat_id / 字幕 / 角色 / 目标分镜）。 */
+  const [scriptQuery, setScriptQuery] = useState('');
+  /** 审核台的轻量筛选档位。 */
+  const [scriptFilter, setScriptFilter] = useState<ScriptFilterKey>('all');
+  /** 「批量处理」下拉菜单是否展开。 */
+  const [batchMenuOpen, setBatchMenuOpen] = useState(false);
+  /** 「+ 多音字规则」快捷弹层是否展开。 */
+  const [rulePopoverOpen, setRulePopoverOpen] = useState(false);
+  /** 多音字规则弹层里的待新增词条草稿。 */
+  const [ruleDraft, setRuleDraft] = useState({ source: '', replacement: '' });
+  /** 已被用户手动关掉的结果条 key（同一 key 不再重复弹出）。 */
+  const [dismissedNotices, setDismissedNotices] = useState<string[]>([]);
   /** Patch v4.23：角色名写法告警的确认弹窗（null = 不显示）。 */
   const [charPrompt, setCharPrompt] = useState<CharacterPrompt | null>(null);
   /**
@@ -1613,6 +1836,20 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   /** Patch v4.11：一键清理过程文件的内联二次确认条与忙碌态。 */
   const [cleanupConfirm, setCleanupConfirm] = useState(false);
   const [cleanupBusy, setCleanupBusy] = useState(false);
+
+  // ---- Patch v4.35：顶部「流水线」与「封页」两块可折叠，首屏空间还给分镜与审核表 ----
+  /**
+   * 折叠态（localStorage 记忆，跨话次保留偏好）。
+   *
+   * 但**有 running / failed 阶段时必须自动展开**——那正是用户此刻要看的东西，
+   * 折叠起来等于把故障藏起来。
+   */
+  const [pipelineCollapsed, setPipelineCollapsed] = useState(() =>
+    readCollapsePref(PIPELINE_COLLAPSE_KEY)
+  );
+  const [brandingCollapsed, setBrandingCollapsed] = useState(() =>
+    readCollapsePref(BRANDING_COLLAPSE_KEY)
+  );
 
   // ---- Patch v4.12：单句重配 TTS + 真实试听 ----
   /** 重配确认条当前指向的 beat_id；非空时显示内联确认条（禁用 window.confirm）。 */
@@ -1980,6 +2217,244 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     return keys;
   }, [draftBeats, episode.beats, storyboardScenes, sceneKeyOfBeat]);
 
+  /**
+   * Patch v4.35：流水线里有没有「正在跑」或「失败」的阶段。
+   *
+   * 有的话强制展开折叠块——用户点开这一页就是想看谁卡住了。
+   */
+  const pipelineNeedsAttention = useMemo(
+    () =>
+      episode.stages.some(
+        (st) => st.status === 'running' || st.status === 'failed'
+      ),
+    [episode.stages]
+  );
+
+  useEffect(() => {
+    if (pipelineNeedsAttention) setPipelineCollapsed(false);
+  }, [pipelineNeedsAttention]);
+
+  /**
+   * Patch v4.35：这些情况下流水线块**不允许折叠**。
+   *
+   * 有阶段在跑 / 跑挂了、或者用户正处在「清理重置 / 清理过程文件」的确认流程里，
+   * 这时把整块折起来等于把问题或半完成的操作藏起来。
+   */
+  const pipelineForceOpen =
+    pipelineNeedsAttention || resetTarget !== null || cleanupConfirm;
+
+  /**
+   * Patch v4.35：封页块在「正在保存 / 保存出错」时不折叠——
+   * 用户要立刻看到保存结果，折叠起来会把反馈吞掉。
+   */
+  const brandingForceOpen = brandingSaving || !!brandingError;
+
+  /** Patch v4.35：折叠 / 展开流水线块（偏好落 localStorage）。 */
+  const togglePipelineCollapsed = useCallback(() => {
+    setPipelineCollapsed((prev) => {
+      const next = !prev;
+      writeCollapsePref(PIPELINE_COLLAPSE_KEY, next);
+      return next;
+    });
+  }, []);
+
+  /** Patch v4.35：折叠 / 展开封页块（偏好落 localStorage）。 */
+  const toggleBrandingCollapsed = useCallback(() => {
+    setBrandingCollapsed((prev) => {
+      const next = !prev;
+      writeCollapsePref(BRANDING_COLLAPSE_KEY, next);
+      return next;
+    });
+  }, []);
+
+  /**
+   * Patch v4.35：流水线摘要条用的阶段概览（已完成 / 总数 + 各阶段状态短记）。
+   */
+  const pipelineSummary = useMemo(() => {
+    const total = episode.stages.length;
+    const done = episode.stages.filter((st) => st.status === 'done').length;
+    const running = episode.stages.filter((st) => st.status === 'running').length;
+    const failed = episode.stages.filter((st) => st.status === 'failed').length;
+    return { total, done, running, failed };
+  }, [episode.stages]);
+
+  /**
+   * Patch v4.35：审核台的搜索 + 筛选命中集合（各档位计数）。
+   *
+   * 搜索口径：beat_id / 字幕原文 / 角色 / 目标分镜 id（任一命中即算命中）。
+   * 筛选档位与命令栏上的五个切换按钮一一对应。
+   */
+  const scriptFilterState = useMemo(() => {
+    const query = scriptQuery.trim().toLowerCase();
+    const counts: Record<ScriptFilterKey, number> = {
+      all: 0,
+      length: 0,
+      multi_panel: 0,
+      custom_tts: 0,
+      voice_tuned: 0,
+    };
+    const matched = new Set<string>();
+    for (const beat of draftBeats) {
+      const charLen = beat.narration_text.trim().length;
+      const isLengthWarn = charLen < 8 || charLen > 30;
+      const isMultiPanel = (beat.target_panel_ids?.length ?? 0) > 1;
+      const { matchedRules } = resolveSpokenText(beat, rules);
+      const isCustomTts = !!beat.tts_text?.trim() || matchedRules.length > 0;
+      const isVoiceTuned =
+        !!beat.voice_override?.trim() || beat.speed_override !== null && beat.speed_override !== undefined;
+      counts.all += 1;
+      if (isLengthWarn) counts.length += 1;
+      if (isMultiPanel) counts.multi_panel += 1;
+      if (isCustomTts) counts.custom_tts += 1;
+      if (isVoiceTuned) counts.voice_tuned += 1;
+      if (query) {
+        const haystack = [
+          beat.beat_id,
+          beat.narration_text,
+          beat.speaker_role ?? '',
+          (beat.target_panel_ids ?? []).join(' '),
+        ]
+          .join(' ')
+          .toLowerCase();
+        if (!haystack.includes(query)) continue;
+      }
+      const pass =
+        scriptFilter === 'all' ||
+        (scriptFilter === 'length' && isLengthWarn) ||
+        (scriptFilter === 'multi_panel' && isMultiPanel) ||
+        (scriptFilter === 'custom_tts' && isCustomTts) ||
+        (scriptFilter === 'voice_tuned' && isVoiceTuned);
+      if (pass) matched.add(beat.beat_id);
+    }
+    return { counts, matched };
+  }, [draftBeats, rules, scriptQuery, scriptFilter]);
+
+  /**
+   * Patch v4.35：未保存的句子条数。
+   *
+   * 命令栏右上角显示「N 处未保存」——比一个模糊的圆点徽标更能说明「还剩多少活没落盘」。
+   * 口径与 dirtySceneKeys 一致：只比对用户可编辑字段。
+   */
+  const dirtyBeatCount = useMemo(() => {
+    const savedMap = new Map(episode.beats.map((beat) => [beat.beat_id, beat]));
+    const draftIds = new Set(draftBeats.map((beat) => beat.beat_id));
+    let count = 0;
+    draftBeats.forEach((beat) => {
+      const other = savedMap.get(beat.beat_id);
+      const changed =
+        !other ||
+        DRAFT_EDITABLE_FIELDS.some(
+          (field) => normDraftField(beat[field]) !== normDraftField(other[field])
+        );
+      if (changed) count += 1;
+    });
+    // 被删掉的句子也算一处未保存。
+    episode.beats.forEach((beat) => {
+      if (!draftIds.has(beat.beat_id)) count += 1;
+    });
+    return count;
+  }, [draftBeats, episode.beats]);
+
+  /**
+   * Patch v4.35：分镜列表的搜索与筛选。
+   *
+   * 一话 200~300 张分镜时，「翻列表找那一格」全靠滚。这里给搜索 + 四态筛选，
+   * 再加 ↑/↓ 键盘切换，找格子的成本从「滚动 + 辨认」降到「输入 + 方向键」。
+   */
+  const [panelQuery, setPanelQuery] = useState('');
+  const [panelFilter, setPanelFilter] = useState<'all' | 'dialogue' | 'skipped' | 'tall'>(
+    'all'
+  );
+  /** Patch v4.35：从分镜详情跳到审核台要高亮的句子。 */
+  const [highlightBeatId, setHighlightBeatId] = useState<string | null>(null);
+  /** Patch v4.35：分镜列表容器（键盘 ↑/↓ 切换时用来 scrollIntoView）。 */
+  const panelListRef = useRef<HTMLDivElement | null>(null);
+  /** Patch v4.35：分镜 → 所属幕（按编排页的幕顺序取第一个命中的）。 */
+  const panelSceneOwner = useMemo(() => {
+    const map = new Map<string, { sceneId: string; sceneIndex: number; title: string }>();
+    (sceneStoryboard?.scenes ?? []).forEach((scene, index) => {
+      scene.panel_ids.forEach((panelId) => {
+        if (!map.has(panelId)) {
+          map.set(panelId, { sceneId: scene.scene_id, sceneIndex: index, title: scene.title });
+        }
+      });
+    });
+    return map;
+  }, [sceneStoryboard]);
+
+  /** Patch v4.35：分镜 → 关联解说句（target_panel_ids 命中即算关联）。 */
+  const panelBeatsByPanel = useMemo(() => {
+    const map = new Map<string, ScriptBeat[]>();
+    draftBeats.forEach((beat) => {
+      (beat.target_panel_ids ?? []).forEach((panelId) => {
+        const list = map.get(panelId) ?? [];
+        list.push(beat);
+        map.set(panelId, list);
+      });
+    });
+    return map;
+  }, [draftBeats]);
+
+  /** Patch v4.35：按搜索 + 筛选过滤后的分镜列表。 */
+  const filteredPanels = useMemo(() => {
+    const query = panelQuery.trim().toLowerCase();
+    return episode.panels.filter((panel) => {
+      if (panelFilter === 'skipped' && !panel.is_transition_blank) return false;
+      if (panelFilter === 'dialogue' && !(panel.dialogues?.length ?? 0)) return false;
+      // Patch v4.35：长竖格判定与后端 TALL_PANEL_RATIO（1.5）同口径。
+      if (panelFilter === 'tall' && !(panel.height > panel.width * 1.5)) return false;
+      if (!query) return true;
+      const dialoguesText = (panel.dialogues ?? []).map((d) => d.text).join(' ');
+      const haystack = `${panel.panel_id} ${panel.scene_summary ?? ''} ${dialoguesText}`.toLowerCase();
+      return haystack.includes(query);
+    });
+  }, [episode.panels, panelFilter, panelQuery]);
+
+  /** Patch v4.35：↑/↓ 切换分镜并把选中项滚进可视区。 */
+  const movePanelSelection = useCallback(
+    (delta: number) => {
+      const list = filteredPanels;
+      if (list.length === 0) return;
+      const current = list.findIndex((p) => p.panel_id === selectedPanelId);
+      const nextIndex =
+        current < 0 ? 0 : Math.min(list.length - 1, Math.max(0, current + delta));
+      const next = list[nextIndex];
+      if (!next) return;
+      setSelectedPanelId(next.panel_id);
+      requestAnimationFrame(() => {
+        const node = panelListRef.current?.querySelector<HTMLElement>(
+          `[data-panel-id="${next.panel_id}"]`
+        );
+        node?.scrollIntoView({ block: 'nearest' });
+      });
+    },
+    [filteredPanels, selectedPanelId]
+  );
+
+  /** Patch v4.35：从分镜详情跳到审核台——展开对应幕并高亮该句。 */
+  const jumpToBeatInScript = useCallback(
+    (beatId: string) => {
+      const group = beatSceneGroups.find((g) => g.beats.some((b) => b.beat_id === beatId));
+      if (group) setExpandedSceneKeys((prev) => new Set(prev).add(group.key));
+      setHighlightBeatId(beatId);
+      setActiveTab('script');
+    },
+    [beatSceneGroups]
+  );
+
+  /** Patch v4.35：从分镜跳到审核台后，把目标行滚到屏幕中央。 */
+  useEffect(() => {
+    if (activeTab !== 'script' || !highlightBeatId) return;
+    const scrollTimer = window.setTimeout(() => {
+      const node = document.querySelector<HTMLElement>(`[data-beat-id="${highlightBeatId}"]`);
+      node?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }, 150);
+    const clearTimer = window.setTimeout(() => setHighlightBeatId(null), 6000);
+    return () => {
+      window.clearTimeout(scrollTimer);
+      window.clearTimeout(clearTimer);
+    };
+  }, [activeTab, expandedSceneKeys, highlightBeatId]);
   const activePanel = useMemo(
     () => panelMap.get(selectedPanelId) ?? episode.panels[0],
     [panelMap, episode.panels, selectedPanelId]
@@ -2907,6 +3382,62 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     };
   }, [episode.episode_id]);
 
+  /**
+   * Patch v4.35：幕 BGM 试听（迷你按钮）。
+   *
+   * 原来每个幕挂一个原生 `<audio controls>`（宽 160px），12 个幕就把幕头部
+   * 撑爆了；换成 [▶/■] 小按钮，并且**全局只保留一个 Audio 实例**，
+   * 点谁停谁，不会出现多幕串音。
+   */
+  const bgmAudioRef = useRef<HTMLAudioElement | null>(null);
+  const [bgmPlayingSceneId, setBgmPlayingSceneId] = useState<string | null>(null);
+
+  const stopBgmPreview = useCallback(() => {
+    const el = bgmAudioRef.current;
+    if (el) {
+      el.pause();
+      el.src = '';
+      bgmAudioRef.current = null;
+    }
+    setBgmPlayingSceneId(null);
+  }, []);
+
+  const toggleBgmPreview = useCallback(
+    (sceneId: string, url: string) => {
+      if (bgmPlayingSceneId === sceneId) {
+        stopBgmPreview();
+        return;
+      }
+      stopBgmPreview();
+      const audio = new Audio(url);
+      bgmAudioRef.current = audio;
+      setBgmPlayingSceneId(sceneId);
+      audio.onended = () => {
+        if (bgmAudioRef.current === audio) {
+          bgmAudioRef.current = null;
+          setBgmPlayingSceneId(null);
+        }
+      };
+      void audio.play().catch(() => {
+        if (bgmAudioRef.current === audio) bgmAudioRef.current = null;
+        setBgmPlayingSceneId(null);
+      });
+    },
+    [bgmPlayingSceneId, stopBgmPreview]
+  );
+
+  // 离开话次时停掉 BGM 试听。
+  useEffect(() => {
+    return () => {
+      const el = bgmAudioRef.current;
+      if (el) {
+        el.pause();
+        el.src = '';
+        bgmAudioRef.current = null;
+      }
+    };
+  }, [episode.episode_id]);
+
   const handlePreviewAudio = useCallback((beatId: string) => {
     // Patch v4.12：只要这一句在清单里有真实时长，就优先播放后端 WAV；
     // 否则退回提示音（S5 未跑或该句尚未合成）。
@@ -3087,6 +3618,27 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   );
 
   /**
+   * Patch v4.35：给这一句再加一格轮播画面。
+   *
+   * 候选范围与下拉一致（编排范围内优先）；已经用过的格不再重复。
+   */
+  const handleRowAddPanelAt = useCallback(
+    (beatId: string) => {
+      const beat = draftBeatsRef.current.find((b) => b.beat_id === beatId);
+      if (!beat) return;
+      const current = beat.target_panel_ids ?? [];
+      const candidates =
+        scopePanelIds.size > 0
+          ? panelOptions.filter((option) => scopePanelIds.has(option.value))
+          : panelOptions;
+      const next = candidates.find((option) => !current.includes(option.value));
+      if (!next) return;
+      updateBeatField(beatId, 'target_panel_ids', [...current, next.value]);
+    },
+    [panelOptions, scopePanelIds, updateBeatField]
+  );
+
+  /**
    * Patch v4.33：一键把「一句多格画面」收敛为「只播主画面」。
    *
    * 背景：Stage 4 会给一句解说配多格分镜（Stage 6 按格数**均分时长**轮播它们）。
@@ -3125,6 +3677,21 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
       updateBeatField(beatId, 'scene_id', sceneId),
     [updateBeatField]
   );
+
+  /**
+   * Patch v4.35：命令栏「+ 多音字规则」弹层的提交动作。
+   *
+   * 只新增送音替换规则（source → replacement），绝不碰字幕原文；
+   * 规则保存后由后端整体覆盖同一 scope，父组件收到后刷新 rules 列表。
+   */
+  const commitRule = useCallback(() => {
+    const source = ruleDraft.source.trim();
+    const replacement = ruleDraft.replacement.trim();
+    if (!source || !replacement || !onAddRule) return;
+    onAddRule({ source, replacement, note: '审核台快捷添加' });
+    setRuleDraft({ source: '', replacement: '' });
+    setRulePopoverOpen(false);
+  }, [onAddRule, ruleDraft.replacement, ruleDraft.source]);
 
   const handleRowToggleTagPicker = useCallback((beatId: string) => {
     setTagPickerBeatId((prev) => (prev === beatId ? null : beatId));
@@ -3339,11 +3906,122 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     ]
   );
 
+  /**
+   * Patch v4.35：审核台结果条候选。
+   *
+   * 以前是 6~8 条并列 Banner 同时占屏，把表格挤到屏幕外；现在收敛成
+   * 「错误 → 提示 → 成功」排序、最多同时显示 2 条，且每条都能手动关掉
+   * （关掉的记在 dismissedNotices 里，不会再冒出来）。
+   */
+  const scriptNotices: Array<{
+    key: string;
+    tone: 'error' | 'success' | 'warn';
+    node: React.ReactNode;
+  }> = [];
+  if (autoPacingError) {
+    scriptNotices.push({
+      key: 'autoPacingError',
+      tone: 'error',
+      node: <span>{autoPacingError}</span>,
+    });
+  }
+  if (autoMotionError) {
+    scriptNotices.push({
+      key: 'autoMotionError',
+      tone: 'error',
+      node: <span>{autoMotionError}</span>,
+    });
+  }
+  if (bgmError) {
+    scriptNotices.push({ key: 'bgmError', tone: 'error', node: <span>{bgmError}</span> });
+  }
+  if (saveHint) {
+    scriptNotices.push({ key: 'saveHint', tone: 'warn', node: <span>{saveHint}</span> });
+  }
+  if (multiPanelHint) {
+    scriptNotices.push({
+      key: 'multiPanelHint',
+      tone: 'warn',
+      node: <span>{multiPanelHint}</span>,
+    });
+  }
+  if (autoPacingSummary) {
+    scriptNotices.push({
+      key: 'autoPacingSummary',
+      tone: 'success',
+      node: autoPacingSummary.updated_count > 0 ? (
+        <>
+          <p>
+            自动节奏留白完成：共调整 {autoPacingSummary.updated_count} 处停顿（跨幕{' '}
+            {autoPacingSummary.scene_end_count} / 转折 {autoPacingSummary.turn_count} / 换气{' '}
+            {autoPacingSummary.breath_count} / 切分镜{' '}
+            {autoPacingSummary.panel_switch_count ?? 0}），已同步{' '}
+            {autoPacingSummary.audio_manifest_synced} 条音频清单。可直接从 S6 重跑，无需重跑 S5
+            配音。
+          </p>
+          {/* Patch v4.8：一键从 S6 重跑成片（只重建时间轴，0 TTS 费用），避免用户手点步骤条又吃到旧停顿。 */}
+          <button
+            type="button"
+            disabled={rerunningStage !== null}
+            onClick={() => void handleStageRerunClick('s6_timeline')}
+            className="mt-1.5 inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-emerald-600 rounded hover:bg-emerald-700 transition-colors cursor-pointer disabled:opacity-50"
+          >
+            {rerunningStage === 's6_timeline' ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <Film className="w-3.5 h-3.5" />
+            )}
+            立即从 S6 重跑成片（0 TTS 费用）
+          </button>
+        </>
+      ) : (
+        <p>自动节奏留白检查完成：现有停顿已符合叙事节奏规则，未做调整。</p>
+      ),
+    });
+  }
+  if (autoMotionSummary) {
+    scriptNotices.push({
+      key: 'autoMotionSummary',
+      tone: 'success',
+      node: autoMotionSummary.updated_count > 0 ? (
+        <>
+          <p>
+            自动分配动效完成：共调整 {autoMotionSummary.updated_count} 处（横扫{' '}
+            {autoMotionSummary.wide_pan_count} / 推拉 {autoMotionSummary.push_pull_count} / 静止{' '}
+            {autoMotionSummary.static_count} / 震动 {autoMotionSummary.shake_count}），重跑
+            S6~S7 即可生效，无需重跑配音。
+          </p>
+          <button
+            type="button"
+            disabled={rerunningStage !== null}
+            onClick={() => void handleStageRerunClick('s6_timeline')}
+            className="mt-1.5 inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-emerald-600 rounded hover:bg-emerald-700 transition-colors cursor-pointer disabled:opacity-50"
+          >
+            {rerunningStage === 's6_timeline' ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <Film className="w-3.5 h-3.5" />
+            )}
+            立即从 S6 重跑成片（0 TTS 费用）
+          </button>
+        </>
+      ) : (
+        <p>自动分配动效检查完成：现有运镜已符合分配规则，未做调整。</p>
+      ),
+    });
+  }
+  if (bgmHint) {
+    scriptNotices.push({ key: 'bgmHint', tone: 'success', node: <span>{bgmHint}</span> });
+  }
   return (
     <div className="space-y-6">
       {/* 8-Step Interactive Pipeline Stepper */}
       <section className="bg-white border border-slate-200 rounded-xl p-5">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
+        <div
+          className={`flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
+            pipelineCollapsed && !pipelineForceOpen ? '' : 'mb-4'
+          }`}
+        >
           <div>
             <h2 className="text-sm font-semibold text-slate-900">
               流水线执行状态与断点重跑（manifest.json）
@@ -3352,8 +4030,9 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
               点击「从此步重跑」或「向后清理」都会先清空该步及全部下游旧产物与完成标记，保证状态与真实成片一致。
             </p>
           </div>
-          <div className="flex items-center gap-3 text-xs font-mono-tabular text-slate-500">
-            <span>
+          {/* Patch v4.35：窄视口（1280）下允许换行，且按钮文字不折行。 */}
+          <div className="flex flex-wrap items-center gap-3 text-xs font-mono-tabular text-slate-500">
+            <span className="whitespace-nowrap">
               {episode.episode_id} · 总时长{' '}
               {totalSimDurationMs > 0 ? formatMs(totalSimDurationMs) : '未合成'}
             </span>
@@ -3363,7 +4042,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                 href={viewerUrl}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-2 py-1 text-[11px] font-medium text-slate-700 hover:border-slate-400 hover:text-slate-900"
+                className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-md border border-slate-300 bg-white px-2 py-1 text-[11px] font-medium text-slate-700 hover:border-slate-400 hover:text-slate-900"
               >
                 <Eye size={12} />
                 查看原漫
@@ -3374,9 +4053,67 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                 本地目录导入
               </span>
             ) : null}
+            {/* Patch v4.35：折叠开关——把首屏垂直空间还给分镜与审核表。 */}
+            <button
+              type="button"
+              onClick={togglePipelineCollapsed}
+              aria-label={pipelineCollapsed ? '展开流水线' : '收起流水线'}
+              title={
+                pipelineCollapsed
+                  ? '展开流水线（显示各阶段状态与重跑入口）'
+                  : '收起流水线，只留一行摘要'
+              }
+              className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-md border border-slate-300 bg-white px-2 py-1 text-[11px] font-medium text-slate-700 hover:border-slate-400 hover:text-slate-900"
+            >
+              {pipelineCollapsed ? (
+                <ChevronDown className="w-3 h-3" />
+              ) : (
+                <ChevronRight className="w-3 h-3" />
+              )}
+              {pipelineCollapsed ? '展开' : '收起'}
+            </button>
           </div>
         </div>
 
+        {pipelineCollapsed && !pipelineForceOpen ? (
+          /* Patch v4.35：折叠态的一行摘要（EP / 阶段总览 / 总时长 / 封页状态）。 */
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border border-slate-200 bg-slate-50/70 px-3 py-2 text-xs text-slate-600">
+            <span className="font-mono-tabular font-semibold text-slate-800">
+              {episode.episode_id}
+            </span>
+            <span className="text-slate-300">·</span>
+            <span>
+              {pipelineSummary.done}/{pipelineSummary.total} 阶段完成
+            </span>
+            {pipelineSummary.running > 0 && (
+              <>
+                <span className="text-slate-300">·</span>
+                <span className="text-blue-600">{pipelineSummary.running} 个执行中</span>
+              </>
+            )}
+            {pipelineSummary.failed > 0 && (
+              <>
+                <span className="text-slate-300">·</span>
+                <span className="text-red-600">{pipelineSummary.failed} 个失败</span>
+              </>
+            )}
+            <span className="text-slate-300">·</span>
+            <span className="font-mono-tabular">
+              总时长 {totalSimDurationMs > 0 ? formatMs(totalSimDurationMs) : '未合成'}
+            </span>
+            <span className="text-slate-300">·</span>
+            <span>封页 {brandingOptions.cover_enabled ? '开' : '关'}</span>
+            <button
+              type="button"
+              onClick={togglePipelineCollapsed}
+              className="ml-auto inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-2 py-1 text-[11px] font-medium text-slate-700 hover:border-slate-400 hover:text-slate-900"
+            >
+              <ChevronDown className="w-3 h-3" />
+              展开流水线
+            </button>
+          </div>
+        ) : (
+          <>
         <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2.5">
           {episode.stages.map((st) => {
             const isDone = st.status === 'done';
@@ -3607,6 +4344,8 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
             </div>
           </div>
         )}
+          </>
+        )}
       </section>
 
       {/* Patch v4.8：重跑前草稿防残留保护——保存失败即中止；送音内容改动需用户裁决；停顿改动自动升级起点。 */}
@@ -3655,13 +4394,17 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
 
       {/* Patch v4.5：本话封页与结尾片包（仅重跑 S7 合成成片即可生效，无需重跑 S4~S6） */}
       <section className="bg-white border border-slate-200 rounded-xl px-5 py-4">
-        <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+        <div
+          className={`flex flex-wrap items-center justify-between gap-3 ${
+            brandingCollapsed && !brandingForceOpen ? '' : 'mb-3'
+          }`}
+        >
           <h3 className="inline-flex items-center gap-2 text-sm font-semibold text-slate-900">
             <Film className="w-4 h-4 text-blue-600" />
             本话封页与结尾片包
             <span className="text-xs font-normal text-slate-400">仅重跑 S7 生效</span>
           </h3>
-          <div className="inline-flex items-center gap-2 text-xs text-slate-500">
+          <div className="inline-flex flex-wrap items-center gap-2 text-xs text-slate-500">
             {brandingSaving && (
               <>
                 <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-600" />
@@ -3682,8 +4425,56 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
             {!brandingSaving && !brandingError && !brandingSavedAt && (
               <span>修改后仅需从 S7 合成成片重跑即可生效</span>
             )}
+            {/* Patch v4.35：折叠开关。 */}
+            <button
+              type="button"
+              onClick={toggleBrandingCollapsed}
+              aria-label={brandingCollapsed ? '展开封页选项' : '收起封页选项'}
+              title={brandingCollapsed ? '展开封页与结尾片包选项' : '收起封页选项，只留一行摘要'}
+              className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-md border border-slate-300 bg-white px-2 py-1 text-[11px] font-medium text-slate-700 hover:border-slate-400 hover:text-slate-900"
+            >
+              {brandingCollapsed ? (
+                <ChevronDown className="w-3 h-3" />
+              ) : (
+                <ChevronRight className="w-3 h-3" />
+              )}
+              {brandingCollapsed ? '展开' : '收起'}
+            </button>
           </div>
         </div>
+        {brandingCollapsed && !brandingForceOpen ? (
+          /* Patch v4.35：折叠态一行摘要。 */
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border border-slate-200 bg-slate-50/70 px-3 py-2 text-xs text-slate-600">
+            <span>封页 {brandingOptions.cover_enabled ? '开' : '关'}</span>
+            <span className="text-slate-300">·</span>
+            <span>
+              结尾图{' '}
+              {EPISODE_OUTRO_OPTIONS.find((o) => o.value === brandingOptions.outro_mode)
+                ?.label ?? brandingOptions.outro_mode}
+            </span>
+            {brandingOptions.cover_text_override && (
+              <>
+                <span className="text-slate-300">·</span>
+                <span className="truncate max-w-[16rem]">
+                  封面文字「{brandingOptions.cover_text_override}」
+                </span>
+              </>
+            )}
+            <span className="text-slate-300">·</span>
+            <span className="font-mono-tabular">
+              总时长 {totalSimDurationMs > 0 ? formatMs(totalSimDurationMs) : '未合成'}
+            </span>
+            <button
+              type="button"
+              onClick={toggleBrandingCollapsed}
+              className="ml-auto inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-2 py-1 text-[11px] font-medium text-slate-700 hover:border-slate-400 hover:text-slate-900"
+            >
+              <ChevronDown className="w-3 h-3" />
+              展开封页选项
+            </button>
+          </div>
+        ) : (
+          <>
         <div className="flex flex-wrap items-end gap-4">
           <label className="inline-flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
             <input
@@ -3732,11 +4523,13 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
             </select>
           </label>
         </div>
+          </>
+        )}
       </section>
 
       {/* Main Studio Workspace Tabs */}
-      <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-        <div className="px-5 py-3.5 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
+      <section className="bg-white border border-slate-200 rounded-xl">
+        <div className="px-5 py-3.5 border-b border-slate-200 rounded-t-xl flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg overflow-x-auto">
             {(
               [
@@ -3768,257 +4561,308 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
             ))}
           </div>
 
+        </div>
           {activeTab === 'script' && (
-            /* Patch v4.34：审核台工具栏改为纯图标（悬停出 title 提示），避免按钮文字把
-               工具条撑出可视区、后面的按钮（如 v4.33 的「全部按主画面」）被挤掉看不见。 */
-            <div className="flex flex-wrap items-center gap-1.5">
-              <button
-                type="button"
-                onClick={handleAddBeat}
-                title="新增解说句"
-                aria-label="新增解说句"
-                className="inline-flex items-center justify-center w-8 h-8 rounded-lg text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 shrink-0 cursor-pointer"
-              >
-                <Plus className="w-4 h-4" />
-              </button>
-              <button
-                type="button"
-                disabled={autoPacingLoading || !onAutoPacing}
-                onClick={() => void handleRunAutoPacing()}
-                title={tableDirty ? '请先保存解说稿再执行自动节奏留白' : '自动节奏留白：按叙事节奏规则优化句间停顿（pause_after_ms）'}
-                aria-label="自动节奏留白"
-                className="inline-flex items-center justify-center w-8 h-8 rounded-lg text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 shrink-0 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
-              >
-                {autoPacingLoading ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : (
-                  <Clock className="w-4 h-4" />
-                )}
-              </button>
-              {/* Patch v4.28：一键自动分配画面动效（按分镜几何 + 情绪自动挑运镜）。 */}
-              <button
-                type="button"
-                disabled={autoMotionLoading || !onAutoMotions}
-                onClick={() => void handleRunAutoMotions()}
-                title={tableDirty ? '请先保存解说稿再执行自动分配动效' : '自动分配动效：按分镜尺寸与情绪自动分配运镜（横扫 / 推拉 / 震动等）'}
-                aria-label="自动分配动效"
-                className="inline-flex items-center justify-center w-8 h-8 rounded-lg text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 shrink-0 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
-              >
-                {autoMotionLoading ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : (
-                  <Wand2 className="w-4 h-4" />
-                )}
-              </button>
-              {/* Patch v4.33：一键把「一句多格画面」收敛成「只播主画面」。
-                  防止成片里出现用户没在审核台逐格确认过的画面。 */}
-              <button
-                type="button"
-                onClick={handleCollapseToMainPanel}
-                title="全部按主画面：把全话所有「一句多格画面」的句子收敛为只播主画面（第 1 格）；想要轮播的行仍可手动加回第 2 格"
-                aria-label="全部按主画面"
-                className="inline-flex items-center justify-center w-8 h-8 rounded-lg text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 shrink-0 cursor-pointer"
-              >
-                <Film className="w-4 h-4" />
-              </button>
-              <button
-                type="button"
-                onClick={() => setBgmDrawerOpen(true)}
-                title="BGM 曲库管理"
-                aria-label="BGM 曲库管理"
-                className="inline-flex items-center justify-center w-8 h-8 rounded-lg text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 shrink-0 cursor-pointer"
-              >
-                <Music className="w-4 h-4" />
-              </button>
-              <button
-                type="button"
-                disabled={suggestBgmLoading}
-                onClick={() => void handleSuggestBgm()}
-                title="补全各幕配乐建议：按各幕标题/地点/视觉摘要与分镜台词，AI 推断五档情绪与搜歌关键词"
-                aria-label="补全各幕配乐建议"
-                className="inline-flex items-center justify-center w-8 h-8 rounded-lg text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 shrink-0 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
-              >
-                {suggestBgmLoading ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : (
-                  <Sparkles className="w-4 h-4" />
-                )}
-              </button>
-              {/* Patch v4.25：默认按幕折叠，这里给出「展开全部 / 全部折叠」快捷入口。 */}
-              <button
-                type="button"
-                onClick={expandAllScenes}
-                title="展开全部幕，逐句审核解说与多音字"
-                aria-label="展开全部幕"
-                className="inline-flex items-center justify-center w-8 h-8 rounded-lg text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 shrink-0 cursor-pointer"
-              >
-                <ChevronDown className="w-4 h-4" />
-              </button>
-              <button
-                type="button"
-                onClick={collapseAllScenes}
-                title="全部折叠，只保留幕标题与要点"
-                aria-label="全部折叠"
-                className="inline-flex items-center justify-center w-8 h-8 rounded-lg text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 shrink-0 cursor-pointer"
-              >
-                <ChevronRight className="w-4 h-4" />
-              </button>
-              {tableDirty && (
-                <span
-                  title="有未保存的改动"
-                  aria-label="有未保存的改动"
-                  className="inline-flex items-center justify-center w-8 h-8 rounded-lg text-amber-700 bg-amber-50 border border-amber-200 shrink-0"
+            /* Patch v4.35：吸顶双区命令栏。
+               左区＝定位（搜索 / 筛选 / 展开折叠），右区＝落盘（未保存计数 + 两个保存按钮），
+               第二行＝批量处理与辅助入口。sticky 让长表格滚动时命令栏始终在手边，
+               也修掉了 v4.34「按钮全挤成图标、标题看不出功能」的可用性问题。 */
+            <div className="sticky top-0 z-20 px-5 py-2.5 bg-white/95 backdrop-blur border-b border-slate-200">
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+                {/* 左区：即时搜索 */}
+                <div className="relative">
+                  <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+                  <input
+                    type="search"
+                    value={scriptQuery}
+                    onChange={(event) => setScriptQuery(event.target.value)}
+                    placeholder="搜索 beat_id / 字幕 / 角色 / 分镜"
+                    aria-label="搜索解说句"
+                    className="w-[240px] pl-8 pr-2 py-1.5 text-xs bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-600/20"
+                  />
+                </div>
+                {/* 左区：轻量筛选（带计数） */}
+                <div className="flex items-center gap-1" role="group" aria-label="解说句筛选">
+                  {SCRIPT_FILTER_ORDER.map((key) => (
+                    <button
+                      key={key}
+                      type="button"
+                      onClick={() => setScriptFilter(key)}
+                      aria-pressed={scriptFilter === key}
+                      className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] rounded-lg border cursor-pointer transition-colors ${
+                        scriptFilter === key
+                          ? 'text-blue-700 bg-blue-50 border-blue-300'
+                          : 'text-slate-600 bg-white border-slate-200 hover:bg-slate-50'
+                      }`}
+                    >
+                      {SCRIPT_FILTER_LABELS[key]}
+                      <span className="font-mono-tabular text-slate-400">
+                        {scriptFilterState.counts[key]}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+                {/* 左区：展开 / 折叠（带文字，v4.25 起保留的能力） */}
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={expandAllScenes}
+                    title="展开全部幕，逐句审核解说与多音字"
+                    className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 cursor-pointer"
+                  >
+                    <ChevronDown className="w-3.5 h-3.5" />
+                    展开全部
+                  </button>
+                  <button
+                    type="button"
+                    onClick={collapseAllScenes}
+                    title="全部折叠，只保留幕标题与要点"
+                    className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 cursor-pointer"
+                  >
+                    <ChevronRight className="w-3.5 h-3.5" />
+                    全部折叠
+                  </button>
+                </div>
+                {/* 右区：未保存计数 + 保存 */}
+                <div className="ml-auto flex items-center gap-2">
+                  <span
+                    title={dirtyBeatCount > 0 ? '这些句子还没保存到磁盘' : '所有改动都已保存'}
+                    className={`text-xs ${dirtyBeatCount > 0 ? 'text-amber-700' : 'text-slate-400'}`}
+                  >
+                    {dirtyBeatCount > 0 ? `${dirtyBeatCount} 处未保存` : '已全部保存'}
+                  </span>
+                  <button
+                    type="button"
+                    disabled={savingBeats || characterCheckBusy}
+                    onClick={() => void handleSaveBeats(false)}
+                    title={characterCheckBusy ? '正在预检角色名写法，请稍候…' : '保存解说稿（Cmd/Ctrl+S）'}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
+                  >
+                    {savingBeats ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <FileText className="w-3.5 h-3.5" />
+                    )}
+                    保存草稿
+                    <kbd className="text-[10px] text-slate-400 font-sans">⌘S</kbd>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={savingBeats || characterCheckBusy}
+                    onClick={() => void handleSaveBeats(true)}
+                    title="保存并从 Stage 5 重跑配音（会作废旧配音重新合成）"
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
+                  >
+                    {savingBeats ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <RotateCcw className="w-3.5 h-3.5" />
+                    )}
+                    保存并重配
+                    <kbd className="text-[10px] text-blue-200 font-sans">⇧⌘S</kbd>
+                  </button>
+                </div>
+              </div>
+
+              {/* 第二行：批量处理 + 辅助入口 */}
+              <div className="flex flex-wrap items-center gap-2 mt-2">
+                <div className="relative">
+                  <button
+                    type="button"
+                    onClick={() => setBatchMenuOpen((open) => !open)}
+                    aria-haspopup="menu"
+                    aria-expanded={batchMenuOpen}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 cursor-pointer"
+                  >
+                    <Wand2 className="w-3.5 h-3.5" />
+                    批量处理
+                    <ChevronDown className="w-3.5 h-3.5" />
+                  </button>
+                  {batchMenuOpen && (
+                    <div
+                      role="menu"
+                      className="absolute left-0 top-full z-30 mt-1 w-[340px] rounded-xl border border-slate-200 bg-white shadow-lg py-1"
+                    >
+                      {(
+                        [
+                          {
+                            key: 'add',
+                            icon: Plus,
+                            title: '新增解说句',
+                            hint: '在末尾加一句新解说；新句要重新配音，需从 S5 起重跑',
+                            run: () => handleAddBeat(),
+                            disabled: false,
+                          },
+                          {
+                            key: 'pacing',
+                            icon: Clock,
+                            title: '自动节奏留白',
+                            hint: '按叙事节奏优化句间停顿；仅需重跑 S6~S7，0 TTS 费用',
+                            run: () => void handleRunAutoPacing(),
+                            disabled: autoPacingLoading || !onAutoPacing,
+                          },
+                          {
+                            key: 'motion',
+                            icon: Wand2,
+                            title: '自动分配动效',
+                            hint: '按分镜尺寸与情绪自动挑运镜；仅需重跑 S6~S7，0 TTS 费用',
+                            run: () => void handleRunAutoMotions(),
+                            disabled: autoMotionLoading || !onAutoMotions,
+                          },
+                          {
+                            key: 'collapse',
+                            icon: Film,
+                            title: '全部按主画面',
+                            hint: '把「一句多格画面」收敛为只播主画面；仅需重跑 S6~S7，0 TTS 费用',
+                            run: () => handleCollapseToMainPanel(),
+                            disabled: false,
+                          },
+                          {
+                            key: 'bgm',
+                            icon: Sparkles,
+                            title: '补全各幕 AI 配乐建议',
+                            hint: 'AI 推断各幕配乐情绪与搜歌关键词；仅需重跑 S7，0 TTS 费用',
+                            run: () => void handleSuggestBgm(),
+                            disabled: suggestBgmLoading,
+                          },
+                        ] as const
+                      ).map((item) => {
+                        const ItemIcon = item.icon;
+                        return (
+                          <button
+                            key={item.key}
+                            type="button"
+                            role="menuitem"
+                            disabled={item.disabled}
+                            onClick={() => {
+                              setBatchMenuOpen(false);
+                              item.run();
+                            }}
+                            className="w-full px-3 py-2 text-left hover:bg-slate-50 flex gap-2.5 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                          >
+                            <ItemIcon className="w-4 h-4 mt-0.5 shrink-0 text-slate-500" />
+                            <span className="min-w-0">
+                              <span className="block text-xs font-medium text-slate-800">
+                                {item.title}
+                              </span>
+                              <span className="block text-[11px] text-slate-500">{item.hint}</span>
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setBgmDrawerOpen(true)}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 cursor-pointer"
                 >
-                  <AlertCircle className="w-4 h-4" />
+                  <Music className="w-3.5 h-3.5" />
+                  BGM 曲库
+                </button>
+                <div className="relative">
+                  <button
+                    type="button"
+                    onClick={() => setRulePopoverOpen((open) => !open)}
+                    aria-expanded={rulePopoverOpen}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 cursor-pointer"
+                  >
+                    <BookOpen className="w-3.5 h-3.5" />
+                    多音字规则
+                  </button>
+                  {rulePopoverOpen && (
+                    <div className="absolute left-0 top-full z-30 mt-1 w-[300px] rounded-xl border border-slate-200 bg-white shadow-lg p-3 space-y-2">
+                      <p className="text-[11px] text-slate-500 leading-relaxed">
+                        就地新增一条送音替换规则（只影响送音文本，不改字幕）。添加后规则列表立即刷新。
+                      </p>
+                      <input
+                        value={ruleDraft.source}
+                        onChange={(event) =>
+                          setRuleDraft((prev) => ({ ...prev, source: event.target.value }))
+                        }
+                        placeholder="原字，如 旻知"
+                        aria-label="多音字原字"
+                        className="w-full px-2 py-1.5 text-xs border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-600/20"
+                      />
+                      <input
+                        value={ruleDraft.replacement}
+                        onChange={(event) =>
+                          setRuleDraft((prev) => ({ ...prev, replacement: event.target.value }))
+                        }
+                        placeholder="送音字，如 闵智"
+                        aria-label="多音字送音字"
+                        className="w-full px-2 py-1.5 text-xs border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-600/20"
+                      />
+                      <div className="flex items-center justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setRuleDraft({ source: '', replacement: '' });
+                            setRulePopoverOpen(false);
+                          }}
+                          className="px-2.5 py-1 text-xs text-slate-600 hover:text-slate-900 cursor-pointer"
+                        >
+                          取消
+                        </button>
+                        <button
+                          type="button"
+                          onClick={commitRule}
+                          disabled={!ruleDraft.source.trim() || !ruleDraft.replacement.trim() || !onAddRule}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          <Plus className="w-3.5 h-3.5" />
+                          添加规则
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+                {/* Patch v4.35：配音模型只在这里展示一次，不再在 120 行里重复。 */}
+                <span className="ml-auto text-[11px] text-slate-500">
+                  配音模型：{config.ttsModel}
                 </span>
-              )}
-              <button
-                type="button"
-                disabled={savingBeats || characterCheckBusy}
-                title={
-                  characterCheckBusy
-                    ? '正在预检角色名写法，请稍候…'
-                    : '保存解说稿（Cmd/Ctrl+S）'
-                }
-                aria-label="保存解说稿"
-                onClick={() => void handleSaveBeats(false)}
-                className={`inline-flex items-center justify-center w-8 h-8 rounded-lg shrink-0 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed ${
-                  tableDirty
-                    ? 'text-blue-700 bg-blue-50 border border-blue-300 hover:bg-blue-100'
-                    : 'text-slate-700 bg-white border border-slate-200 hover:bg-slate-50'
-                }`}
-              >
-                {savingBeats ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : (
-                  <FileText className="w-4 h-4" />
-                )}
-              </button>
-              <button
-                type="button"
-                disabled={savingBeats || characterCheckBusy}
-                onClick={() => void handleSaveBeats(true)}
-                title="保存并从 Stage 5 重跑配音（会作废旧配音重新合成）"
-                aria-label="保存并从 Stage 5 重跑配音"
-                className="inline-flex items-center justify-center w-8 h-8 rounded-lg text-white bg-blue-600 hover:bg-blue-700 shrink-0 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
-              >
-                {savingBeats ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : (
-                  <RotateCcw className="w-4 h-4" />
-                )}
-              </button>
+              </div>
             </div>
           )}
-        </div>
 
-        {activeTab === 'script' && saveHint && (
-          <div className="mt-2 flex items-start gap-2 px-3 py-2 text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg">
-            <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
-            <span>{saveHint}</span>
-          </div>
-        )}
-
-        {activeTab === 'script' && autoPacingSummary && (
-          <div className="mt-2 flex items-start gap-2 px-3 py-2 text-xs text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg">
-            <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0" />
-            <div className="space-y-0.5 flex-1">
-              {autoPacingSummary.updated_count > 0 ? (
-                <>
-                  <p>
-                    自动节奏留白完成：共调整 {autoPacingSummary.updated_count} 处停顿（跨幕{' '}
-                    {autoPacingSummary.scene_end_count} / 转折 {autoPacingSummary.turn_count} / 换气{' '}
-                    {autoPacingSummary.breath_count} / 切分镜{' '}
-                    {autoPacingSummary.panel_switch_count ?? 0}），已同步{' '}
-                    {autoPacingSummary.audio_manifest_synced} 条音频清单。可直接从 S6 重跑，无需重跑 S5
-                    配音。
-                  </p>
-                  {/* Patch v4.8：一键从 S6 重跑成片（只重建时间轴，0 TTS 费用），避免用户手点步骤条又吃到旧停顿。 */}
+        {activeTab === 'script' && scriptNotices.length > 0 && (
+          /* Patch v4.35：结果条收敛为「最多 2 条 + 可关闭」，
+             避免 6~8 条并列 Banner 把表格挤到屏幕外。 */
+          <div className="mt-2 space-y-2">
+            {scriptNotices
+              .filter((notice) => !dismissedNotices.includes(notice.key))
+              .slice(0, 2)
+              .map((notice) => (
+                <div
+                  key={notice.key}
+                  className={`flex items-start gap-2 px-3 py-2 text-xs rounded-lg border ${
+                    notice.tone === 'error'
+                      ? 'text-red-700 bg-red-50 border-red-200'
+                      : notice.tone === 'success'
+                        ? 'text-emerald-800 bg-emerald-50 border-emerald-200'
+                        : 'text-amber-800 bg-amber-50 border-amber-200'
+                  }`}
+                >
+                  {notice.tone === 'success' ? (
+                    <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0" />
+                  ) : notice.tone === 'error' ? (
+                    <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+                  ) : (
+                    <Film className="w-4 h-4 mt-0.5 shrink-0" />
+                  )}
+                  <div className="space-y-0.5 flex-1">{notice.node}</div>
                   <button
                     type="button"
-                    disabled={rerunningStage !== null}
-                    onClick={() => void handleStageRerunClick('s6_timeline')}
-                    className="mt-1.5 inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-emerald-600 rounded hover:bg-emerald-700 transition-colors cursor-pointer disabled:opacity-50"
+                    onClick={() => setDismissedNotices((prev) => [...prev, notice.key])}
+                    title="关闭这条提示"
+                    aria-label="关闭这条提示"
+                    className="shrink-0 opacity-60 hover:opacity-100 cursor-pointer"
                   >
-                    {rerunningStage === 's6_timeline' ? (
-                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    ) : (
-                      <Film className="w-3.5 h-3.5" />
-                    )}
-                    立即从 S6 重跑成片（0 TTS 费用）
+                    <X className="w-3.5 h-3.5" />
                   </button>
-                </>
-              ) : (
-                <p>自动节奏留白检查完成：现有停顿已符合叙事节奏规则，未做调整。</p>
-              )}
-            </div>
-          </div>
-        )}
-        {activeTab === 'script' && autoPacingError && (
-          <div className="mt-2 flex items-start gap-2 px-3 py-2 text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg">
-            <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
-            <span>{autoPacingError}</span>
-          </div>
-        )}
-
-        {/* Patch v4.28：自动分配动效结果条——只改运镜，配音不动。 */}
-        {activeTab === 'script' && autoMotionSummary && (
-          <div className="mt-2 flex items-start gap-2 px-3 py-2 text-xs text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg">
-            <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0" />
-            <div className="space-y-0.5 flex-1">
-              {autoMotionSummary.updated_count > 0 ? (
-                <>
-                  <p>
-                    自动分配动效完成：共调整 {autoMotionSummary.updated_count} 处（横扫{' '}
-                    {autoMotionSummary.wide_pan_count} / 推拉{' '}
-                    {autoMotionSummary.push_pull_count} / 静止{' '}
-                    {autoMotionSummary.static_count} / 震动{' '}
-                    {autoMotionSummary.shake_count}），重跑 S6~S7 即可生效，无需重跑配音。
-                  </p>
-                  <button
-                    type="button"
-                    disabled={rerunningStage !== null}
-                    onClick={() => void handleStageRerunClick('s6_timeline')}
-                    className="mt-1.5 inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-emerald-600 rounded hover:bg-emerald-700 transition-colors cursor-pointer disabled:opacity-50"
-                  >
-                    {rerunningStage === 's6_timeline' ? (
-                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    ) : (
-                      <Film className="w-3.5 h-3.5" />
-                    )}
-                    立即从 S6 重跑成片（0 TTS 费用）
-                  </button>
-                </>
-              ) : (
-                <p>自动分配动效检查完成：现有运镜已符合分配规则，未做调整。</p>
-              )}
-            </div>
-          </div>
-        )}
-        {activeTab === 'script' && autoMotionError && (
-          <div className="mt-2 flex items-start gap-2 px-3 py-2 text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg">
-            <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
-            <span>{autoMotionError}</span>
-          </div>
-        )}
-        {/* Patch v4.33：「全部按主画面」结果条。 */}
-        {activeTab === 'script' && multiPanelHint && (
-          <div className="mt-2 flex items-start gap-2 px-3 py-2 text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-lg">
-            <Film className="w-4 h-4 mt-0.5 shrink-0" />
-            <span>{multiPanelHint}</span>
-          </div>
-        )}
-
-        {activeTab === 'script' && bgmHint && (
-          <div className="mt-2 flex items-start gap-2 px-3 py-2 text-xs text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg">
-            <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0" />
-            <span>{bgmHint}</span>
-          </div>
-        )}
-        {activeTab === 'script' && bgmError && (
-          <div className="mt-2 flex items-start gap-2 px-3 py-2 text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg">
-            <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
-            <span>{bgmError}</span>
+                </div>
+              ))}
           </div>
         )}
 
@@ -4045,135 +4889,302 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
             {/* TAB 1: Panels & Vision Inspector */}
             {activeTab === 'panels' && activePanel && (
               <div className="p-5 grid grid-cols-1 lg:grid-cols-12 gap-6">
-                {/* Panel Strip */}
-                <div className="lg:col-span-4 space-y-2.5 max-h-[620px] overflow-y-auto pr-1">
-                  {episode.panels.map((p) => {
-                    const isSelected = p.panel_id === activePanel.panel_id;
-                    return (
-                      <button
-                        key={p.panel_id}
-                        type="button"
-                        onClick={() => setSelectedPanelId(p.panel_id)}
-                        className={`w-full text-left p-2.5 rounded-lg border flex items-start gap-3 transition-colors cursor-pointer [content-visibility:auto] [contain-intrinsic-size:88px] ${
-                          isSelected
-                            ? 'border-blue-600 bg-blue-50/40'
-                            : 'border-slate-200 hover:bg-slate-50'
-                        } ${p.is_transition_blank ? 'opacity-50' : ''}`}
-                      >
-                        {/* Patch v4.25：缩略图走 ?w=180，并让浏览器懒加载；
-                            容器用 content-visibility:auto，200~300 张也不会一次性解码。 */}
-                        <img
-                          src={panelThumbUrl(p.image_url, 180)}
-                          alt={p.panel_id}
-                          referrerPolicy="no-referrer"
-                          loading="lazy"
-                          decoding="async"
-                          className="w-16 h-20 object-cover rounded border border-slate-200 shrink-0"
-                        />
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-xs font-mono-tabular font-semibold text-slate-900">
-                              {p.panel_id}
-                            </span>
-                            <span className="text-[11px] font-mono-tabular text-slate-500">
-                              切片 {p.source_slice_range[0]}–{p.source_slice_range[1]}
-                            </span>
-                          </div>
-                          <p className="text-xs text-slate-600 line-clamp-2 mt-1">
-                            {p.scene_summary}
-                          </p>
-                          <div className="text-[11px] text-slate-400 font-mono-tabular mt-1.5">
-                            {p.width}×{p.height} · {p.dialogues.length} 条气泡
-                            {p.is_transition_blank ? ' · 已标记跳过' : ''}
-                          </div>
-                        </div>
-                      </button>
-                    );
-                  })}
+                {/* 左列：搜索 + 筛选 + 分镜列表 */}
+                <div className="lg:col-span-4 space-y-3">
+                  {/* Patch v4.35：搜索 + 四态筛选（原来只能一路往下滚）。 */}
+                  <div className="space-y-2">
+                    <div className="relative">
+                      <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+                      <input
+                        type="search"
+                        value={panelQuery}
+                        onChange={(event) => setPanelQuery(event.target.value)}
+                        placeholder="搜索分镜号 / 画面描述 / 气泡台词"
+                        aria-label="搜索分镜"
+                        className="w-full pl-8 pr-2 py-1.5 text-xs bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-600/20"
+                      />
+                    </div>
+                    <div
+                      className="flex flex-wrap items-center gap-1"
+                      role="group"
+                      aria-label="分镜筛选"
+                    >
+                      {(
+                        [
+                          { key: 'all', label: '全部' },
+                          { key: 'dialogue', label: '有台词' },
+                          { key: 'skipped', label: '已跳过' },
+                          { key: 'tall', label: '长竖格' },
+                        ] as const
+                      ).map((item) => (
+                        <button
+                          key={item.key}
+                          type="button"
+                          onClick={() => setPanelFilter(item.key)}
+                          aria-pressed={panelFilter === item.key}
+                          className={`px-2 py-1 text-[11px] rounded-lg border cursor-pointer transition-colors ${
+                            panelFilter === item.key
+                              ? 'text-blue-700 bg-blue-50 border-blue-300'
+                              : 'text-slate-600 bg-white border-slate-200 hover:bg-slate-50'
+                          }`}
+                        >
+                          {item.label}
+                        </button>
+                      ))}
+                      <span className="ml-auto text-[11px] font-mono-tabular text-slate-400">
+                        {filteredPanels.length} / {episode.panels.length}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Patch v4.35：↑ / ↓ 键盘切换分镜（容器聚焦后可用）。 */}
+                  <div
+                    ref={panelListRef}
+                    tabIndex={0}
+                    onKeyDown={(event) => {
+                      if (event.key === 'ArrowDown') {
+                        event.preventDefault();
+                        movePanelSelection(1);
+                      } else if (event.key === 'ArrowUp') {
+                        event.preventDefault();
+                        movePanelSelection(-1);
+                      }
+                    }}
+                    title="点一下列表后可用 ↑ / ↓ 切换分镜"
+                    className="space-y-2.5 max-h-[560px] overflow-y-auto pr-1 rounded-lg focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-600/30"
+                  >
+                    {filteredPanels.length === 0 ? (
+                      <p className="px-3 py-6 text-xs text-slate-500 text-center">
+                        没有符合当前筛选的分镜，换个筛选或清空搜索词试试。
+                      </p>
+                    ) : (
+                      filteredPanels.map((p) => {
+                        const isSelected = p.panel_id === activePanel.panel_id;
+                        const owner = panelSceneOwner.get(p.panel_id);
+                        const beatCount = panelBeatsByPanel.get(p.panel_id)?.length ?? 0;
+                        return (
+                          <button
+                            key={p.panel_id}
+                            type="button"
+                            data-panel-id={p.panel_id}
+                            onClick={() => setSelectedPanelId(p.panel_id)}
+                            className={`w-full text-left p-2.5 rounded-lg border flex items-start gap-3 transition-colors cursor-pointer [content-visibility:auto] [contain-intrinsic-size:88px] ${
+                              isSelected
+                                ? 'border-blue-600 bg-blue-50/40'
+                                : 'border-slate-200 hover:bg-slate-50'
+                            } ${p.is_transition_blank ? 'opacity-50' : ''}`}
+                          >
+                            {/* Patch v4.25：缩略图走 ?w=180，并让浏览器懒加载；
+                                容器用 content-visibility:auto，200~300 张也不会一次性解码。 */}
+                            <img
+                              src={panelThumbUrl(p.image_url, 180)}
+                              alt={p.panel_id}
+                              referrerPolicy="no-referrer"
+                              loading="lazy"
+                              decoding="async"
+                              className="w-16 h-20 object-cover rounded border border-slate-200 shrink-0"
+                            />
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="text-xs font-mono-tabular font-semibold text-slate-900">
+                                  {p.panel_id}
+                                </span>
+                                <span className="text-[11px] font-mono-tabular text-slate-500">
+                                  切片 {p.source_slice_range[0]}–{p.source_slice_range[1]}
+                                </span>
+                              </div>
+                              <p className="text-xs text-slate-600 line-clamp-2 mt-1">
+                                {p.scene_summary}
+                              </p>
+                              {/* Patch v4.35：补上「所属幕次」与「关联句数」，一眼看出这格在成片里的位置。 */}
+                              <div className="text-[11px] text-slate-400 font-mono-tabular mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1">
+                                <span>
+                                  {p.width}×{p.height}
+                                </span>
+                                <span>{p.dialogues.length} 条气泡</span>
+                                {owner ? (
+                                  <span className="text-blue-600 not-italic">
+                                    第 {owner.sceneIndex + 1} 幕 · {owner.title}
+                                  </span>
+                                ) : (
+                                  <span>未编入任何幕</span>
+                                )}
+                                {beatCount > 0 ? (
+                                  <span className="text-emerald-600">{beatCount} 句引用</span>
+                                ) : (
+                                  <span>未被引用</span>
+                                )}
+                                {p.is_transition_blank ? <span>已跳过</span> : null}
+                              </div>
+                            </div>
+                          </button>
+                        );
+                      })
+                    )}
+                  </div>
                 </div>
 
-                {/* Selected Panel Detail + Focus Region Overlay */}
-                <div className="lg:col-span-8 grid grid-cols-1 md:grid-cols-2 gap-6 items-start">
-                  <div className="bg-slate-900 rounded-xl p-3 flex flex-col items-center">
-                    <div className="relative w-full max-w-[300px] aspect-[3/4] overflow-hidden rounded-lg">
-                      <img
-                        src={activePanel.image_url}
-                        alt={activePanel.panel_id}
-                        referrerPolicy="no-referrer"
-                        className="w-full h-full object-cover"
-                      />
-                      {showFocusOverlay && (
-                        <div
-                          className="absolute border-2 border-amber-400 bg-amber-400/10 pointer-events-none"
-                          style={{
-                            left: `${activePanel.focus_region[0] * 100}%`,
-                            top: `${activePanel.focus_region[1] * 100}%`,
-                            width: `${(activePanel.focus_region[2] - activePanel.focus_region[0]) * 100}%`,
-                            height: `${(activePanel.focus_region[3] - activePanel.focus_region[1]) * 100}%`,
-                          }}
-                        >
-                          <span className="inline-block bg-amber-400 text-slate-950 text-[10px] font-mono-tabular font-semibold px-1">
-                            focus_region
-                          </span>
-                        </div>
-                      )}
-                    </div>
-
-                    <div className="w-full flex items-center justify-between mt-3 pt-3 border-t border-slate-800 text-xs text-slate-300">
-                      <label className="inline-flex items-center gap-2 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={showFocusOverlay}
-                          onChange={(e) => setShowFocusOverlay(e.target.checked)}
-                          className="rounded border-slate-600"
-                        />
-                        显示视觉焦点框
-                      </label>
+                {/* 右列：紧凑信息头 + 真比例预览 + 画面详情 */}
+                <div className="lg:col-span-8 space-y-4">
+                  {/* Patch v4.35：紧凑信息头（分镜号 / 尺寸 / 切片 / 跳过切换 / 上下格）。 */}
+                  <div className="flex flex-wrap items-center gap-x-4 gap-y-2 px-3.5 py-2.5 border border-slate-200 rounded-lg bg-slate-50/60">
+                    <span className="text-sm font-mono-tabular font-semibold text-slate-900">
+                      {activePanel.panel_id}
+                    </span>
+                    <span className="text-xs text-slate-600 font-mono-tabular">
+                      {activePanel.width}×{activePanel.height}
+                    </span>
+                    <span className="text-xs text-slate-500 font-mono-tabular">
+                      切片 {activePanel.source_slice_range[0]}–{activePanel.source_slice_range[1]}
+                    </span>
+                    {activePanel.is_transition_blank ? (
+                      <span className="text-[11px] text-amber-700">已标记跳过</span>
+                    ) : null}
+                    <div className="ml-auto flex items-center gap-1.5">
                       <button
                         type="button"
-                        onClick={() => onTogglePanelBlank(episode.episode_id, activePanel.panel_id)}
-                        className="text-xs text-slate-300 hover:text-white underline cursor-pointer"
+                        onClick={() => movePanelSelection(-1)}
+                        className="px-2 py-1 text-[11px] text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 cursor-pointer"
+                      >
+                        上一格
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => movePanelSelection(1)}
+                        className="px-2 py-1 text-[11px] text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 cursor-pointer"
+                      >
+                        下一格
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onTogglePanelBlank(episode.episode_id, activePanel.panel_id)
+                        }
+                        className="px-2 py-1 text-[11px] text-slate-600 underline cursor-pointer"
                       >
                         {activePanel.is_transition_blank ? '恢复参与剪辑' : '标记为过渡废格(跳过)'}
                       </button>
                     </div>
                   </div>
 
-                  <div className="space-y-4">
-                    <div>
-                      <div className="text-xs font-medium text-slate-500">
-                        {config.visionModel} 画面描述 (scene_summary)
-                      </div>
-                      <p className="text-sm text-slate-900 mt-1 leading-relaxed">
-                        {activePanel.scene_summary}
-                      </p>
-                    </div>
-
-                    <div className="pt-3 border-t border-slate-100">
-                      <div className="text-xs font-medium text-slate-500 mb-2">
-                        气泡 OCR 与说话人归因 (dialogues)
-                      </div>
-                      <div className="space-y-2">
-                        {activePanel.dialogues.map((d, idx) => (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-start">
+                    <div className="bg-slate-900 rounded-xl p-3 flex flex-col items-center">
+                      {/* Patch v4.35：按真实比例渲染。
+                          原来固定 aspect-[3/4] + object-cover 会把长竖图裁掉，
+                          focus_region 覆盖框因此和真实画面完全对不上。 */}
+                      <div
+                        className="relative w-full max-w-[320px] overflow-hidden rounded-lg"
+                        style={{
+                          aspectRatio: `${activePanel.width} / ${activePanel.height}`,
+                          maxHeight: '68vh',
+                        }}
+                      >
+                        <img
+                          src={activePanel.image_url}
+                          alt={activePanel.panel_id}
+                          referrerPolicy="no-referrer"
+                          className="w-full h-full object-contain"
+                        />
+                        {showFocusOverlay && (
                           <div
-                            key={idx}
-                            className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs"
+                            className="absolute border-2 border-amber-400 bg-amber-400/10 pointer-events-none"
+                            style={{
+                              left: `${activePanel.focus_region[0] * 100}%`,
+                              top: `${activePanel.focus_region[1] * 100}%`,
+                              width: `${(activePanel.focus_region[2] - activePanel.focus_region[0]) * 100}%`,
+                              height: `${(activePanel.focus_region[3] - activePanel.focus_region[1]) * 100}%`,
+                            }}
                           >
-                            <div className="flex items-center justify-between text-slate-500 mb-1">
-                              <span className="font-semibold text-slate-800">{d.speaker_guess}</span>
-                              <span className="font-mono-tabular">emotion: {d.emotion}</span>
-                            </div>
-                            <p className="text-slate-800">{d.text}</p>
+                            <span className="inline-block bg-amber-400 text-slate-950 text-[10px] font-mono-tabular font-semibold px-1">
+                              focus_region
+                            </span>
                           </div>
-                        ))}
+                        )}
+                      </div>
+
+                      <div className="w-full flex items-center justify-between mt-3 pt-3 border-t border-slate-800 text-xs text-slate-300">
+                        <label className="inline-flex items-center gap-2 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={showFocusOverlay}
+                            onChange={(e) => setShowFocusOverlay(e.target.checked)}
+                            className="rounded border-slate-600"
+                          />
+                          显示视觉焦点框
+                        </label>
+                        <span className="font-mono-tabular text-slate-400">
+                          [{activePanel.focus_region.map((n) => n.toFixed(2)).join(', ')}]
+                        </span>
                       </div>
                     </div>
 
-                    <div className="pt-3 border-t border-slate-100 flex items-center justify-between text-xs text-slate-600">
-                      <span>拟声词 (sfx_list)：{activePanel.sfx_list.join(' / ') || '无'}</span>
-                      <span className="font-mono-tabular text-slate-400">
-                        [{activePanel.focus_region.map((n) => n.toFixed(2)).join(', ')}]
-                      </span>
+                    <div className="space-y-4">
+                      <div>
+                        <div className="text-xs font-medium text-slate-500">
+                          {config.visionModel} 画面描述 (scene_summary)
+                        </div>
+                        <p className="text-sm text-slate-900 mt-1 leading-relaxed">
+                          {activePanel.scene_summary}
+                        </p>
+                      </div>
+
+                      <div className="pt-3 border-t border-slate-100">
+                        <div className="text-xs font-medium text-slate-500 mb-2">
+                          气泡 OCR 与说话人归因 (dialogues)
+                        </div>
+                        {activePanel.dialogues.length === 0 ? (
+                          <p className="text-xs text-slate-400 px-1 py-2">
+                            这一格没有识别到气泡文字（纯画面分镜或 OCR 未命中）。
+                          </p>
+                        ) : (
+                          <div className="space-y-2">
+                            {activePanel.dialogues.map((d, idx) => (
+                              <div
+                                key={idx}
+                                className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs"
+                              >
+                                <div className="flex items-center justify-between text-slate-500 mb-1">
+                                  <span className="font-semibold text-slate-800">
+                                    {d.speaker_guess}
+                                  </span>
+                                  <span className="font-mono-tabular">emotion: {d.emotion}</span>
+                                </div>
+                                <p className="text-slate-800">{d.text}</p>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="pt-3 border-t border-slate-100 text-xs text-slate-600">
+                        <span>拟声词 (sfx_list)：{activePanel.sfx_list.join(' / ') || '无'}</span>
+                      </div>
+
+                      {/* Patch v4.35：关联解说句——点一下直接跳到审核台并高亮那一行。 */}
+                      <div className="pt-3 border-t border-slate-100">
+                        <div className="text-xs font-medium text-slate-500 mb-2">
+                          关联解说句（{panelBeatsByPanel.get(activePanel.panel_id)?.length ?? 0}）
+                        </div>
+                        {(panelBeatsByPanel.get(activePanel.panel_id) ?? []).length === 0 ? (
+                          <p className="text-xs text-slate-400 px-1 py-2">
+                            这一格还没有被任何解说句引用，成片里不会出现。
+                          </p>
+                        ) : (
+                          <div className="flex flex-wrap gap-1.5">
+                            {(panelBeatsByPanel.get(activePanel.panel_id) ?? []).map((b) => (
+                              <button
+                                key={b.beat_id}
+                                type="button"
+                                onClick={() => jumpToBeatInScript(b.beat_id)}
+                                title={`跳到审核台：${b.narration_text.slice(0, 40)}`}
+                                className="px-2 py-1 text-[11px] font-mono-tabular text-blue-700 bg-blue-50 border border-blue-200 rounded-lg hover:bg-blue-100 cursor-pointer"
+                              >
+                                {b.beat_id}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -4261,30 +5272,30 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                             {group.beats.length} 句 · 配音合计{' '}
                             {(sceneDurationMs / 1000).toFixed(1)}s
                           </p>
+                          {/* Patch v4.35：去掉「未保存 / bgm_mood」胶囊徽标，
+                              改成一行纯文本 + 圆点分隔，别把幕头部撑成两行。 */}
+                          {(dirtySceneKeys.has(group.key) ||
+                            (scene && (scene.bgm_mood || scene.bgm_suggestion))) && (
+                            <p className="text-[11px] text-slate-500 flex items-center gap-1.5 flex-wrap mt-0.5">
+                              {dirtySceneKeys.has(group.key) && (
+                                <span className="text-amber-600" title="这一幕有未保存的改动">
+                                  未保存
+                                </span>
+                              )}
+                              {scene?.bgm_mood && (
+                                <span className="inline-flex items-center gap-1 text-violet-600">
+                                  <Music className="h-3 w-3" />
+                                  {scene.bgm_mood}
+                                </span>
+                              )}
+                              {scene?.bgm_suggestion && (
+                                <span className="truncate max-w-[16rem]" title={scene.bgm_suggestion}>
+                                  {scene.bgm_suggestion}
+                                </span>
+                              )}
+                            </p>
+                          )}
                         </div>
-                        {/* Patch v4.25：这一幕还有没落盘的改动，折叠时也能看到。 */}
-                        {dirtySceneKeys.has(group.key) && (
-                          <span
-                            className="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[11px] text-amber-700 whitespace-nowrap"
-                            title="这一幕有未保存的改动"
-                          >
-                            未保存
-                          </span>
-                        )}
-                        {scene && (scene.bgm_mood || scene.bgm_suggestion) && (
-                          <span
-                            className="inline-flex items-center gap-1.5 rounded-full border border-violet-200 bg-violet-50 px-2.5 py-1 text-[11px] text-violet-700 max-w-[24rem]"
-                            title={scene.bgm_suggestion}
-                          >
-                            <Music className="h-3.5 w-3.5 shrink-0" />
-                            {scene.bgm_mood && (
-                              <span className="font-medium shrink-0">{scene.bgm_mood}</span>
-                            )}
-                            {scene.bgm_suggestion && (
-                              <span className="truncate">{scene.bgm_suggestion}</span>
-                            )}
-                          </span>
-                        )}
                         {scene && (
                           // Patch v4.25：点 BGM 控件不能顺手把幕折叠掉。
                           <div
@@ -4332,20 +5343,32 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                             </select>
                             {isAutoMatched && autoMatchedTrack && (
                               <span
-                                className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] text-emerald-700 whitespace-nowrap"
+                                className="text-[11px] text-emerald-700 whitespace-nowrap"
                                 title="本幕未显式选曲，按情绪档自动命中的曲目"
                               >
                                 自动命中：{autoMatchedTrack.filename}
                               </span>
                             )}
                             {selectedTrack && (
-                              <audio
-                                controls
-                                preload="none"
-                                src={selectedTrack.url}
-                                className="h-8 w-40"
+                              /* Patch v4.35：原生 <audio controls>（160px）换成迷你按钮，
+                                 全局单一 Audio 实例，点谁停谁。 */
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  toggleBgmPreview(scene.scene_id, selectedTrack.url)
+                                }
+                                aria-label={
+                                  isAutoMatched ? '试听自动命中的曲目' : '试听本幕曲目'
+                                }
                                 title={isAutoMatched ? '试听自动命中的曲目' : '试听本幕曲目'}
-                              />
+                                className="w-7 h-7 flex items-center justify-center rounded border border-slate-200 bg-white text-slate-500 hover:border-slate-400 hover:text-slate-900 cursor-pointer"
+                              >
+                                {bgmPlayingSceneId === scene.scene_id ? (
+                                  <Square className="w-3 h-3" />
+                                ) : (
+                                  <Play className="w-3 h-3" />
+                                )}
+                              </button>
                             )}
                             {sceneBgmSavingId === scene.scene_id && (
                               <Loader2 className="h-4 w-4 animate-spin text-blue-600" />
@@ -4405,6 +5428,8 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                                   onChangePanelAt={handleRowChangePanelAt}
                                   onRemovePanelAt={handleRowRemovePanelAt}
                                   scopePanelIds={scopePanelIds}
+                                  panelsById={panelMap}
+                                  onAddPanelAt={handleRowAddPanelAt}
                                   onChangeScene={handleRowChangeScene}
                                   onToggleTagPicker={handleRowToggleTagPicker}
                                   onPickTag={handleRowPickTag}
@@ -4806,6 +5831,14 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         }
         onChangeSpeed={handleZoomSpeedChange}
         onQuickSave={flushSave}
+        /* Patch v4.35：补全 PanelZoomModal 的专注审校能力。 */
+        onPreviewAudio={handlePreviewAudio}
+        playingBeatId={playingBeatId}
+        rules={rules}
+        onChangeTtsText={(beatId, text) => handleRowChangeText(beatId, 'tts_text', text)}
+        onChangeMotion={handleRowChangeMotion}
+        onChangePause={handleRowChangePause}
+        onPickTag={handleRowPickTag}
       />
 
       {/* Patch v4.13：单句重配 TTS 的居中确认弹窗（禁用 window.confirm / window.alert）。 */}

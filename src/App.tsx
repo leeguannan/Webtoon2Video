@@ -1842,6 +1842,7 @@ export default function App() {
               seriesId={activeSeries.series_id}
               config={config ?? FALLBACK_CONFIG}
               rules={activeSeriesRules}
+              onAddRule={handleAddRule}
               onRerunFromStage={handleRerunFromStage}
               onResetFromStage={handleResetFromStage}
               onTogglePanelBlank={handleTogglePanelBlank}
