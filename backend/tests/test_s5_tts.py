@@ -366,7 +366,10 @@ async def test_audio_manifest_written_and_loaded_back(tmp_path) -> None:
         "duration_ms",
         "pause_after_ms",
         "word_timestamps",
+        # Patch v4.40：句内内联音效落点（没有标签时是空列表）
+        "inline_sfx",
     }
+    assert payload[0]["inline_sfx"] == []
     assert payload[0]["pause_after_ms"] == 320
     # Patch v3.2 Patch 12：默认停顿由 250ms 收紧到 150ms。
     assert payload[1]["pause_after_ms"] == 150

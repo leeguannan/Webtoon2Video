@@ -144,6 +144,8 @@ FIELD_LOCKS: list[tuple[type, tuple[str, ...]]] = [
             "focus_hint",
             # Patch v3.1 Patch 10：可选音效触发标签（默认 None，向后兼容旧剧本）
             "sfx_cue",
+            # Patch v4.40：音效在本句内的落点（首 / 中 / 尾，默认 "start"）
+            "sfx_position",
             # Patch v3.2 Patch 12：说话人性别（默认 "unknown"，向后兼容旧剧本）
             "speaker_gender",
             # Patch v4.2：逐句指定音色（默认空串 = 跟随角色解析）
@@ -169,7 +171,15 @@ FIELD_LOCKS: list[tuple[type, tuple[str, ...]]] = [
     (WordTimestamp, ("text", "start_ms", "end_ms")),
     (
         AudioClipMeta,
-        ("beat_id", "audio_path", "duration_ms", "pause_after_ms", "word_timestamps"),
+        (
+            "beat_id",
+            "audio_path",
+            "duration_ms",
+            "pause_after_ms",
+            "word_timestamps",
+            # Patch v4.40：句内内联音效的落点（毫秒偏移 + 音效键）
+            "inline_sfx",
+        ),
     ),
     (
         TimelineScene,

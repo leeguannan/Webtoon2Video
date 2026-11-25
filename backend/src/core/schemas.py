@@ -224,6 +224,16 @@ class ScriptBeat(BaseModel):
     #: ``phone_msg`` / ``footstep`` / ``crash``）；普通对话与叙述留空。
     #: Stage 6 会据此生成 :class:`SfxEvent`（全话最多 8 个、间隔 >= 6000ms）。
     sfx_cue: str | None = None
+    #: Patch v4.40：音效在本句内的落点。
+    #:
+    #: * ``start``：句首（默认，与 Patch v3.1 的 beat 级 ``sfx_cue`` 行为一致）；
+    #: * ``mid``：句中（该句音频时长的一半处）；
+    #: * ``end``：句尾（该句音频结束前 150ms）。
+    #:
+    #: 与句内内联标签 ``[sfx:key]``（写在 ``tts_text`` 里）互补：内联标签
+    #: 的落点是**按真实子段耗时**算出来的，精确到毫秒；本字段是「整句级」
+    #: 的粗锚点，适合模型只想说「这一句末尾有声响」的场景。
+    sfx_position: Literal["start", "mid", "end"] = "start"
     #: Patch v3.2 Patch 12：说话人性别。与 ``speaker_role`` 配套，
     #: 用于把「未在作品词典里单独指定音色的角色」路由到通用男声 / 通用女声。
     speaker_gender: Literal["male", "female", "unknown"] = "unknown"
@@ -319,12 +329,27 @@ class WordTimestamp(BaseModel):
     end_ms: int
 
 
+class InlineSfxOffset(BaseModel):
+    """Patch v4.40：句内内联音效的落点。
+
+    ``offset_ms`` 是**这条 beat 音频内部**的毫秒偏移（从音频开头算起），
+    由 Stage 5 按各子段的**真实合成时长**累加得出——所以「音效正好落在
+    「他一拳挥出」那一段台词的后面」是算出来的，不是估的。
+    """
+
+    sfx_key: str
+    offset_ms: int = Field(default=0, ge=0)
+
+
 class AudioClipMeta(BaseModel):
     beat_id: str
     audio_path: str
     duration_ms: int
     pause_after_ms: int
     word_timestamps: list[WordTimestamp] = Field(default_factory=list)
+    #: Patch v4.40：句内内联音效落点（``[sfx:key]`` 标签解析的产物）。
+    #: 空列表 = 这一句没有内联音效（只有 beat 级 ``sfx_cue``）。
+    inline_sfx: list[InlineSfxOffset] = Field(default_factory=list)
 
 
 class TimelineScene(BaseModel):

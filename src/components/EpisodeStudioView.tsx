@@ -51,6 +51,7 @@ import type {
   ScriptSaveOutcome,
   SeriesTtsConfigResponse,
   SfxLibraryItem,
+  SfxPosition,
   StageId,
   StoryboardScene,
   StudioConfig,
@@ -295,6 +296,8 @@ const DRAFT_EDITABLE_FIELDS: Array<keyof ScriptBeat> = [
   'motion',
   'focus_hint',
   'sfx_cue',
+  /** Patch v4.40：音效在本句内的落点（首 / 中 / 尾）。 */
+  'sfx_position',
   /** Patch v4.13：这条解说归属的镜头组（幕）。 */
   'scene_id',
 ];
@@ -363,6 +366,17 @@ const MOTION_LABELS: Record<CameraMotion, string> = {
   shake: 'SHAKE 震动',
   static: 'STATIC 静止',
 };
+
+/**
+ * Patch v4.40：音效在本句内的落点档位（首 / 中 / 尾）。
+ *
+ * 这是「整句级」的粗锚点；句中精确落点用送音文本里的 `[sfx:key]` 内联标签。
+ */
+const SFX_POSITION_OPTIONS: { value: SfxPosition; label: string }[] = [
+  { value: 'start', label: '首' },
+  { value: 'mid', label: '中' },
+  { value: 'end', label: '尾' },
+];
 
 // Patch v4.31：下拉里**推荐**的动效清单——竖扫（pan_down / pan_up）已从自动
 // 链路下线，默认不再展示，避免用户被推荐一个系统不会再自动分配的动作。
@@ -868,6 +882,8 @@ interface ScriptBeatRowProps {
   sfxLibrary?: SfxLibraryItem[];
   /** Patch v4.38：改这一句的音效提示（传 null = 清空）。 */
   onChangeSfxCue?: (beatId: string, sfxKey: string | null) => void;
+  /** Patch v4.40：改这一句的音效落点（首 / 中 / 尾）。 */
+  onChangeSfxPosition?: (beatId: string, position: SfxPosition) => void;
   onChangeScene: (beatId: string, sceneId: string | null) => void;
   onToggleTagPicker: (beatId: string) => void;
   onPickTag: (beatId: string, snippet: string) => void;
@@ -919,6 +935,7 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
     highlight,
     sfxLibrary,
     onChangeSfxCue,
+    onChangeSfxPosition,
     onChangeScene,
     onToggleTagPicker,
     onPickTag,
@@ -1218,11 +1235,11 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
                   <button
                     type="button"
                     onClick={() => onToggleTagPicker(beat.beat_id)}
-                    aria-label={`${beat.beat_id} 插入语气或停顿标签`}
-                    title="插入 MiniMax 语气词（如 (laughs)）或句中停顿（如 <#0.5#>）"
+                    aria-label={`${beat.beat_id} 插入语气 / 停顿 / 音效标签`}
+                    title="插入 MiniMax 语气词（如 (laughs)）、句中停顿（如 <#0.5#>）或句中音效（如 [sfx:slap]）"
                     className="rounded-md border border-slate-200 bg-white px-1.5 py-0.5 text-[10px] text-slate-600 hover:border-blue-400 hover:text-blue-700 transition-colors"
                   >
-                    + 语气 / 停顿标签
+                    + 语气 / 停顿 / 音效标签
                   </button>
                   <button
                     type="button"
@@ -1279,6 +1296,8 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
                 value={beat.tts_text ?? ''}
                 selection={ttsSelections.current[beat.beat_id] ?? null}
                 ttsModel={ttsModel}
+                sfxLibrary={sfxLibrary}
+                onPreviewSfx={(sfxKey) => previewSfx(sfxKey)}
                 onPick={(snippet) => onPickTag(beat.beat_id, snippet)}
                 onClose={() => onToggleTagPicker(beat.beat_id)}
               />
@@ -1553,6 +1572,29 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
             >
               <Volume2 className="w-3 h-3" />
             </button>
+            {/* Patch v4.40：音效落点（首 / 中 / 尾）——只有选中音效时才可点。 */}
+            <div className="flex shrink-0 items-center gap-0.5">
+              {SFX_POSITION_OPTIONS.map((option) => {
+                const active = (beat.sfx_position ?? 'start') === option.value;
+                return (
+                  <button
+                    key={option.value}
+                    type="button"
+                    disabled={!beat.sfx_cue}
+                    onClick={() => onChangeSfxPosition?.(beat.beat_id, option.value)}
+                    aria-label={`${beat.beat_id} 音效落点${option.label}`}
+                    title={beat.sfx_cue ? `音效落在句${option.label}` : '先给这一句选一个音效'}
+                    className={`w-4 h-4 flex items-center justify-center rounded border text-[10px] leading-none transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                      active
+                        ? 'border-blue-300 bg-blue-50 text-blue-700'
+                        : 'border-slate-200 bg-white text-slate-500 hover:border-slate-400 hover:text-slate-800'
+                    }`}
+                  >
+                    {option.label}
+                  </button>
+                );
+              })}
+            </div>
           </div>
         </div>
       </td>
@@ -2774,7 +2816,8 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
       // Patch v4.8：改了句间停顿就必须重建时间轴，否则从 S7 重跑会吃到旧停顿。
       // Patch v4.38：改了音效提示同理——S6 排音效事件、S7 取素材，
       // 不重跑 S6~S7 就还是旧的音效。
-      if (key === 'pause_after_ms' || key === 'sfx_cue') {
+      // Patch v4.40：改了音效落点（sfx_position）同理——落点由 S6 排事件时算。
+      if (key === 'pause_after_ms' || key === 'sfx_cue' || key === 'sfx_position') {
         setNeedsTimelineRebuild(true);
       }
       markTableDirty();
@@ -3915,6 +3958,19 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   const handleRowChangeSfxCue = useCallback(
     (beatId: string, sfxKey: string | null) => {
       updateBeatField(beatId, 'sfx_cue', sfxKey);
+    },
+    [updateBeatField]
+  );
+
+  /**
+   * Patch v4.40：改这一句的音效落点（首 / 中 / 尾）。
+   *
+   * 落点由 Stage 6 排音效事件时按这一句的音频时长算出，
+   * 所以只重跑 S6~S7（不用重跑配音）。
+   */
+  const handleRowChangeSfxPosition = useCallback(
+    (beatId: string, position: SfxPosition) => {
+      updateBeatField(beatId, 'sfx_position', position);
     },
     [updateBeatField]
   );
@@ -5689,6 +5745,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                                   onAddPanelAt={handleRowAddPanelAt}
                                   sfxLibrary={sfxLibrary}
                                   onChangeSfxCue={handleRowChangeSfxCue}
+                                  onChangeSfxPosition={handleRowChangeSfxPosition}
                                   onChangeScene={handleRowChangeScene}
                                   onToggleTagPicker={handleRowToggleTagPicker}
                                   onPickTag={handleRowPickTag}

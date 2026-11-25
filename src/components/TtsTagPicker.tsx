@@ -8,16 +8,19 @@ import {
   formatPauseTag,
   isSpeech28Model,
 } from '../constants/ttsTags';
+import type { SfxLibraryItem } from '../types/studio';
 
 /**
- * 送音标签浮层面板（语气词 + 句中停顿）。
+ * 送音标签浮层面板（语气词 + 句中停顿 + 句中音效）。
  *
  * 本组件是**受控浮层的内容部分**：开合与位置由父组件负责挂载，
  * 这里只渲染内容并通过 `onPick` / `onClose` 回调把意图抛回去。
  *
- * 两类标签的插入位置要求不同，所以提示分两处给：
+ * 三类标签的插入位置要求不同，所以提示分处给：
  * - 语气词：任何位置都可插入；
- * - 停顿标签：必须夹在句中两段文字之间，因此只在「句中停顿」Tab 内给出位置类提醒。
+ * - 停顿标签：必须夹在句中两段文字之间，因此只在「句中停顿」Tab 内给出位置类提醒；
+ * - 音效标签（Patch v4.40）：写在句中就落在那句话说完的那一刻，
+ *   与 MiniMax 的语气词/停顿标签不是一套能力，因此**不**提示 speech-2.8 兼容性。
  */
 export interface TtsTagPickerProps {
   /** 当前该句的送音文本（tts_text），用于判断「空文本 / 选区」并给出提示。 */
@@ -30,12 +33,19 @@ export interface TtsTagPickerProps {
   onClose: () => void;
   /** 当前 MiniMax 模型名；非 speech-2.8-* 时在顶部显示温和提醒。 */
   ttsModel?: string;
+  /** Patch v4.40：24 个标准音效（用于「句中音效」Tab 的卡片网格）。 */
+  sfxLibrary?: SfxLibraryItem[];
+  /** Patch v4.40：试听某个音效（由父组件负责播放与复用单一 Audio 实例）。 */
+  onPreviewSfx?: (sfxKey: string) => void;
 }
 
-type PickerTab = 'interjection' | 'pause';
+type PickerTab = 'interjection' | 'pause' | 'sfx';
 
 /** 面板底部固定提示（文案为约定原文，不要改写）。 */
 const PAUSE_FOOTER_HINT = '停顿标签仅用于句中两段文字之间，不可连用；句尾停顿请用右侧停顿ms';
+
+/** Patch v4.40：句中音效 Tab 的底部提示。 */
+const SFX_FOOTER_HINT = '只作用于配音句内落点、不印字幕，保存后重跑 S5 生效';
 
 /** 停顿秒数输入的合法形状：整数或最多两位小数（允许 ".5" 写法）。 */
 const PAUSE_INPUT_PATTERN = /^(\d+(\.\d{1,2})?|\.\d{1,2})$/;
@@ -50,9 +60,28 @@ export const TtsTagPicker: React.FC<TtsTagPickerProps> = ({
   onPick,
   onClose,
   ttsModel,
+  sfxLibrary,
+  onPreviewSfx,
 }) => {
   const [tab, setTab] = useState<PickerTab>('interjection');
   const [pauseInput, setPauseInput] = useState('');
+
+  // Patch v4.40：音效按分类分组展示（顺序沿用后端 catalog 的分类顺序）。
+  const sfxGroups = useMemo(() => {
+    const groups: { category: string; items: SfxLibraryItem[] }[] = [];
+    const index = new Map<string, { category: string; items: SfxLibraryItem[] }>();
+    (sfxLibrary ?? []).forEach((item) => {
+      const category = item.category || '其它';
+      let group = index.get(category);
+      if (!group) {
+        group = { category, items: [] };
+        index.set(category, group);
+        groups.push(group);
+      }
+      group.items.push(item);
+    });
+    return groups;
+  }, [sfxLibrary]);
 
   // Esc 关闭：浮层由父组件挂载，这里只挂一个文档级监听，卸载时清理。
   useEffect(() => {
@@ -100,7 +129,6 @@ export const TtsTagPicker: React.FC<TtsTagPickerProps> = ({
       ? `当前模型 ${ttsModel} 不是 speech-2.8 系列，语气词与停顿标签可能不生效；推荐 speech-2.8-hd / speech-2.8-turbo`
       : '';
   const emptyTextNotice = value.trim() === '' ? '送音文本为空，插入后会先铺底字幕原文' : '';
-
   const tabButtonClass = (active: boolean) =>
     active
       ? 'px-2.5 py-1 rounded-lg border border-blue-200 bg-blue-50 text-blue-700 font-medium transition-colors cursor-pointer'
@@ -127,7 +155,7 @@ export const TtsTagPicker: React.FC<TtsTagPickerProps> = ({
 
       {/* 温和提醒：不阻塞操作，只提示风险 */}
       <div className="px-3 pt-2 space-y-1">
-        {modelNotice && (
+        {modelNotice && tab !== 'sfx' && (
           <p className="rounded-lg border border-amber-200 bg-amber-50 px-2 py-1 text-[11px] leading-4 text-amber-700">
             {modelNotice}
           </p>
@@ -146,6 +174,9 @@ export const TtsTagPicker: React.FC<TtsTagPickerProps> = ({
         </button>
         <button type="button" onClick={() => setTab('pause')} className={tabButtonClass(tab === 'pause')}>
           句中停顿
+        </button>
+        <button type="button" onClick={() => setTab('sfx')} className={tabButtonClass(tab === 'sfx')}>
+          句中音效
         </button>
       </div>
 
@@ -173,7 +204,7 @@ export const TtsTagPicker: React.FC<TtsTagPickerProps> = ({
               </div>
             ))}
           </div>
-        ) : (
+        ) : tab === 'pause' ? (
           <div className="space-y-3">
             {/* 快捷秒数 */}
             <div className="space-y-1.5">
@@ -242,12 +273,57 @@ export const TtsTagPicker: React.FC<TtsTagPickerProps> = ({
               </p>
             )}
           </div>
+        ) : (
+          /* Patch v4.40：句中音效 —— 24 个标准音效的网格卡片 */
+          <div className="space-y-3">
+            {sfxGroups.length === 0 && (
+              <p className="rounded-lg border border-slate-200 bg-slate-50 px-2 py-1 text-[11px] leading-4 text-slate-500">
+                音效曲库加载中或为空，稍后再打开本面板即可看到 24 个标准音效
+              </p>
+            )}
+            {sfxGroups.map((group) => (
+              <div key={group.category} className="space-y-1.5">
+                <p className="text-[11px] font-medium text-slate-500">{group.category}</p>
+                <div className="grid grid-cols-2 gap-1.5">
+                  {group.items.map((item) => (
+                    <div
+                      key={item.key}
+                      className="flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2 py-1 transition-colors hover:border-blue-300 hover:bg-blue-50"
+                    >
+                      <button
+                        type="button"
+                        title={`在光标处插入 [sfx:${item.key}]`}
+                        onClick={() => onPick(`[sfx:${item.key}]`)}
+                        className="flex min-w-0 flex-1 flex-col items-start gap-0.5 text-left transition-colors cursor-pointer"
+                      >
+                        <span className="truncate text-xs font-medium text-slate-800">{item.label}</span>
+                        <span className="font-mono text-[10px] text-slate-400">[{`sfx:${item.key}`}]</span>
+                      </button>
+                      {onPreviewSfx && item.available && (
+                        <button
+                          type="button"
+                          title={`试听 ${item.label}`}
+                          aria-label={`试听 ${item.label}`}
+                          onClick={() => onPreviewSfx(item.key)}
+                          className="shrink-0 rounded-md p-1 text-slate-400 transition-colors hover:bg-white hover:text-blue-600 cursor-pointer"
+                        >
+                          <Volume2 className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
         )}
       </div>
 
       {/* 底部固定提示 */}
       <div className="border-t border-slate-100 bg-slate-50 px-3 py-2">
-        <p className="text-[11px] leading-4 text-slate-500">{PAUSE_FOOTER_HINT}</p>
+        <p className="text-[11px] leading-4 text-slate-500">
+          {tab === 'sfx' ? SFX_FOOTER_HINT : PAUSE_FOOTER_HINT}
+        </p>
       </div>
     </div>
   );

@@ -144,12 +144,83 @@ def sfx_fallback_key(sfx_key: str) -> str:
     """
     return SFX_CUE_FALLBACKS.get(str(sfx_key or "").strip().lower(), "")
 
+
+# --------------------------------------------------------------------------
+# Patch v4.40：句中内联音效标签（``[sfx:key]``）
+# --------------------------------------------------------------------------
+#: 内联音效标签的形状：``[sfx:key]``（允许 ``sfx`` 与冒号之间有空白）。
+#:
+#: 标签**只允许出现在送音文本（``tts_text``）里**：它标的是「这一句的第几毫秒
+#: 响一下音效」，不是台词。字幕轨（``narration_text``）若原样带上，屏幕上会
+#: 印出 ``[sfx:slap]`` 这种莫名其妙的东西，所以字幕轨一律剥除。
+#:
+#: 与 :data:`utils.tts_tags.INLINE_SFX_TAG_PATTERN` 同形（两边各留一份是了
+#: 避免 ``utils.tts_tags`` 反向依赖 ``core.normalize`` 形成循环导入；
+#: ``tests/test_patch_v440_inline_sfx_timing.py`` 会断言两者 pattern 一致）。
+INLINE_SFX_TAG_RE: re.Pattern[str] = re.compile(
+    r"\[\s*sfx\s*:\s*([a-zA-Z0-9_\-]+)\s*\]"
+)
+
+#: 相邻重复的内联音效标签（中间只隔空白）会被折叠成一个。
+_INLINE_SFX_DUPLICATE_RE: re.Pattern[str] = re.compile(
+    r"(\[\s*sfx\s*:\s*[a-zA-Z0-9_\-]+\s*\])(?:\s*\[\s*sfx\s*:\s*[a-zA-Z0-9_\-]+\s*\])+"
+)
+
+
+def normalize_inline_sfx_tags(text: str) -> str:
+    """规范化送音文本里的内联音效标签（Patch v4.40）。
+
+    规则：
+
+    1. **别名收敛**：``[sfx:slap_face]`` → ``[sfx:slap]``（与 :data:`SFX_CUE_ALIASES` 一致）；
+    2. **白名单校验**：key 不在 :data:`SFX_CUE_KEYS` 里的标签**直接剥离**
+       （既不报错也不保留——模型写错一个键不该让整句配音失败）；
+    3. **规范写法**：合法标签统一写成 ``[sfx:<key>]``（去掉多余空白）；
+    4. **相邻重复折叠**：``[sfx:slap][sfx:slap]`` → ``[sfx:slap]``
+       （同一个音效连着响两遍没有意义，反而会挤掉别的音效事件）；
+    5. 其它文本**原样保留**（含停顿标签 ``<#0.5#>`` 与语气词标签）。
+
+    参数
+    ----
+    text:
+        原始送音文本。
+
+    返回
+    ----
+    ``str``
+        规范化后的送音文本。
+    """
+    if not text or "sfx" not in text.lower():
+        return text
+
+    def _replace(match: re.Match[str]) -> str:
+        key = SFX_CUE_ALIASES.get(match.group(1).strip().lower(), match.group(1).strip().lower())
+        if key not in SFX_CUE_KEYS:
+            return ""
+        return f"[sfx:{key}]"
+
+    normalized = INLINE_SFX_TAG_RE.sub(_replace, text)
+
+    # 相邻重复折叠：连续多个标签只保留第一个（合法标签已统一写法，比对更简单）。
+    def _collapse(match: re.Match[str]) -> str:
+        return re.match(r"\[\s*sfx\s*:\s*[a-zA-Z0-9_\-]+\s*\]", match.group(0)).group(0)
+
+    normalized = _INLINE_SFX_DUPLICATE_RE.sub(_collapse, normalized)
+    return normalized
+
 # 契约里的长度上限
 MAX_NARRATION_CHARS = 120
 MIN_NARRATION_CHARS = 2
 
 #: Patch v3.2 Patch 12：说话人性别合法值。与 ``core.schemas.ScriptBeat`` 一致。
 SPEAKER_GENDERS: tuple[str, ...] = ("male", "female", "unknown")
+
+#: Patch v4.40：音效在本句内的落点。与 ``core.schemas.ScriptBeat.sfx_position`` 一致。
+#:
+#: * ``start``：句首（默认，等价于 Patch v3.1 的 beat 级 ``sfx_cue`` 行为）；
+#: * ``mid``：句中（该句音频时长的一半处）；
+#: * ``end``：句尾（该句音频结束前 150ms）。
+SFX_POSITIONS: tuple[str, ...] = ("start", "mid", "end")
 
 
 def normalize_enum(value: Any, allowed: Sequence[str], default: str) -> str:
@@ -341,9 +412,13 @@ def clip_text(value: str, limit: int = MAX_NARRATION_CHARS) -> str:
 # Patch v4.13 / v4.14：繁简统一 + 标签感知的长度控制
 # --------------------------------------------------------------------------
 #: MiniMax 语气词 / 停顿标签在文本中的位置（截断时不能切在标签中间）。
+#:
+#: Patch v4.40：内联音效标签 ``[sfx:key]`` 也纳入——截断送音文本时不能把标签
+#: 从中间切开（``[sfx:sla`` 会被模型端解析报错），标签字符也不计入长度额度。
 _MINIMAX_TAG_SPAN_PATTERN: re.Pattern[str] = re.compile(
     "|".join(re.escape(tag) for tag in MINIMAX_INTERJECTION_TAGS)
     + r"|<#\d+(?:\.\d{1,2})?#>"
+    + r"|" + INLINE_SFX_TAG_RE.pattern
 )
 
 #: 单句语速合法区间（与 ``core.schemas.ScriptBeat.speed_override`` 一致）。
@@ -459,7 +534,10 @@ def sanitize_narration_and_tts(text: str, *, for_tts: bool = False) -> str:
     * 删除字体大概率缺失、且无法发音的装饰符号（``♥`` ``★`` ``☒`` …）；
     * 删除 Emoji 区段、私用区字符与 ``U+FE0F`` 变体选择符；
     * 归一化异常波浪号 / 破折号组合；``for_tts=True`` 时额外去掉末尾多余的
-      ``~``（合成时会读出怪音）。
+      ``~``（合成时会读出怪音）；
+    * Patch v4.40：``for_tts=False``（字幕轨）时**剥除**内联音效标签
+      ``[sfx:key]``——屏幕绝不印出音效标记；``for_tts=True`` 时**保留并规范化**
+      合法标签（这是音效落点的唯一来源）。
 
     参数
     ----
@@ -494,6 +572,12 @@ def sanitize_narration_and_tts(text: str, *, for_tts: bool = False) -> str:
     if for_tts:
         # 末尾多余的 "~" 会让合成读出怪音，直接去掉。
         cleaned = cleaned.rstrip("~ ")
+        # Patch v4.40：送音轨保留内联音效标签（别名收敛 + 白名单校验 + 相邻去重）。
+        cleaned = normalize_inline_sfx_tags(cleaned)
+    else:
+        # Patch v4.40：字幕轨绝不能印出 [sfx:key]。
+        cleaned = INLINE_SFX_TAG_RE.sub("", cleaned)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
     return cleaned
 
 
@@ -826,6 +910,10 @@ def normalize_script_payload(
         sfx_cue = SFX_CUE_ALIASES.get(sfx_cue, sfx_cue)
         if sfx_cue not in SFX_CUE_KEYS:
             sfx_cue = None
+        # Patch v4.40：音效在本句内的落点（start / mid / end），非法值回落到 start。
+        sfx_position = coerce_str(item.get("sfx_position")).strip().lower()
+        if sfx_position not in SFX_POSITIONS:
+            sfx_position = "start"
         # Patch v3.2 Patch 12：说话人性别（male / female / unknown）。
         speaker_gender = coerce_str(item.get("speaker_gender")).lower()
         if speaker_gender not in SPEAKER_GENDERS:
@@ -851,6 +939,8 @@ def normalize_script_payload(
                 "motion": normalize_enum(item.get("motion"), MOTION_VALUES, "zoom_in"),
                 "pause_after_ms": coerce_int(item.get("pause_after_ms"), 150, low=0, high=2000),
                 "sfx_cue": sfx_cue,
+                # Patch v4.40：音效落点。
+                "sfx_position": sfx_position,
                 "speed_override": speed_override,
                 "scene_id": scene_id,
             }

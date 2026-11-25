@@ -668,6 +668,8 @@ PRESERVED_BEAT_FIELDS: tuple[str, ...] = (
     "speed_override",
     # Patch v4.13：解说句归属的镜头组（幕）；前端未回传时继承旧值，显式传 null = 解除归属
     "scene_id",
+    # Patch v4.40：音效在本句内的落点（首/中/尾）；前端未回传时继承旧值
+    "sfx_position",
 )
 
 #: 上面这些字段里允许显式置 ``None``（清空）的，其余字段 ``None`` 非法，按「未提供」处理。

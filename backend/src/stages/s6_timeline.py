@@ -119,6 +119,12 @@ SFX_MIN_GAP_MS = 6000
 #: 单话音效事件数量上限。
 SFX_MAX_EVENTS = 8
 
+#: Patch v4.40：beat 级 ``sfx_position="end"`` 时的落点提前量（毫秒）。
+#:
+#: 音效落在音频结束前这么久的位置——提前一点才不会「话还没说完就响」，
+#: 也避免和下一句的音效撞在一起。
+SFX_POSITION_TAIL_OFFSET_MS = 150
+
 #: 保守关键词 → 音效键的兜底映射（只认 Stage 3 明确写出的音效描述）。
 #:
 #: 只在 beat 没写 ``sfx_cue`` 时启用，且必须命中关键词才触发，
@@ -914,14 +920,37 @@ def build_timeline(
 
     # ---- 音效事件（Patch v3.1 Patch 11 B3）----
     # 主来源：beat.sfx_cue；兜底：画面 sfx_list 的保守关键词。
+    #
+    # Patch v4.40：句内内联音效（``[sfx:key]``）**优先**——它的落点按真实子段
+    # 耗时算到了毫秒，比整句级的 ``sfx_position`` 粗锚点精确得多；
+    # 一句只要带了内联音效，就不再重复触发 beat 级 ``sfx_cue`` 兜底
+    # （否则同一声效会在同一句里响两次）。
     sfx_candidates: list[tuple[int, str]] = []
     for plan in plans:
         beat = plan["beat"]
         if beat is None:
             continue
+        audio = plan["audio"]
+        inline_sfx = list(getattr(audio, "inline_sfx", None) or [])
+        if inline_sfx:
+            for item in inline_sfx:
+                key = str(getattr(item, "sfx_key", "") or "").strip()
+                if not key:
+                    continue
+                offset = max(0, int(getattr(item, "offset_ms", 0) or 0))
+                sfx_candidates.append((int(plan["start"]) + offset, key))
+            continue
         key = resolve_sfx_key(beat, panel_sfx_map)
         if key:
-            sfx_candidates.append((int(plan["start"]), key))
+            position = str(getattr(beat, "sfx_position", "start") or "start")
+            duration_ms = int(getattr(audio, "duration_ms", 0) or 0)
+            if position == "mid":
+                offset = duration_ms // 2
+            elif position == "end":
+                offset = max(0, duration_ms - SFX_POSITION_TAIL_OFFSET_MS)
+            else:
+                offset = 0
+            sfx_candidates.append((int(plan["start"]) + offset, key))
     sfx_events = select_sfx_events(sfx_candidates)
 
     return RenderTimeline(

@@ -64,13 +64,26 @@ _PAUSE_RUN_PATTERN: re.Pattern[str] = re.compile(
     r"(?:<#\d+(?:\.\d{1,2})?#>)(?:\s*(?:<#\d+(?:\.\d{1,2})?#>))+"
 )
 
-#: 语气词标签 + 合法停顿标签的**完整匹配**模式。
+#: Patch v4.40：句中内联音效标签的形状（``[sfx:key]``）。
+#:
+#: 与 :data:`core.normalize.INLINE_SFX_TAG_RE` **同形**（两边各留一份是为了
+#: 避免 ``utils.tts_tags`` 反向依赖 ``core.normalize`` 形成循环导入；
+#: ``tests/test_patch_v440_inline_sfx_timing.py`` 会断言两者 pattern 一致）。
+INLINE_SFX_TAG_PATTERN: re.Pattern[str] = re.compile(
+    r"\[\s*sfx\s*:\s*([a-zA-Z0-9_\-]+)\s*\]"
+)
+
+#: 语气词标签 + 合法停顿标签 + 内联音效标签的**完整匹配**模式。
 #:
 #: 供「按标签边界切段处理」的场合使用：拼音校验、发音词典替换等操作都要
 #: 在标签之外进行，绝不能把标签内容当成普通文本改写。
+#:
+#: Patch v4.40：``[sfx:key]`` 也纳入切分——标签里的 ``slap`` 是音效键而不是
+#: 台词，不参与拼音校验、也不该被发音词典改写。
 MINIMAX_TAG_SPLIT_PATTERN: re.Pattern[str] = re.compile(
     "|".join(re.escape(tag) for tag in MINIMAX_INTERJECTION_TAGS)
     + r"|<#\d+(?:\.\d{1,2})?#>"
+    + r"|" + INLINE_SFX_TAG_PATTERN.pattern
 )
 
 
@@ -164,6 +177,8 @@ def strip_minimax_tts_tags(text: str) -> str:
 
     * 移除 19 个语气词标签；
     * 移除停顿标签（含不合规写法）；
+    * Patch v4.40：移除句中内联音效标签 ``[sfx:key]``——字幕轨**绝不能**
+      把音效标记印到屏幕上；
     * 收敛多余空白，句首句尾去空白。
 
     参数
@@ -182,6 +197,7 @@ def strip_minimax_tts_tags(text: str) -> str:
     for tag in MINIMAX_INTERJECTION_TAGS:
         cleaned = cleaned.replace(tag, "")
     cleaned = _LOOSE_PAUSE_TAG_PATTERN.sub("", cleaned)
+    cleaned = INLINE_SFX_TAG_PATTERN.sub("", cleaned)
     # 抹掉标签后可能留下「多余空格 / 空格 + 标点」的空洞，收敛掉。
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     cleaned = re.sub(r"[ \t]+([，。！？、；：,.!?;])", r"\1", cleaned)
@@ -199,7 +215,10 @@ def mask_minimax_tts_tags(text: str) -> str:
     拼音与漏括号英文。
 
     * 占位符与原文等长，**不改变任何字符下标**；
-    * 只遮蔽「完整标签」，裸单词（如 ``coughs``）不会被遮蔽，仍会被校验拦下。
+    * 只遮蔽「完整标签」，裸单词（如 ``coughs``）不会被遮蔽，仍会被校验拦下；
+    * Patch v4.40：``[sfx:key]`` 里的 ``key``（``slap`` / ``boom_hit`` …）同样
+      是拉丁字母，**必须**一起遮蔽，否则带内联音效标签的剧本会被整条判成
+      「配音文本含拼音」而全线报错。
 
     参数
     ----
@@ -220,6 +239,9 @@ def mask_minimax_tts_tags(text: str) -> str:
     masked = MINIMAX_PAUSE_TAG_PATTERN.sub(
         lambda m: _MASK_CHAR * len(m.group(0)), masked
     )
+    masked = INLINE_SFX_TAG_PATTERN.sub(
+        lambda m: _MASK_CHAR * len(m.group(0)), masked
+    )
     return masked
 
 
@@ -236,6 +258,7 @@ def count_minimax_interjection_tags(text: str) -> int:
 
 
 __all__ = [
+    "INLINE_SFX_TAG_PATTERN",
     "MINIMAX_INTERJECTION_TAGS",
     "MINIMAX_PAUSE_MAX_SECONDS",
     "MINIMAX_PAUSE_MIN_SECONDS",

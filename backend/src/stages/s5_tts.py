@@ -27,7 +27,7 @@ import os
 import re
 import shutil
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -37,6 +37,7 @@ from core.normalize import resolve_dialogue_speaker_inheritance, to_simplified_c
 from core.schemas import (
     AudioClipMeta,
     CharacterProfile,
+    InlineSfxOffset,
     NarrationScript,
     ScriptBeat,
     StoryBibleV2,
@@ -45,6 +46,7 @@ from core.schemas import (
 from providers.tts_base import TTSResult
 from providers.tts_qwen import DEFAULT_VOICE
 from utils.tts_tags import (
+    INLINE_SFX_TAG_PATTERN,
     MINIMAX_INTERJECTION_TAGS,
     MINIMAX_TAG_SPLIT_PATTERN,
     normalize_minimax_pause_tags,
@@ -325,6 +327,154 @@ def safe_beat_id(beat_id: str) -> str:
     return cleaned or "beat"
 
 
+# --------------------------------------------------------------------------
+# Patch v4.40：句中内联音效标签（``[sfx:key]``）
+# --------------------------------------------------------------------------
+#: 句中内联音效两侧的默认静音间隙（毫秒）。
+#:
+#: 内联音效**不进入配音音频**——它是时间轴上的一个独立事件。间隙的作用是
+#: 在配音里真的留出一段空白，让音效落在空白上而不是压在字上。
+INLINE_SFX_DEFAULT_GAP_MS = 80
+
+#: 句尾音效的落点提前量（毫秒）：音效落在音频结束前这么久的位置。
+INLINE_SFX_TAIL_OFFSET_MS = 120
+
+#: 拼接后统一响度目标（LUFS）与采样率。
+#:
+#: 子段分别合成时每段的响度都可能偏（短句尤甚），拼起来更不平；统一过一遍
+#: loudnorm 才不会出现「前半句轻、后半句响」。
+INLINE_SFX_TARGET_LUFS = -16.0
+INLINE_SFX_SAMPLE_RATE = 24000
+
+#: 停顿标签（用于把「紧贴音效标签的停顿」转成拼接间隙）。
+_LEADING_PAUSE_RE: re.Pattern[str] = re.compile(r"^\s*<#(\d+(?:\.\d{1,2})?)#>")
+_TRAILING_PAUSE_RE: re.Pattern[str] = re.compile(r"<#(\d+(?:\.\d{1,2})?)#>\s*$")
+
+
+@dataclass(frozen=True)
+class _InlineSfxPart:
+    """送音文本按 ``[sfx:key]`` 切开后的一段。
+
+    * ``kind="text"``：可发音文字段；
+    * ``kind="sfx"``：音效标签段（``text`` 存音效键）。
+
+    ``gap_before_ms`` / ``gap_after_ms`` 是这一段**两侧**的静音间隙
+    （由紧贴的 ``<#x#>`` 停顿标签换算而来；没有显式停顿则用默认 80ms）。
+    """
+
+    kind: str
+    text: str
+    gap_before_ms: int = 0
+    gap_after_ms: int = 0
+
+
+def _split_edge_pauses(chunk: str) -> tuple[str, int, int]:
+    """把一段文字里的首尾停顿标签摘出来。
+
+    返回 ``(剩余正文, 开头停顿毫秒, 结尾停顿毫秒)``。
+    """
+    leading = _LEADING_PAUSE_RE.match(chunk)
+    lead_ms = int(round(float(leading.group(1)) * 1000)) if leading else 0
+    if leading is not None:
+        chunk = chunk[leading.end() :]
+    trailing = _TRAILING_PAUSE_RE.search(chunk)
+    tail_ms = int(round(float(trailing.group(1)) * 1000)) if trailing else 0
+    if trailing is not None:
+        chunk = chunk[: trailing.start()]
+    return chunk, lead_ms, tail_ms
+
+
+def split_inline_sfx(text: str) -> list[_InlineSfxPart]:
+    """把送音文本按 ``[sfx:key]`` 标签切成「文字段 / 音效段」交替序列。
+
+    * 紧贴音效标签**前面**的停顿标签 → 该音效**之前**的间隙；
+    * 紧贴音效标签**后面**的停顿标签 → 该音效**之后**的间隙；
+    * 没有显式停顿时，间隙由调用方按 :data:`INLINE_SFX_DEFAULT_GAP_MS` 兜底。
+
+    参数
+    ----
+    text:
+        送音文本（可能含 ``[sfx:key]``）。
+
+    返回
+    ----
+    ``list[_InlineSfxPart]``
+        切分后的段落序列；文本里没有音效标签时返回空列表。
+    """
+    if not text or "[sfx" not in text.lower():
+        return []
+    parts: list[_InlineSfxPart] = []
+    cursor = 0
+    for match in INLINE_SFX_TAG_PATTERN.finditer(text):
+        chunk = text[cursor : match.start()]
+        body, lead_ms, tail_ms = _split_edge_pauses(chunk)
+        if lead_ms and parts and parts[-1].kind == "sfx":
+            parts[-1] = replace(parts[-1], gap_after_ms=lead_ms)
+        if body.strip():
+            parts.append(_InlineSfxPart(kind="text", text=body))
+        parts.append(
+            _InlineSfxPart(
+                kind="sfx",
+                text=match.group(1).strip().lower(),
+                gap_before_ms=tail_ms,
+            )
+        )
+        cursor = match.end()
+    chunk = text[cursor:]
+    body, lead_ms, _tail_ms = _split_edge_pauses(chunk)
+    if lead_ms and parts and parts[-1].kind == "sfx":
+        parts[-1] = replace(parts[-1], gap_after_ms=lead_ms)
+    if body.strip():
+        parts.append(_InlineSfxPart(kind="text", text=body))
+    return parts
+
+
+def _inline_sfx_edge_kind(parts: Sequence[_InlineSfxPart]) -> str | None:
+    """判断音效标签是不是**只在句首或只在句尾**。
+
+    返回 ``"start"``（全部标签都在正文之前）、``"end"``（全部标签都在正文之后）
+    或 ``None``（标签落在句中，需要拆分合成）。
+    """
+    text_positions = [
+        index
+        for index, part in enumerate(parts)
+        if part.kind == "text" and part.text.strip()
+    ]
+    sfx_positions = [index for index, part in enumerate(parts) if part.kind == "sfx"]
+    if not text_positions or not sfx_positions:
+        return None
+    if max(sfx_positions) < text_positions[0]:
+        return "start"
+    if min(sfx_positions) > text_positions[-1]:
+        return "end"
+    return None
+
+
+def inline_sfx_edge_offsets(
+    parts: Sequence[_InlineSfxPart], duration_ms: int
+) -> list[InlineSfxOffset] | None:
+    """标签只在句首 / 句尾时，算出落点（**不必**拆分整句）。
+
+    * 标签全在正文**之前** → 句首音效：落点 = 0（配音一开口就响）；
+    * 标签全在正文**之后** → 句尾音效：落点 = 音频结束前
+      :data:`INLINE_SFX_TAIL_OFFSET_MS` 毫秒。
+
+    返回 ``None`` 表示标签落在句中、需要拆分合成。
+    """
+    kind = _inline_sfx_edge_kind(parts)
+    if kind is None:
+        return None
+    if kind == "start":
+        offset = 0
+    else:
+        offset = max(0, int(duration_ms) - INLINE_SFX_TAIL_OFFSET_MS)
+    return [
+        InlineSfxOffset(sfx_key=part.text, offset_ms=offset)
+        for part in parts
+        if part.kind == "sfx"
+    ]
+
+
 # ----------------------------------------------------------------------
 # 音频处理：ffmpeg 静音裁剪与时长探测
 # ----------------------------------------------------------------------
@@ -495,6 +645,209 @@ async def _trim_silence(
     tmp_path.replace(final_path)
     src.unlink(missing_ok=True)
     return final_path, None
+
+
+# --------------------------------------------------------------------------
+# Patch v4.40：内联音效的子段合成与拼接
+# --------------------------------------------------------------------------
+async def _normalize_audio_format(src: Path, dst: Path, *, ffmpeg_bin: str) -> bool:
+    """把任意音频转成统一格式（24kHz / 单声道 / 16bit PCM wav）。
+
+    拼接（concat demuxer）要求各段参数完全一致，否则会错位甚至直接失败。
+    """
+    ffmpeg = _resolve_binary(ffmpeg_bin)
+    if not ffmpeg:
+        return False
+    code, _stdout, stderr = await _run_command(
+        [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(src),
+            "-ar",
+            str(INLINE_SFX_SAMPLE_RATE),
+            "-ac",
+            "1",
+            "-c:a",
+            "pcm_s16le",
+            str(dst),
+        ]
+    )
+    if code != 0 or not dst.is_file() or dst.stat().st_size <= 44:
+        dst.unlink(missing_ok=True)
+        logger.warning(
+            "[s5_tts] 音频格式统一失败（%s）：%s", src.name, stderr.strip()[:200]
+        )
+        return False
+    return True
+
+
+async def _make_silence(dst: Path, *, duration_ms: int, ffmpeg_bin: str) -> bool:
+    """生成一段指定时长的静音 wav（参数与拼接格式一致）。"""
+    ffmpeg = _resolve_binary(ffmpeg_bin)
+    if not ffmpeg:
+        return False
+    seconds = max(0, int(duration_ms)) / 1000.0
+    code, _stdout, stderr = await _run_command(
+        [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            f"anullsrc=r={INLINE_SFX_SAMPLE_RATE}:cl=mono",
+            "-t",
+            f"{seconds:.3f}",
+            "-c:a",
+            "pcm_s16le",
+            str(dst),
+        ]
+    )
+    if code != 0 or not dst.is_file():
+        dst.unlink(missing_ok=True)
+        logger.warning(
+            "[s5_tts] 生成静音间隙失败（%d ms）：%s", duration_ms, stderr.strip()[:200]
+        )
+        return False
+    return True
+
+
+async def _concat_wav_files(
+    parts: Sequence[Path], out_path: Path, *, ffmpeg_bin: str
+) -> bool:
+    """用 concat demuxer 拼接同格式 wav（参数一致，可直接 copy）。"""
+    ffmpeg = _resolve_binary(ffmpeg_bin)
+    if not ffmpeg or not parts:
+        return False
+    list_path = out_path.with_suffix(".concat.txt")
+    try:
+        list_path.write_text(
+            "".join(f"file '{item.resolve()}'\n" for item in parts), encoding="utf-8"
+        )
+    except OSError as exc:
+        logger.warning("[s5_tts] 写拼接清单失败：%s", exc)
+        return False
+    code, _stdout, stderr = await _run_command(
+        [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_path),
+            "-c:a",
+            "copy",
+            str(out_path),
+        ]
+    )
+    list_path.unlink(missing_ok=True)
+    if code != 0 or not out_path.is_file() or out_path.stat().st_size <= 44:
+        out_path.unlink(missing_ok=True)
+        logger.warning(
+            "[s5_tts] 拼接音频失败（ffmpeg 退出码 %s）：%s", code, stderr.strip()[:200]
+        )
+        return False
+    return True
+
+
+async def _apply_inline_sfx_loudness(src: Path, dst: Path, *, ffmpeg_bin: str) -> bool:
+    """把拼接结果统一到 -16 LUFS / 24kHz 单声道。
+
+    子段分别合成时每段的响度都可能偏（短句尤甚），拼起来更不平；统一过一遍
+    loudnorm 才不会出现「前半句轻、后半句响」。
+    """
+    ffmpeg = _resolve_binary(ffmpeg_bin)
+    if not ffmpeg:
+        return False
+    code, _stdout, stderr = await _run_command(
+        [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(src),
+            "-af",
+            (
+                f"loudnorm=I={INLINE_SFX_TARGET_LUFS}:TP=-1.5:LRA=11,"
+                f"aresample={INLINE_SFX_SAMPLE_RATE}"
+            ),
+            "-ac",
+            "1",
+            "-c:a",
+            "pcm_s16le",
+            str(dst),
+        ]
+    )
+    if code != 0 or not dst.is_file() or dst.stat().st_size <= 44:
+        dst.unlink(missing_ok=True)
+        logger.warning(
+            "[s5_tts] 内联音效拼接结果归一失败：%s", stderr.strip()[:200]
+        )
+        return False
+    return True
+
+
+async def _synthesize_text_segment(
+    client: Any,
+    text: str,
+    *,
+    instruction: str,
+    extra: Mapping[str, Any],
+    out_path: Path,
+    ffmpeg_bin: str,
+    trim_silence: bool,
+    speed: float = 1.0,
+) -> tuple[Path | None, int, str | None]:
+    """合成**一段**文本，返回 ``(音频路径, 时长毫秒, 错误描述)``。
+
+    与整句路径的行为保持一致：静音裁剪失败**不**让这条 beat 失败，
+    只是保留原音频并返回错误描述（由调用方决定要不要记 issue）。
+    """
+    if not text.strip():
+        return None, 0, "空文本"
+    try:
+        result: TTSResult = await client.synthesize(text, instruction=instruction, **extra)
+    except Exception as exc:  # noqa: BLE001 - 单段失败由调用方兜底
+        return None, 0, f"合成失败：{type(exc).__name__}: {exc}"
+    audio = getattr(result, "audio", b"") or b""
+    if not audio:
+        return None, 0, "合成结果为空音频"
+    suffix = getattr(result, "suffix", None) or ".wav"
+    if not suffix.startswith("."):
+        suffix = f".{suffix}"
+    # 原始音频按引擎给的真实后缀落盘（ffmpeg 靠后缀/内容识别格式）。
+    raw_path = out_path.with_name(f"{out_path.stem}{suffix}")
+    try:
+        raw_path.parent.mkdir(parents=True, exist_ok=True)
+        raw_path.write_bytes(audio)
+    except OSError as exc:
+        return None, 0, f"写入音频失败：{exc}"
+    final_path = raw_path
+    if trim_silence:
+        trimmed, problem = await _trim_silence(
+            raw_path, ffmpeg_bin=ffmpeg_bin, speed=speed
+        )
+        if trimmed is not None:
+            final_path = trimmed
+        else:
+            logger.warning("[s5_tts] 子段静音裁剪失败：%s", problem)
+    duration = await _probe_duration_ms(final_path, ffmpeg_bin=ffmpeg_bin)
+    if duration <= 0:
+        return final_path, 0, "无法读取音频时长"
+    return final_path, duration, None
 
 
 # ----------------------------------------------------------------------
@@ -1008,11 +1361,16 @@ def _write_cache_index(cache_dir: Path, index: Mapping[str, Any]) -> None:
         logger.warning("[s5_tts] 写音频缓存索引失败（%s）：%s", cache_dir, exc)
 
 
-def _cache_lookup(cache_dir: Path, synth_hash: str) -> tuple[Path, int] | None:
-    """查缓存命中：``(缓存文件, 时长毫秒)``，没命中返回 ``None``。
+def _cache_lookup(
+    cache_dir: Path, synth_hash: str
+) -> tuple[Path, int, list[InlineSfxOffset]] | None:
+    """查缓存命中：``(缓存文件, 时长毫秒, 内联音效落点)``，没命中返回 ``None``。
 
     命中条件：索引里有记录、缓存文件真实存在、大小大于 44 字节（空 WAV 头）、
     时长大于 0——避免把「半截文件」当成可复用音频。
+
+    Patch v4.40：索引里的 ``inline_sfx`` 会被一并恢复（句内音效落点）。
+    旧缓存没有这个字段时按「无内联音效」处理，不影响命中。
     """
     if not synth_hash:
         return None
@@ -1033,7 +1391,34 @@ def _cache_lookup(cache_dir: Path, synth_hash: str) -> tuple[Path, int] | None:
             return None
     except OSError:
         return None
-    return path, duration_ms
+    return path, duration_ms, _inline_sfx_from_cache(entry.get("inline_sfx"))
+
+
+def _inline_sfx_from_cache(raw: Any) -> list[InlineSfxOffset]:
+    """从缓存索引里还原内联音效落点（旧缓存缺字段 → 空列表）。"""
+    if not isinstance(raw, list):
+        return []
+    items: list[InlineSfxOffset] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        key = str(entry.get("sfx_key") or "").strip()
+        if not key:
+            continue
+        try:
+            offset = int(entry.get("offset_ms") or 0)
+        except (TypeError, ValueError):
+            offset = 0
+        items.append(InlineSfxOffset(sfx_key=key, offset_ms=max(0, offset)))
+    return items
+
+
+def _inline_sfx_to_cache(items: Sequence[InlineSfxOffset]) -> list[dict[str, Any]]:
+    """把内联音效落点序列化成可写进索引的 JSON 结构。"""
+    return [
+        {"sfx_key": item.sfx_key, "offset_ms": int(item.offset_ms)}
+        for item in items
+    ]
 
 
 def _cache_store(
@@ -1044,6 +1429,7 @@ def _cache_store(
     duration_ms: int,
     beat_id: str,
     overwrite: bool = False,
+    inline_sfx: Sequence[InlineSfxOffset] | None = None,
 ) -> dict[str, Any] | None:
     """把合成结果存进缓存，返回待写入索引的记录。
 
@@ -1054,6 +1440,8 @@ def _cache_store(
     单句重配（``resynthesize_single_beat``）的音频可能与旧音频**字节长度完全相同**
     （同一句话重配，采样率与时长不变），只比大小会误判「内容没变」而保留旧音频，
     于是重配结果被旧缓存吞掉。
+
+    Patch v4.40：一并记录 ``inline_sfx``（句内音效落点），命中缓存时原样恢复。
     """
     if not synth_hash or duration_ms <= 0:
         return None
@@ -1073,6 +1461,7 @@ def _cache_store(
         "file": f"{synth_hash}{suffix}",
         "duration_ms": int(duration_ms),
         "beat_id": beat_id,
+        "inline_sfx": _inline_sfx_to_cache(inline_sfx or []),
     }
 
 
@@ -1090,6 +1479,9 @@ def _flush_cache_index(cache_dir: Path, records: Sequence[Mapping[str, Any]]) ->
             "file": str(record.get("file") or ""),
             "duration_ms": int(record.get("duration_ms") or 0),
             "beat_id": str(record.get("beat_id") or ""),
+            "inline_sfx": record.get("inline_sfx")
+            if isinstance(record.get("inline_sfx"), list)
+            else [],
         }
     _write_cache_index(
         cache_dir,
@@ -1245,6 +1637,316 @@ def _resolve_beat_synth_plan(
     )
 
 
+async def _synthesize_beat_with_inline_sfx(
+    client: Any,
+    plan: _BeatSynthPlan,
+    *,
+    audio_dir: Path,
+    ffmpeg_bin: str,
+    trim_silence: bool,
+    extra: Mapping[str, Any],
+    cache_dir: Path,
+    write_cache: bool,
+    use_cache: bool,
+    cache_records: list[dict[str, Any]] | None,
+    stats_out: dict[str, int] | None,
+) -> tuple[AudioClipMeta | None, list[_Issue]]:
+    """合成**带句内音效标签**的 beat，返回 ``(清单项, 问题列表)``。
+
+    Patch v4.40。规则：
+
+    * ``[sfx:key]`` 标签**绝不会**被送进 TTS 引擎（引擎会把拉丁字母读成拼音）；
+    * 标签只在句首 / 句尾时**不拆分整句**：剥掉标签后整句合成一次，
+      音效落点由音频总时长算出（句首 = 0，句尾 = 末尾前 120ms）；
+    * 标签落在句中时按标签切子段、各自合成、再拼回一条完整音频，
+      拼接处插入静音间隙，音效落点 = 前置子段的**真实耗时**累加；
+    * 任何子段合成失败 → 回退「剥掉全部标签整句合成」，
+      落点按字符比例估算，绝不因此丢掉整条配音。
+
+    内联音效**不进入配音音频**：它是时间轴上的独立事件（见
+    :class:`core.schemas.InlineSfxOffset`），由 Stage 6 排到时间轴上。
+    """
+    issues: list[_Issue] = []
+    beat = plan.beat
+    parts = split_inline_sfx(plan.spoken)
+    if not parts:
+        return None, issues
+    plain = INLINE_SFX_TAG_PATTERN.sub("", plan.spoken).strip()
+    if not plain:
+        plain = "".join(part.text for part in parts if part.kind == "text").strip()
+
+    target_path = Path(audio_dir) / f"beat_{safe_beat_id(beat.beat_id)}.wav"
+    edge_kind = _inline_sfx_edge_kind(parts)
+
+    # ------------------------------------------------------------------
+    # 边缘模式：句首 / 句尾音效 —— 整句合成，不拆分
+    # ------------------------------------------------------------------
+    if edge_kind is not None:
+        seg_path, duration_ms, error = await _synthesize_text_segment(
+            client,
+            plain,
+            instruction=plan.instruction,
+            extra=extra,
+            out_path=target_path,
+            ffmpeg_bin=ffmpeg_bin,
+            trim_silence=trim_silence,
+            speed=plan.trim_speed,
+        )
+        if seg_path is None or duration_ms <= 0:
+            issues.append(
+                _Issue(beat.beat_id, "inline_sfx", error or "句内音效句合成失败")
+            )
+            return None, issues
+        offsets = inline_sfx_edge_offsets(parts, duration_ms) or []
+        return _finalize_inline_sfx_beat(
+            beat,
+            audio_path=seg_path,
+            duration_ms=duration_ms,
+            offsets=offsets,
+            issues=issues,
+            cache_dir=cache_dir,
+            plan=plan,
+            write_cache=write_cache,
+            use_cache=use_cache,
+            cache_records=cache_records,
+            stats_out=stats_out,
+        )
+
+    # ------------------------------------------------------------------
+    # 句中模式：切子段 → 各自合成 → 拼接
+    # ------------------------------------------------------------------
+    text_parts: list[str] = []
+    sfx_groups: list[list[_InlineSfxPart]] = []
+    group_index = -1
+    for part in parts:
+        if part.kind == "text":
+            if not part.text.strip():
+                continue
+            text_parts.append(part.text)
+            group_index += 1
+            sfx_groups.append([])
+        elif part.kind == "sfx":
+            if group_index < 0:
+                # 句首音效（理论上边缘模式已拦下），忽略以免越界。
+                continue
+            sfx_groups[group_index].append(part)
+
+    work_dir = Path(audio_dir) / "_inline_sfx_work" / safe_beat_id(beat.beat_id)
+    try:
+        work_dir.mkdir(parents=True, exist_ok=True)
+        segment_files: list[Path] = []
+        segment_durations: list[int] = []
+        gap_files: list[Path] = []
+        gap_durations: list[int] = []
+        failed = False
+        for index, text in enumerate(text_parts):
+            raw_seg, raw_ms, error = await _synthesize_text_segment(
+                client,
+                text,
+                instruction=plan.instruction,
+                extra=extra,
+                out_path=work_dir / f"seg_{index}.in",
+                ffmpeg_bin=ffmpeg_bin,
+                trim_silence=trim_silence,
+                speed=plan.trim_speed,
+            )
+            if raw_seg is None or raw_ms <= 0:
+                issues.append(
+                    _Issue(beat.beat_id, "inline_sfx", error or "子段合成失败")
+                )
+                failed = True
+                break
+            normalized = work_dir / f"norm_{index}.wav"
+            if not await _normalize_audio_format(raw_seg, normalized, ffmpeg_bin=ffmpeg_bin):
+                issues.append(
+                    _Issue(beat.beat_id, "inline_sfx", f"子段音频格式统一失败：{text[:20]}")
+                )
+                failed = True
+                break
+            segment_files.append(normalized)
+            segment_durations.append(raw_ms)
+
+            if index < len(text_parts) - 1:
+                group = sfx_groups[index] if index < len(sfx_groups) else []
+                gap_ms = 0
+                for item in group:
+                    if item.gap_before_ms:
+                        gap_ms = item.gap_before_ms
+                        break
+                if not gap_ms and group:
+                    gap_ms = group[-1].gap_after_ms
+                if not gap_ms:
+                    gap_ms = INLINE_SFX_DEFAULT_GAP_MS
+                gap_path = work_dir / f"gap_{index}.wav"
+                if not await _make_silence(
+                    gap_path, duration_ms=gap_ms, ffmpeg_bin=ffmpeg_bin
+                ):
+                    issues.append(
+                        _Issue(beat.beat_id, "inline_sfx", "静音间隙生成失败")
+                    )
+                    failed = True
+                    break
+                gap_files.append(gap_path)
+                gap_durations.append(gap_ms)
+
+        if failed:
+            # 回退：剥掉全部标签整句合成，落点按字符比例估算。
+            logger.warning(
+                "[s5_tts] %s：句内音效分段合成失败，回退为整句合成", beat.beat_id
+            )
+            plain_path, plain_ms, error = await _synthesize_text_segment(
+                client,
+                plain,
+                instruction=plan.instruction,
+                extra=extra,
+                out_path=target_path,
+                ffmpeg_bin=ffmpeg_bin,
+                trim_silence=trim_silence,
+                speed=plan.trim_speed,
+            )
+            if plain_path is None or plain_ms <= 0:
+                issues.append(
+                    _Issue(beat.beat_id, "inline_sfx", error or "整句回退合成失败")
+                )
+                return None, issues
+            offsets = _estimate_inline_offsets(parts, plain, plain_ms)
+            return _finalize_inline_sfx_beat(
+                beat,
+                audio_path=plain_path,
+                duration_ms=plain_ms,
+                offsets=offsets,
+                issues=issues,
+                cache_dir=cache_dir,
+                plan=plan,
+                write_cache=write_cache,
+                use_cache=use_cache,
+                cache_records=cache_records,
+                stats_out=stats_out,
+            )
+
+        # 拼接：文字段 + 间隙
+        ordered: list[Path] = []
+        for index, seg in enumerate(segment_files):
+            ordered.append(seg)
+            if index < len(gap_files):
+                ordered.append(gap_files[index])
+        merged = work_dir / "merged.wav"
+        if not await _concat_wav_files(ordered, merged, ffmpeg_bin=ffmpeg_bin):
+            issues.append(_Issue(beat.beat_id, "inline_sfx", "子段拼接失败"))
+            return None, issues
+        loud = work_dir / "loud.wav"
+        if await _apply_inline_sfx_loudness(merged, loud, ffmpeg_bin=ffmpeg_bin):
+            final_audio = loud
+        else:
+            # 归一失败不致命：用未归一的拼接结果（格式已统一）。
+            final_audio = merged
+        try:
+            if target_path.exists():
+                target_path.unlink()
+            final_audio.replace(target_path)
+        except OSError as exc:
+            issues.append(_Issue(beat.beat_id, "inline_sfx", f"写入成品音频失败：{exc}"))
+            return None, issues
+        duration_ms = await _probe_duration_ms(target_path, ffmpeg_bin=ffmpeg_bin)
+        if duration_ms <= 0:
+            issues.append(_Issue(beat.beat_id, "inline_sfx", "无法读取拼接后音频时长"))
+            return None, issues
+
+        # 落点：音效紧跟在第 i 段文字之后 → offset = 前 i+1 段文字真实耗时
+        # + 前 i 段间隙长度（也就是「这段话说完的那一刻」）。
+        offsets: list[InlineSfxOffset] = []
+        elapsed = 0
+        for index, group in enumerate(sfx_groups):
+            base = elapsed + (
+                segment_durations[index] if index < len(segment_durations) else 0
+            )
+            for item in group:
+                offsets.append(
+                    InlineSfxOffset(sfx_key=item.text, offset_ms=max(0, base))
+                )
+            elapsed = base
+            if index < len(gap_durations):
+                elapsed += gap_durations[index]
+
+        return _finalize_inline_sfx_beat(
+            beat,
+            audio_path=target_path,
+            duration_ms=duration_ms,
+            offsets=offsets,
+            issues=issues,
+            cache_dir=cache_dir,
+            plan=plan,
+            write_cache=write_cache,
+            use_cache=use_cache,
+            cache_records=cache_records,
+            stats_out=stats_out,
+        )
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def _estimate_inline_offsets(
+    parts: Sequence[_InlineSfxPart], plain: str, duration_ms: int
+) -> list[InlineSfxOffset]:
+    """子段合成失败时的兜底落点估算（按字符比例）。"""
+    total = max(1, len(plain))
+    consumed = 0
+    offsets: list[InlineSfxOffset] = []
+    for part in parts:
+        if part.kind == "sfx":
+            ratio = min(1.0, consumed / total)
+            offsets.append(
+                InlineSfxOffset(
+                    sfx_key=part.text, offset_ms=max(0, int(duration_ms * ratio))
+                )
+            )
+        else:
+            consumed += len(part.text.strip())
+    return offsets
+
+
+def _finalize_inline_sfx_beat(
+    beat: ScriptBeat,
+    *,
+    audio_path: Path,
+    duration_ms: int,
+    offsets: Sequence[InlineSfxOffset],
+    issues: list[_Issue],
+    cache_dir: Path,
+    plan: _BeatSynthPlan,
+    write_cache: bool,
+    use_cache: bool,
+    cache_records: list[dict[str, Any]] | None,
+    stats_out: dict[str, int] | None,
+) -> tuple[AudioClipMeta, list[_Issue]]:
+    """内联音效 beat 的收尾：写缓存 + 生成清单项。"""
+    if write_cache and duration_ms > 0:
+        record = _cache_store(
+            cache_dir,
+            plan.synth_hash,
+            audio_path,
+            duration_ms=duration_ms,
+            beat_id=beat.beat_id,
+            overwrite=not use_cache and write_cache,
+            inline_sfx=offsets,
+        )
+        if record is not None and cache_records is not None:
+            cache_records.append(record)
+    if stats_out is not None:
+        stats_out["synthesized"] = int(stats_out.get("synthesized", 0)) + 1
+    meta = AudioClipMeta(
+        beat_id=beat.beat_id,
+        audio_path=audio_path.name,
+        duration_ms=duration_ms,
+        pause_after_ms=(
+            beat.pause_after_ms if beat.pause_after_ms is not None else DEFAULT_PAUSE_AFTER_MS
+        ),
+        word_timestamps=[],
+        inline_sfx=list(offsets),
+    )
+    return meta, issues
+
+
 async def _synthesize_beat(
     client: Any,
     beat: ScriptBeat,
@@ -1298,7 +2000,7 @@ async def _synthesize_beat(
     if use_cache:
         cached = _cache_lookup(cache_dir, plan.synth_hash)
         if cached is not None:
-            cache_path, cached_duration = cached
+            cache_path, cached_duration, cached_inline_sfx = cached
             suffix = cache_path.suffix or ".wav"
             target = Path(audio_dir) / f"beat_{safe_beat_id(beat.beat_id)}{suffix}"
             if _copy_cached_audio(cache_path, target):
@@ -1321,6 +2023,8 @@ async def _synthesize_beat(
                             else DEFAULT_PAUSE_AFTER_MS
                         ),
                         word_timestamps=[],
+                        # Patch v4.40：句内音效落点随缓存一起恢复。
+                        inline_sfx=list(cached_inline_sfx),
                     ),
                     issues,
                 )
@@ -1330,6 +2034,22 @@ async def _synthesize_beat(
         extra["voice"] = plan.voice
     if plan.native_speed:
         extra["speed"] = plan.speed
+
+    # Patch v4.40：送音文本里带 ``[sfx:key]`` 标签 → 走句内音效专用合成路径。
+    if INLINE_SFX_TAG_PATTERN.search(plan.spoken):
+        return await _synthesize_beat_with_inline_sfx(
+            client,
+            plan,
+            audio_dir=audio_dir,
+            ffmpeg_bin=ffmpeg_bin,
+            trim_silence=trim_silence,
+            extra=extra,
+            cache_dir=cache_dir,
+            write_cache=write_cache,
+            use_cache=use_cache,
+            cache_records=cache_records,
+            stats_out=stats_out,
+        )
 
     try:
         result: TTSResult = await client.synthesize(
