@@ -1127,7 +1127,9 @@ export const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
             className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 disabled:opacity-50 cursor-pointer disabled:cursor-not-allowed"
           >
             {busy === 'phase1' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <FileText className="w-3.5 h-3.5" />}
-            按镜头组重生成剧本 (S4)
+            {episode.beats.length === 0
+              ? '按镜头组生成剧本 (S4)'
+              : '按镜头组重生成剧本 (S4)'}
           </button>
           <button
             type="button"
@@ -1136,7 +1138,9 @@ export const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
             className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-slate-900 rounded-lg hover:bg-slate-800 disabled:opacity-50 cursor-pointer disabled:cursor-not-allowed"
           >
             {busy === 'full' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Film className="w-3.5 h-3.5" />}
-            按镜头组一键制片 (S4→S7)
+            {episode.beats.length === 0
+              ? '一键制片 (S4→S7)'
+              : '按镜头组一键制片 (S4→S7)'}
           </button>
         </div>
       </div>

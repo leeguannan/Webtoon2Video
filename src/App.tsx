@@ -74,6 +74,13 @@ const STAGE_ORDER: StageId[] = [
   's7_renderer',
 ];
 
+/** 任务模式的中文名（Patch v4.36：三档模式）。 */
+const RUN_MODE_LABELS: Record<RunMode, string> = {
+  storyboard_prep: '切幕预备',
+  phase1_only: '出稿止步',
+  full_video: '全流程',
+};
+
 const EPISODE_STATUSES: EpisodeItem['status'][] = [
   'idle',
   'queued',
@@ -366,7 +373,28 @@ export default function App() {
   const [seriesList, setSeriesList] = useState<SeriesItem[]>([]);
   const [activeSeriesId, setActiveSeriesId] = useState<string>('');
   const [activeEpisodeId, setActiveEpisodeId] = useState<string>('');
-  const [runMode, setRunMode] = useState<RunMode>('phase1_only');
+  const [runMode, setRunMode] = useState<RunMode>(() => {
+    // Patch v4.36：记住用户上次选的模式；默认「切幕预备」，让用户先调镜头
+    // 编排再写稿（S4 只跑一遍）。
+    try {
+      const saved = window.localStorage.getItem('w2v.runMode');
+      if (saved === 'storyboard_prep' || saved === 'phase1_only' || saved === 'full_video') {
+        return saved;
+      }
+    } catch {
+      /* localStorage 不可用时用默认值 */
+    }
+    return 'storyboard_prep';
+  });
+  /** Patch v4.36：切换模式时顺手记住，下次进来还是同一档。 */
+  const handleRunModeChange = (mode: RunMode) => {
+    setRunMode(mode);
+    try {
+      window.localStorage.setItem('w2v.runMode', mode);
+    } catch {
+      /* localStorage 不可用时不影响本次会话 */
+    }
+  };
   const [config, setConfig] = useState<StudioConfig | null>(null);
   const [rules, setRules] = useState<PronunciationRule[]>([]);
   const [toast, setToast] = useState<string | null>(null);
@@ -921,9 +949,7 @@ export default function App() {
         body: JSON.stringify({ from_stage: fromStage, mode }),
       });
       showToast(
-        `${episodeId} 已从 ${fromStage} 重新排队（${
-          mode === 'phase1_only' ? 'Phase 1' : '全流程'
-        }）`
+        `${episodeId} 已从 ${fromStage} 重新排队（${RUN_MODE_LABELS[mode] ?? mode}）`
       );
       void refreshSeries(seriesIdOf(episodeId));
     } catch (err) {
@@ -933,7 +959,17 @@ export default function App() {
 
   const handleRerunFromStage = (episodeId: string, stageId: StageId) => {
     const idx = STAGE_ORDER.indexOf(stageId);
-    const mode: RunMode = idx >= 5 ? 'full_video' : runMode;
+    // Patch v4.36：
+    // - 点 S5 及之后 → 一路跑到成片；
+    // - 点「S4 从此步重跑」且当前是「切幕预备」模式 → 提升为「出稿止步」，
+    //   否则 S4 会被切幕预备模式挡在门外（只跑一次 S4 的承诺就落空了）；
+    // - 点 S1~S3 → 沿用当前模式。
+    let mode: RunMode = runMode;
+    if (idx >= 5) {
+      mode = 'full_video';
+    } else if (mode === 'storyboard_prep' && stageId === 's4_scriptwriter') {
+      mode = 'phase1_only';
+    }
     // Patch v4.8：把 Promise 交回给审核台，便于它在重跑前先保存草稿 / 提示升级起点。
     return rerunEpisode(episodeId, stageId, mode);
   };
@@ -1819,7 +1855,7 @@ export default function App() {
             <CatalogView
               series={activeSeries}
               runMode={runMode}
-              onChangeRunMode={setRunMode}
+              onChangeRunMode={handleRunModeChange}
               onParseCatalogUrl={handleParseCatalogUrl}
               onToggleEpisode={handleToggleEpisode}
               onApplyRangeSelection={handleApplyRangeSelection}

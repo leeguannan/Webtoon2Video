@@ -29,7 +29,7 @@ from core.config import (
 )
 from core.manifest import STAGE_DIR_NAMES, ManifestManager
 from core.memory import StoryBibleManager
-from core.schemas import NarrationScript, load_model
+from core.schemas import NarrationScript, VisionWindowOutput, load_model
 from stages import (
     s0_catalog,
     s1_crawler,
@@ -61,6 +61,12 @@ PHASE1_LAST_STAGE = "s4_scriptwriter"
 
 #: 全流程模式的终点。
 FULL_LAST_STAGE = "s7_renderer"
+
+#: 「切幕预备」模式的终点：只跑到 Stage 3（视觉抽取）并顺带做语义切幕，
+#: 之后停下等人工确认镜头编排，再单独跑一次 S4。
+#:
+#: Patch v4.36：解决「调完镜头编排必须重跑 S4 → S4 跑两遍」的痛点。
+STORYBOARD_PREP_LAST_STAGE = "s3_vision"
 
 #: Stage 4 排队等待上限（秒），避免话次永远等不到前序而挂死。
 STAGE4_QUEUE_TIMEOUT_S = 6 * 3600.0
@@ -375,12 +381,35 @@ class JobRunner:
         self._publish_state(state)
 
         start_index = STAGE_IDS.index(from_stage)
-        last_stage = PHASE1_LAST_STAGE if mode == "phase1_only" else FULL_LAST_STAGE
+        if mode == "storyboard_prep":
+            # Patch v4.36：切幕预备模式——跑到 S3 就停，顺带做语义切幕，
+            # 等人工确认镜头编排后再单独跑一次 S4。
+            last_stage = STORYBOARD_PREP_LAST_STAGE
+        elif mode == "phase1_only":
+            last_stage = PHASE1_LAST_STAGE
+        else:
+            last_stage = FULL_LAST_STAGE
         end_index = STAGE_IDS.index(last_stage)
         if start_index > end_index:
-            # 「仅第一步」模式下请求 Stage 5~7：自动提升为全流程并留下记录。
-            self._log(state, f"[调度器] {from_stage} 超出「仅第一步」范围，自动提升为全流程模式")
-            end_index = STAGE_IDS.index(FULL_LAST_STAGE)
+            if mode == "storyboard_prep":
+                # 切幕预备模式下用户手动点了「S4 从此步重跑」或「S5 从此步重跑」：
+                # 自动提升到对应模式的终点，绝不因为模式窄而只跑一个阶段。
+                if from_stage == "s4_scriptwriter":
+                    end_index = STAGE_IDS.index(PHASE1_LAST_STAGE)
+                    self._log(
+                        state,
+                        "[调度器] S4 超出「切幕预备」范围，自动提升为「出稿止步」模式（S1~S4）",
+                    )
+                else:
+                    end_index = STAGE_IDS.index(FULL_LAST_STAGE)
+                    self._log(
+                        state,
+                        f"[调度器] {from_stage} 超出「切幕预备」范围，自动提升为全流程模式（S1~S7）",
+                    )
+            else:
+                # 「仅第一步」模式下请求 Stage 5~7：自动提升为全流程并留下记录。
+                self._log(state, f"[调度器] {from_stage} 超出「仅第一步」范围，自动提升为全流程模式")
+                end_index = STAGE_IDS.index(FULL_LAST_STAGE)
 
         catalog = self.registry.load_catalog(series_id)
         if catalog is None:
@@ -446,6 +475,16 @@ class JobRunner:
                     story_model=story_model,
                     series_title=catalog.series_title,
                 )
+                if stage == "s3_vision" and mode == "storyboard_prep":
+                    # Patch v4.36：S3 跑完立刻做语义切幕（Stage 3b），
+                    # 不跑 S4、不写 StoryBible、不做视觉复核。
+                    await self._stage_prepare_storyboard(
+                        state,
+                        series_dir,
+                        episode,
+                        llm_client,
+                        story_model,
+                    )
             state.status = "done"
             self._log(state, "[完成] 本轮流水线执行完毕")
         except Exception as exc:  # noqa: BLE001 - 后台任务需要把异常转成状态
@@ -617,6 +656,52 @@ class JobRunner:
                 f"Stage 1 有 {len(result.failures)} 张图片下载失败：{result.failures[0]}"
             )
         self._log(state, f"[Stage 1] 新增 {len(result.saved)} 张，跳过 {len(result.skipped)} 张")
+
+    async def _stage_prepare_storyboard(
+        self,
+        state: EpisodeState,
+        series_dir: Path,
+        episode: Any,
+        llm_client: Any,
+        story_model: str,
+    ) -> None:
+        """Stage 3b：语义切幕预备（Patch v4.36 ``storyboard_prep`` 模式）。
+
+        只做「切幕」，落盘 ``04_script/storyboard.json``（``auto_strategy="semantic"``）：
+
+        * **不跑 S4**（用户确认镜头编排后再单独跑一次，S4 只跑一遍）；
+        * 不做视觉复核（``enrich_storyboard_with_vision``），避免在人工确认前
+          把复核结论写进编排；
+        * 不拿部级互斥锁、不写 ``StoryBible``（这是「准备」，不是正式撰稿）。
+        """
+        episode_dir = series_dir / "episodes" / f"ep_{episode.episode_no:03d}"
+        vision_path = episode_dir / "03_vision" / "vision.json"
+        if not vision_path.is_file():
+            self._log(state, "[Stage 3b] 缺少 03_vision/vision.json，跳过切幕预备")
+            return
+        try:
+            vision = load_model(VisionWindowOutput, vision_path)
+        except Exception as exc:  # noqa: BLE001 - 读视觉结果失败不应阻断流水线
+            self._log(state, f"[Stage 3b] 读取视觉结果失败，跳过切幕预备：{exc}")
+            return
+        storyboard_path = s3b_scenes.storyboard_path_for(episode_dir)
+        try:
+            storyboard = await s3b_scenes.resolve_or_build_storyboard(
+                llm_client,
+                episode_id=episode.episode_id,
+                vision=vision,
+                storyboard_path=storyboard_path,
+                model=story_model,
+                reset=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - 切幕失败不阻断流水线
+            self._log(state, f"[Stage 3b] 语义切幕失败：{exc}")
+            return
+        self._log(
+            state,
+            f"[Stage 3b] 已完成语义切幕（共 {len(storyboard.scenes)} 幕），"
+            "等待人工确认镜头编排后再执行 S4",
+        )
 
     async def _stage_script(
         self,

@@ -1504,6 +1504,18 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   onRegenerateBeatTts,
 }) => {
   const [activeTab, setActiveTab] = useState<StudioTab>('script');
+  // Patch v4.36：切幕预备模式下，用户先看到的是「镜头编排」而不是解说审核台
+  // （此刻还没有解说稿）。有分镜但一句稿都没有时自动切过去——每个话次只
+  // 自动切一次，之后用户手动选 tab 不会被抢回来。
+  const storyboardDefaultAppliedRef = useRef<string>('');
+  useEffect(() => {
+    if (!episode.episode_id) return;
+    if (storyboardDefaultAppliedRef.current === episode.episode_id) return;
+    storyboardDefaultAppliedRef.current = episode.episode_id;
+    if (episode.panels.length > 0 && episode.beats.length === 0) {
+      setActiveTab('storyboard');
+    }
+  }, [episode.episode_id, episode.panels.length, episode.beats.length]);
 
   // ---- Patch v4.5：本话封页与结尾片包（render_options.json，仅重跑 S7 生效） ----
   const brandingOptions: EpisodeRenderOptions = episode.render_options ?? DEFAULT_RENDER_OPTIONS;
@@ -5065,6 +5077,10 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                         {activePanel.is_transition_blank ? '恢复参与剪辑' : '标记为过渡废格(跳过)'}
                       </button>
                     </div>
+                    {/* Patch v4.36：说明「跳过」到底跳过了什么。 */}
+                    <p className="text-[11px] text-slate-500 leading-relaxed">
+                      移出/跳过纯对话与空镜仅不出镜，S4 写稿仍会参考其台词全貌；需整段跳过请关闭整幕开关。
+                    </p>
                   </div>
 
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-start">
@@ -5193,14 +5209,20 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
 
             {/* Patch v4.0 Patch 20: 镜头编排（Storyboard）Tab */}
             {activeTab === 'storyboard' && (
-              <StoryboardEditor
-                episode={episode}
-                onJobSubmitted={() => {
-                  // 后台任务进度由 App 层定时刷新剧集 stages 驱动，这里无需额外轮询。
-                }}
-                onSwitchToScriptTab={() => setActiveTab('script')}
-                onScenesLoaded={setStoryboardSceneCount}
-              />
+              <div className="space-y-3">
+                {/* Patch v4.36：说明「移出/跳过」与「关闭整幕」的区别。 */}
+                <p className="text-[11px] text-slate-500 leading-relaxed">
+                  移出/跳过纯对话与空镜仅不出镜，S4 写稿仍会参考其台词全貌；需整段跳过请关闭整幕开关。
+                </p>
+                <StoryboardEditor
+                  episode={episode}
+                  onJobSubmitted={() => {
+                    // 后台任务进度由 App 层定时刷新剧集 stages 驱动，这里无需额外轮询。
+                  }}
+                  onSwitchToScriptTab={() => setActiveTab('script')}
+                  onScenesLoaded={setStoryboardSceneCount}
+                />
+              </div>
             )}
 
             {/* TAB 2: Script & Polyphone Editor */}

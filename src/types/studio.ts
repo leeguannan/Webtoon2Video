@@ -21,7 +21,15 @@ export type StageId =
 
 export type StageStatus = 'pending' | 'running' | 'done' | 'failed';
 
-export type RunMode = 'phase1_only' | 'full_video';
+/**
+ * 流水线任务模式（Patch v4.36 新增 ``storyboard_prep``）。
+ *
+ * - ``storyboard_prep``：只跑 S1~S3 并顺带做语义切幕，等人工确认镜头编排后
+ *   再单独跑一次 S4（S4 只跑一遍）；
+ * - ``phase1_only``：跑到 S4 写稿为止；
+ * - ``full_video``：一直跑到 S7 成片。
+ */
+export type RunMode = 'storyboard_prep' | 'phase1_only' | 'full_video';
 
 export interface StageProgress {
   id: StageId;

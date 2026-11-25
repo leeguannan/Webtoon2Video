@@ -453,13 +453,27 @@ def validate_storyboard_coverage(
 
 def _storyboard_constraints_block(
     active_scenes: Sequence[StoryboardScene],
+    reference_only_ids: Iterable[str] | None = None,
 ) -> str:
-    """给 4A 故事反写的「分幕约束」文本。"""
+    """给 4A 故事反写的「分幕约束」文本。
+
+    Patch v4.36：``reference_only_ids`` 是「只在 4A 讲故事时作参考、不会出镜」
+    的分镜（被移出/跳过的）。它们的台词仍是真实剧情，必须让模型结合理解并
+    把必要台词融入相邻的启用镜头所在章节，但**不得**为它们单独开章。
+    """
+    reference_only = sorted({str(item) for item in (reference_only_ids or ())})
     if not active_scenes:
-        return (
+        lines = [
             "【分幕约束】本话未启用镜头组编排：章节数 3~8 章，"
             "按分镜时间顺序单调排列，每章自带 panel_hint_range。"
-        )
+        ]
+        if reference_only:
+            lines.append(
+                "【仅参考分镜】以下分镜不在任何启用镜头组内，台词属于真实剧情，"
+                "请结合理解并把必要台词融入相邻章节，但不得为其单独开章："
+                + "、".join(reference_only)
+            )
+        return "\n".join(lines)
     lines = [
         f"【分幕约束】本话已切分为 {len(active_scenes)} 个镜头组，"
         "章节数量与顺序必须与下表严格一一对应（第 i 章 = 第 i 幕）：",
@@ -477,6 +491,13 @@ def _storyboard_constraints_block(
             lines.append(f"  · 必保原话：{'；'.join(scene.locked_quotes)}")
         if scene.visual_recap:
             lines.append(f"  · 画面复核：{scene.visual_recap}")
+    if reference_only:
+        lines.append(
+            "【仅参考分镜】以下分镜被移出或跳过，不在任何启用镜头组内，"
+            "不会出镜；但它们的台词属于真实剧情，必须结合理解并把必要台词"
+            "融入相邻启用镜头所在章节，不得为其单独开章、也不得引用其编号："
+            + "、".join(reference_only)
+        )
     return "\n".join(lines)
 
 
@@ -645,8 +666,12 @@ def _converge_panel_pool(
     * **剔除孤儿分镜**：不被任何启用幕引用的分镜（包括「移除分镜」后残留的）
       一律不进入撰稿范围——否则会出现「解说讲了、但画面根本没有」的句子。
 
-    ``story_panels`` 是喂给概览与 4A 故事反写的上下文，必须与 4B 的候选窗口
-    落在同一集合里，否则概览会讲到用户已经删掉的画面。
+    ``story_panels`` 是「与 4B 候选窗口同集合」的那份上下文（纯字卡已剔除）。
+
+    Patch v4.36：概览与 4A 故事反写**不再**直接吃这份 ``story_panels``——
+    它们改吃 :func:`_build_story_context_panels` 产出的「全貌剧情列表」
+    （含仅参考分镜），否则「移出/跳过一格纯对话」会把剧情剪断。
+    4B 的候选窗口仍然严格只用 ``valid_panel_ids``。
     """
     valid_panel_ids = {panel.panel_id for panel in panels} if panels else None
     panel_map: dict[str, PanelVisionInfo] = {
@@ -719,6 +744,82 @@ def _converge_panel_pool(
         [panel_map[panel_id] for panel_id in ordered_panel_ids]
     )
     return valid_panel_ids, ordered_panel_ids, panel_map, story_panels
+
+
+def _build_story_context_panels(
+    *,
+    panels: Sequence[PanelVisionInfo],
+    all_panels: Sequence[PanelVisionInfo],
+    valid_panel_ids: set[str] | None,
+    resolved_storyboard: EpisodeStoryboard | None,
+    active_scenes: Sequence[StoryboardScene],
+    scene_mode: bool,
+) -> tuple[list[PanelVisionInfo], set[str]]:
+    """Patch v4.36：算出 4A/概览该看到的「全貌剧情列表」与「仅参考分镜」集合。
+
+    为什么要解耦（v4.29 收敛过头了）：
+
+    * v4.29 把「启用幕以外的分镜」从**撰稿范围**里彻底剔掉了，于是用户把一格
+      纯对话/空镜「移出」或「标记跳过」之后，S4 写稿就**看不到这格的台词**，
+      剧情被剪断——「跳过格子」被误当成了「跳过剧情」。
+    * 但如果反过来把参考分镜交给 4B 选图，又会重演「讲的是 A、画的是 B」。
+
+    所以这里做**双层解耦**：
+
+    * **4A / 概览**看全貌：所有真实剧情分镜都在（移出/跳过的那些标成
+      ``[仅参考剧情·不出镜]``），台词不丢，剧情不断；
+    * **4B** 仍然严格只看 ``valid_panel_ids``（启用幕 + 人工放行），参考分镜
+      一格都不会被选中出镜。
+
+    只有「**仅属于禁用幕**」的分镜（整段被 ``enabled=False`` 关掉）和版权页/
+    推广尾页才真正从 4A 视野里消失——那才是用户明确不要的整段剧情。
+    """
+    if not (scene_mode and active_scenes and resolved_storyboard is not None):
+        # 没有逐幕编排：概览 / 4A / 4B 用同一批分镜（保持旧行为）。
+        return exclude_pure_text_cards(list(panels)), set()
+
+    enabled_ids: set[str] = set()
+    for scene in active_scenes:
+        enabled_ids.update(str(panel_id) for panel_id in (scene.panel_ids or []))
+    disabled_only_ids: set[str] = set()
+    for scene in resolved_storyboard.scenes:
+        if scene.enabled:
+            continue
+        for panel_id in scene.panel_ids or []:
+            panel_id = str(panel_id)
+            if panel_id not in enabled_ids:
+                disabled_only_ids.add(panel_id)
+
+    valid = {str(item) for item in (valid_panel_ids or set())}
+    story_context: list[PanelVisionInfo] = []
+    reference_only_ids: set[str] = set()
+    for panel in all_panels:
+        panel_id = str(panel.panel_id)
+        non_story_type = str(getattr(panel, "non_story_type", "none") or "none")
+        if non_story_type != "none":
+            # 版权声明页 / 推广尾页 / 过渡空页 / 纯拟声格：本来就不是剧情，
+            # 连参考都不给（与 write_episode_script 开头的硬过滤同口径）。
+            continue
+        if getattr(panel, "is_transition_blank", False):
+            # 过渡空页：纯空白，没有可讲的剧情。
+            continue
+        if panel_id in disabled_only_ids:
+            # 整段被关掉的镜头组：用户明确不要这一段，参考也不给。
+            continue
+        story_context.append(panel)
+        if panel_id not in valid:
+            # 移出/跳过的分镜：4A 看得到（保剧情），4B 选不到（不出镜）。
+            reference_only_ids.add(panel_id)
+
+    # Patch v3.2 Patch 12 的一贯契约：纯字卡（白底黑字 PPT）不进入任何
+    # 请求体——它一旦被选进候选池就会被念成 PPT 朗读。整批都是纯字卡时
+    # 兜底保留（与 exclude_pure_text_cards 同口径）。
+    kept = exclude_pure_text_cards(story_context)
+    if len(kept) != len(story_context):
+        kept_ids = {str(item.panel_id) for item in kept}
+        reference_only_ids &= kept_ids
+        story_context = kept
+    return story_context, reference_only_ids
 
 
 def _chapter_panel_span(
@@ -1802,20 +1903,31 @@ def render_prompt(template: str, mapping: dict[str, str]) -> str:
     return rendered
 
 
-def format_panel_list(panels: Sequence[PanelVisionInfo]) -> str:
+def format_panel_list(
+    panels: Sequence[PanelVisionInfo],
+    reference_only_ids: Iterable[str] | None = None,
+) -> str:
     """把一批 Stage 3 面板渲染成撰稿 Prompt 片段。
 
     Patch v3.1 Patch 10：纯字卡（``is_pure_text_card=True``）会在分镜 ID 后面
     标上 ``[纯字卡]``，提示 4B 尽量跳过这类「白底黑字 PPT 格」。
+
+    Patch v4.36：``reference_only_ids`` 里的分镜是「只在 4A 讲故事时作参考、
+    不会出镜」的那些（被移出/跳过的分镜）。它们会被标上
+    ``[仅参考剧情·不出镜]``——台词仍然保留（那也是真实剧情），但模型不能
+    为它们单独开章、也不能在 4B 里引用它们的编号。
     """
     if not panels:
         return "（本话暂无视觉抽取结果）"
+    reference_only = {str(item) for item in (reference_only_ids or ())}
     lines: list[str] = []
     for panel in panels:
         dialogues = "；".join(
             f"{item.speaker_guess}：{item.text}" for item in panel.dialogues
         )
         parts = [f"- {panel.panel_id}："]
+        if str(panel.panel_id) in reference_only:
+            parts.append("[仅参考剧情·不出镜]")
         if getattr(panel, "is_pure_text_card", False):
             parts.append("[纯字卡]")
         parts.append(panel.scene_summary)
@@ -2816,13 +2928,14 @@ async def _write_overview(
     template: str | None,
     temperature: float,
     character_lock: str = "",
+    reference_only_ids: Iterable[str] | None = None,
 ) -> dict:
     """第一段：通读整话，只产出钩子/摘要/角色/伏笔等元数据（不写解说句）。"""
     prompt = render_prompt(
         template if template is not None else load_prompt_template(OVERVIEW_PROMPT_FILENAME),
         {
             "MEMORY": _append_lock(context.prompt_block(), character_lock),
-            "PANELS": format_panel_list(panels),
+            "PANELS": format_panel_list(panels, reference_only_ids),
             "EPISODE_ID": episode_id,
             "EPISODE_NO": str(context.episode_no),
             "SERIES_TITLE": series_title or "未知作品",
@@ -2860,6 +2973,7 @@ async def _write_story_draft(
     story_word_budget: str = "",
     storyboard_constraints: str = "",
     character_lock: str = "",
+    reference_only_ids: Iterable[str] | None = None,
 ) -> EpisodeStoryDraft:
     """Stage 4A：全话通读 + 说书体故事反写，产出按时间单调排列的章节稿。
 
@@ -2876,7 +2990,7 @@ async def _write_story_draft(
         template if template is not None else load_prompt_template(STORY_PROMPT_FILENAME),
         {
             "MEMORY": _append_lock(context.prompt_block(), character_lock),
-            "PANELS": format_panel_list(panels),
+            "PANELS": format_panel_list(panels, reference_only_ids),
             "EPISODE_ID": episode_id,
             "EPISODE_NO": str(context.episode_no),
             "SERIES_TITLE": series_title or "未知作品",
@@ -2910,11 +3024,22 @@ async def _write_story_draft(
 
 
 def _fallback_story_draft(
-    episode_id: str, panels: Sequence[PanelVisionInfo], overview_text: str
+    episode_id: str,
+    panels: Sequence[PanelVisionInfo],
+    overview_text: str,
+    *,
+    panel_range: tuple[str, str] | None = None,
 ) -> EpisodeStoryDraft:
-    """故事反写失败时的兜底：用整话概览当唯一一章，保证 4B 仍有上下文。"""
-    first = panels[0].panel_id if panels else "panel_001"
-    last = panels[-1].panel_id if panels else "panel_001"
+    """故事反写失败时的兜底：用整话概览当唯一一章，保证 4B 仍有上下文。
+
+    Patch v4.36：``panel_range`` 显式给出「能出镜的分镜区间」，避免参考分镜
+    （仅参考剧情·不出镜）被写进章节锚点里。
+    """
+    if panel_range:
+        first, last = panel_range
+    else:
+        first = panels[0].panel_id if panels else "panel_001"
+        last = panels[-1].panel_id if panels else "panel_001"
     prose = overview_text or "（未获得结构化故事反写，改用整话概览作为参考）"
     return EpisodeStoryDraft(
         episode_id=episode_id,
@@ -3425,18 +3550,43 @@ async def write_episode_script(
         scene_mode=scene_mode,
     )
 
+    # ------------------------------------------------------------------
+    # Patch v4.36：4A（故事反写/概览）与 4B（选图）解耦
+    # ------------------------------------------------------------------
+    # 4A 看全貌：被移出/跳过的分镜仍然参与讲故事（标 [仅参考剧情·不出镜]），
+    # 否则「跳过一格纯对话」就会把剧情剪断；只有整段被关掉的镜头组才真正
+    # 从 4A 视野里消失。4B 仍然严格只用 valid_panel_ids，参考分镜一格都不会出镜。
+    (
+        story_context_panels,
+        reference_only_ids,
+    ) = _build_story_context_panels(
+        panels=panels,
+        all_panels=all_panels,
+        valid_panel_ids=valid_panel_ids,
+        resolved_storyboard=resolved_storyboard,
+        active_scenes=active_scenes,
+        scene_mode=scene_mode,
+    )
+    if reference_only_ids:
+        print(
+            "[s4_scriptwriter] 仅参考分镜（4A 可参考、4B 不出镜）："
+            + "、".join(sorted(reference_only_ids)),
+            file=sys.stderr,
+        )
+
     # Patch v3.2 Patch 12：纯字卡（白底黑字 PPT）从撰稿上下文里硬剔除，
     # overview / 4A 故事反写 / 4B 候选池都看不到它，避免被念成 PPT 朗读。
     overview = await _write_overview(
         client,
         model=model,
         context=context,
-        panels=story_panels,
+        panels=story_context_panels,
         episode_id=episode_id,
         series_title=series_title,
         template=overview_template,
         temperature=temperature,
         character_lock=canonicalizer_lock(canonicalizer),
+        reference_only_ids=reference_only_ids,
     )
     overview_text = _overview_brief(overview)
 
@@ -3445,7 +3595,8 @@ async def write_episode_script(
     )
     story_word_budget = f"{story_word_low}~{story_word_high} 字"
     storyboard_constraints = _storyboard_constraints_block(
-        active_scenes if scene_mode else []
+        active_scenes if scene_mode else [],
+        reference_only_ids,
     )
 
     # ------------------------------------------------------------------
@@ -3492,7 +3643,7 @@ async def write_episode_script(
                     client,
                     model=story_model or model,
                     context=context,
-                    panels=story_panels,
+                    panels=story_context_panels,
                     episode_id=episode_id,
                     series_title=series_title,
                     template=story_draft_template,
@@ -3500,6 +3651,7 @@ async def write_episode_script(
                     story_word_budget=story_word_budget,
                     storyboard_constraints=storyboard_constraints,
                     character_lock=canonicalizer_lock(canonicalizer),
+                    reference_only_ids=reference_only_ids,
                 )
             except Exception as exc:  # noqa: BLE001 - 故事反写失败不阻断流水线
                 # 故事反写失败不阻断流水线：退回整话概览作为 4B 的锚点。
@@ -3508,7 +3660,14 @@ async def write_episode_script(
                     file=sys.stderr,
                 )
                 story_draft = _fallback_story_draft(
-                    episode_id, story_panels, overview_text
+                    episode_id,
+                    story_context_panels,
+                    overview_text,
+                    panel_range=(
+                        (ordered_panel_ids[0], ordered_panel_ids[-1])
+                        if ordered_panel_ids
+                        else None
+                    ),
                 )
                 break
             chapter_count = len(story_draft.chapters or [])

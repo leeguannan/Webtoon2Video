@@ -288,31 +288,50 @@ export const CatalogView: React.FC<CatalogViewProps> = ({
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
-            {/* Mode Switch */}
+            {/* Mode Switch —— Patch v4.36 三档 */}
             <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg">
               <button
                 type="button"
+                onClick={() => onChangeRunMode('storyboard_prep')}
+                title="只跑下载→切图→视觉抽取→语义切幕，然后停下等你调镜头编排；确认后再单独跑一次 S4 写稿（S4 只跑一遍）"
+                className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                  runMode === 'storyboard_prep'
+                    ? 'bg-white text-slate-900 shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                准备分镜+切幕 (S1–S3b)
+              </button>
+              <button
+                type="button"
                 onClick={() => onChangeRunMode('phase1_only')}
+                title="跑到 S4 写稿为止，停下来给你审解说稿"
                 className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                   runMode === 'phase1_only'
                     ? 'bg-white text-slate-900 shadow-xs'
                     : 'text-slate-600 hover:text-slate-900'
                 }`}
               >
-                仅第一步 (下载+百炼出稿)
+                出稿止步 (S1–S4)
               </button>
               <button
                 type="button"
                 onClick={() => onChangeRunMode('full_video')}
+                title="一路跑到成片（S1–S7）"
                 className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                   runMode === 'full_video'
                     ? 'bg-white text-slate-900 shadow-xs'
                     : 'text-slate-600 hover:text-slate-900'
                 }`}
               >
-                全流程生成视频
+                全流程制片 (S1–S7)
               </button>
             </div>
+            {runMode === 'storyboard_prep' && (
+              <span className="text-[11px] text-slate-500 whitespace-nowrap shrink-0">
+                推荐：先调幕再写稿，S4 只跑一次
+              </span>
+            )}
 
             <button
               type="button"

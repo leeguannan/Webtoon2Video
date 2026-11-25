@@ -445,6 +445,14 @@ class StoryboardGenerateRequest(BaseModel):
 #: 镜头组重生成支持的任务模式。
 STORYBOARD_MODES: frozenset[str] = frozenset({"phase1_only", "full_video"})
 
+#: 流水线调度支持的任务模式（Patch v4.36 新增 ``storyboard_prep``）。
+#:
+#: * ``storyboard_prep``——切幕预备：只跑 S1~S3，顺带做语义切幕，
+#:   等人工确认镜头编排后再单独跑 S4（S4 只跑一遍）；
+#: * ``phase1_only``——出稿止步：跑到 S4 写稿为止；
+#: * ``full_video``——全流程：一直跑到 S7 成片。
+RUN_MODES: frozenset[str] = frozenset({"storyboard_prep", "phase1_only", "full_video"})
+
 #: 面板图片后缀 → media type（``/panels/{filename}`` 静态回源用）。
 PANEL_MEDIA_TYPES: dict[str, str] = {
     ".png": "image/png",
@@ -2361,6 +2369,11 @@ def create_app(
     async def submit_jobs(payload: JobBatchRequest) -> dict[str, Any]:
         if not payload.items:
             raise HTTPException(status_code=400, detail="任务列表为空")
+        if payload.mode not in RUN_MODES:
+            raise HTTPException(
+                status_code=400,
+                detail="mode 只支持 storyboard_prep / phase1_only / full_video",
+            )
         for item in payload.items:
             if "series_id" not in item or "episode_no" not in item:
                 raise HTTPException(
@@ -2374,6 +2387,11 @@ def create_app(
         located = view.find_episode(episode_id)
         if located is None:
             raise HTTPException(status_code=404, detail=f"找不到话次：{episode_id}")
+        if payload.mode not in RUN_MODES:
+            raise HTTPException(
+                status_code=400,
+                detail="mode 只支持 storyboard_prep / phase1_only / full_video",
+            )
         series_id, episode_no = located
         try:
             job = await job_runner.submit_episode(

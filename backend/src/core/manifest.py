@@ -331,16 +331,20 @@ class ManifestManager:
                 board_path = stage_dir / "storyboard.json"
                 if board_path.is_file():
                     source = ""
+                    auto_strategy = ""
                     try:
                         payload = json.loads(board_path.read_text(encoding="utf-8"))
                         source = str(payload.get("source") or "")
+                        auto_strategy = str(payload.get("auto_strategy") or "")
                     except (OSError, ValueError):
                         source = ""
-                    if (
-                        from_stage == "s4_scriptwriter"
-                        and source == "human"
-                        and not include_human_storyboard
-                    ):
+                        auto_strategy = ""
+                    # Patch v4.36：从 S4 重跑时保留**人工编排**与**已完成的语义切幕**。
+                    # 语义切幕（auto_strategy == "semantic"）是 S3b 切幕预备模式
+                    # 落盘的成果，用户看完觉得无需改动直接跑 S4 时不该被删掉重切
+                    # （那会白跑一次切幕模型）。
+                    keep_board = from_stage == "s4_scriptwriter" and not include_human_storyboard
+                    if keep_board and (source == "human" or auto_strategy == "semantic"):
                         preserved_human_storyboard = True
                     else:
                         _remove_file(board_path)
