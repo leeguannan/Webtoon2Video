@@ -92,7 +92,12 @@ from core.panel_scope import (
     load_panel_scope,
     violations_payload,
 )
-from core.normalize import to_simplified_chinese
+from core.normalize import (
+    SFX_CUE_ALIASES,
+    SFX_CUE_CATALOG,
+    SFX_CUE_KEYS,
+    to_simplified_chinese,
+)
 from core.schemas import (
     ArcSummary,
     CharacterProfile,
@@ -1260,7 +1265,58 @@ class BgmUploadRequest(BaseModel):
 
 #: Patch v4.7 曲库上传限制：30MB、仅四种音频后缀（与 s7 ASSET_SUFFIX_PRIORITY 对齐）。
 BGM_UPLOAD_MAX_BYTES = 30 * 1024 * 1024
+class SfxUploadRequest(BaseModel):
+    """音效素材上传（Patch v4.38）。"""
+
+    sfx_key: str
+    filename: str = ""
+    content_base64: str
+
+
 BGM_ALLOWED_SUFFIXES = (".mp3", ".m4a", ".wav", ".ogg")
+
+
+#: Patch v4.38：音效素材允许的后缀与媒体类型（全局音效盘面）。
+SFX_ALLOWED_SUFFIXES = (".mp3", ".wav", ".m4a", ".ogg")
+SFX_MEDIA_TYPES = {
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".m4a": "audio/mp4",
+    ".ogg": "audio/ogg",
+}
+#: 音效上传体积上限（单个音效文件本来都很小，给 30MB 余量）。
+SFX_UPLOAD_MAX_BYTES = 30 * 1024 * 1024
+
+
+def _sfx_library_payload() -> dict[str, Any]:
+    """音效曲库清单（对应 ``core.normalize.SFX_CUE_CATALOG``）。
+
+    每条包含：key / label / category / available（盘面有没有真实素材）/
+    resolved_filename（实际会用的文件名）/ fallback_key（兜底音效）/
+    url（前端试听地址）。
+    """
+    items: list[dict[str, Any]] = []
+    for entry in SFX_CUE_CATALOG:
+        key = entry["key"]
+        fallback_key = entry.get("fallback_key") or ""
+        resolved = s7_renderer.resolve_sfx_asset(key)
+        resolved_name = resolved.name if resolved is not None else ""
+        items.append(
+            {
+                "key": key,
+                "label": entry["label"],
+                "category": entry["category"],
+                "available": resolved_name != "",
+                "resolved_filename": resolved_name,
+                "fallback_key": fallback_key,
+                "url": f"/api/sfx-file/{key}",
+            }
+        )
+    return {
+        "items": items,
+        "aliases": dict(SFX_CUE_ALIASES),
+        "allowed_suffixes": list(SFX_ALLOWED_SUFFIXES),
+    }
 
 
 def _decode_base64_audio(content_base64: str) -> bytes:
@@ -3194,6 +3250,53 @@ def create_app(
         bgm_dir.mkdir(parents=True, exist_ok=True)
         (bgm_dir / target_name).write_bytes(raw_bytes)
         return _bgm_library_payload(series_id)
+
+    @app.get("/api/sfx-library")
+    def get_sfx_library() -> dict[str, Any]:
+        """音效曲库清单（Patch v4.38）：24 个标准音效键 + 盘面可用情况。"""
+        return _sfx_library_payload()
+
+    @app.get("/api/sfx-file/{sfx_key}")
+    def get_sfx_file(sfx_key: str) -> FileResponse:
+        """回源一个音效素材（试听用）。
+
+        key 必须属于 ``core.normalize.SFX_CUE_KEYS``；盘面没有真实素材时按
+        ``fallback_key`` 回源复用通用音效；都没有则 404。
+        """
+        key = Path(str(sfx_key or "")).name.strip().lower()
+        if key not in SFX_CUE_KEYS:
+            raise HTTPException(status_code=400, detail=f"不是合法的音效键：{sfx_key}")
+        resolved = s7_renderer.resolve_sfx_asset(key)
+        if resolved is None or not resolved.is_file():
+            raise HTTPException(status_code=404, detail=f"找不到音效素材：{key}")
+        media_type = SFX_MEDIA_TYPES.get(
+            resolved.suffix.lower(), "application/octet-stream"
+        )
+        return FileResponse(
+            resolved,
+            media_type=media_type,
+            filename=resolved.name,
+            content_disposition_type="inline",
+        )
+
+    @app.post("/api/sfx-library/upload")
+    def upload_sfx_asset(payload: SfxUploadRequest) -> dict[str, Any]:
+        """上传（覆盖）一个音效素材（Patch v4.38）。"""
+        key = Path(str(payload.sfx_key or "")).name.strip().lower()
+        if key not in SFX_CUE_KEYS:
+            raise HTTPException(status_code=400, detail=f"不是合法的音效键：{payload.sfx_key}")
+        raw_name = Path(payload.filename or "").name
+        suffix = Path(raw_name).suffix.lower() if raw_name else ".mp3"
+        if suffix not in SFX_ALLOWED_SUFFIXES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"只支持 {', '.join(SFX_ALLOWED_SUFFIXES)} 音频",
+            )
+        raw_bytes = _decode_base64_audio(payload.content_base64)
+        sfx_dir = s7_renderer.assets_root() / s7_renderer.SFX_DIR_NAME
+        sfx_dir.mkdir(parents=True, exist_ok=True)
+        (sfx_dir / f"{key}{suffix}").write_bytes(raw_bytes)
+        return _sfx_library_payload()
 
     @app.delete("/api/series/{series_id}/bgm-library/{filename}")
     def delete_bgm_track(series_id: str, filename: str) -> dict[str, Any]:

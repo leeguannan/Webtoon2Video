@@ -49,12 +49,14 @@ import type {
   ScriptBeat,
   ScriptSaveOutcome,
   SeriesTtsConfigResponse,
+  SfxLibraryItem,
   StageId,
   StoryboardScene,
   StudioConfig,
   VoiceOption,
 } from '../types/studio';
 import { formatMs, playPreviewTone, resolveSpokenText } from '../utils/pronunciation';
+import { fetchSfxLibrary, sfxFileUrl } from '../api/studioApi';
 import { formatBytes } from '../utils/format';
 import { PanelZoomModal, type RoleOption, type SaveStatus } from './PanelZoomModal';
 import {
@@ -698,6 +700,31 @@ const beatVoiceInfoOf = (
 };
 
 /**
+ * Patch v4.38：音效试听（模块级**单一** Audio 实例）。
+ *
+ * 一话 120 行、每行一个试听按钮，用 new Audio() 逐个 new 会让多个音效
+ * 同时响（点一个响一片）。这里全局只留一个实例，播新的先停掉旧的。
+ */
+let sfxPreviewAudio: HTMLAudioElement | null = null;
+
+function playSfxPreview(url: string): void {
+  if (!url) return;
+  try {
+    if (sfxPreviewAudio) {
+      sfxPreviewAudio.pause();
+      sfxPreviewAudio.currentTime = 0;
+    }
+    const audio = new Audio(url);
+    sfxPreviewAudio = audio;
+    void audio.play().catch(() => {
+      /* 浏览器自动播放策略拦截时静默失败 */
+    });
+  } catch {
+    /* 素材损坏 / 格式不支持时不影响审核台其余功能 */
+  }
+}
+
+/**
  * Patch v4.25：改说话人角色时要同步落的字段（模块级版本）。
  *
  * a) speaker_gender 始终跟着角色走，选回「不指定」（空串）时重置为 unknown；
@@ -781,6 +808,10 @@ interface ScriptBeatRowProps {
   onAddPanelAt?: (beatId: string) => void;
   /** Patch v4.35：从分镜详情跳到审核台时高亮这一行。 */
   highlight?: boolean;
+  /** Patch v4.38：音效曲库（24 个标准键 + 盘面可用情况）。 */
+  sfxLibrary?: SfxLibraryItem[];
+  /** Patch v4.38：改这一句的音效提示（传 null = 清空）。 */
+  onChangeSfxCue?: (beatId: string, sfxKey: string | null) => void;
   onChangeScene: (beatId: string, sceneId: string | null) => void;
   onToggleTagPicker: (beatId: string) => void;
   onPickTag: (beatId: string, snippet: string) => void;
@@ -830,6 +861,8 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
     panelsById,
     onAddPanelAt,
     highlight,
+    sfxLibrary,
+    onChangeSfxCue,
     onChangeScene,
     onToggleTagPicker,
     onPickTag,
@@ -844,6 +877,34 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
     () => roleOptionsForBeat(beat, seriesTts, roleNames),
     [beat, seriesTts, roleNames]
   );
+  /* Patch v4.38：音效曲库按分类分组；「usedFallback」= 盘面没有该键的素材，
+     实际回源用了兜底音效（前端要标出来，别让人以为听到的是原音效）。 */
+  const sfxGroups = useMemo(() => {
+    const groups: Array<{
+      category: string;
+      items: Array<SfxLibraryItem & { usedFallback: boolean }>;
+    }> = [];
+    const byCategory = new Map<string, Array<SfxLibraryItem & { usedFallback: boolean }>>();
+    for (const item of sfxLibrary ?? []) {
+      const usedFallback =
+        item.resolved_filename !== '' &&
+        !item.resolved_filename.startsWith(item.key);
+      const enriched = { ...item, usedFallback };
+      const bucket = byCategory.get(item.category);
+      if (bucket) bucket.push(enriched);
+      else byCategory.set(item.category, [enriched]);
+    }
+    for (const [category, items] of byCategory) {
+      groups.push({ category, items });
+    }
+    return groups;
+  }, [sfxLibrary]);
+  const currentSfx = (sfxLibrary ?? []).find((item) => item.key === (beat.sfx_cue ?? ''));
+  const currentSfxPlayable = Boolean(currentSfx?.available);
+  const previewSfx = useCallback((sfxKey: string) => {
+    if (!sfxKey) return;
+    playSfxPreview(sfxFileUrl(sfxKey));
+  }, []);
   const voiceInfo = useMemo(
     () => beatVoiceInfoOf(beat, seriesTts, roleNames, voiceOptionMap),
     [beat, seriesTts, roleNames, voiceOptionMap]
@@ -1395,6 +1456,48 @@ const ScriptBeatRow = React.memo(function ScriptBeatRow(props: ScriptBeatRowProp
               </button>
             )}
           </div>
+          {/* Patch v4.38：本句音效提示（sfx_cue）——下拉选 24 个标准音效之一，
+              紧邻一个试听按钮；盘面缺素材时会标注「·通用兜底」。 */}
+          <div className="flex items-center gap-1 pt-1">
+            <span className="shrink-0 text-[10px] text-slate-400">音效</span>
+            <select
+              value={beat.sfx_cue ?? ''}
+              onChange={(e) =>
+                onChangeSfxCue?.(beat.beat_id, e.target.value || null)
+              }
+              aria-label={`${beat.beat_id} 音效`}
+              title="这一句的音效提示；保存后从 S6 重跑即可生效"
+              className="min-w-0 flex-1 px-2 py-1 text-[11px] bg-white border border-slate-200 rounded-lg focus:outline-none focus:border-blue-600"
+            >
+              <option value="">无音效</option>
+              {sfxGroups.map((group) => (
+                <optgroup key={group.category} label={group.category}>
+                  {group.items.map((item) => (
+                    <option key={item.key} value={item.key}>
+                      {item.label}
+                      {item.usedFallback ? '·通用兜底' : ''}
+                    </option>
+                  ))}
+                </optgroup>
+              ))}
+            </select>
+            <button
+              type="button"
+              onClick={() => previewSfx(beat.sfx_cue ?? '')}
+              disabled={!beat.sfx_cue || !currentSfxPlayable}
+              aria-label={`${beat.beat_id} 试听当前音效`}
+              title={
+                beat.sfx_cue
+                  ? currentSfxPlayable
+                    ? '试听这一句的音效素材'
+                    : '盘面暂无该音效素材'
+                  : '这一句还没有选音效'
+              }
+              className="shrink-0 w-5 h-5 flex items-center justify-center rounded border border-slate-200 bg-white text-slate-500 hover:border-slate-400 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <Volume2 className="w-3 h-3" />
+            </button>
+          </div>
         </div>
       </td>
 
@@ -1812,6 +1915,21 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
    * 这个提示把「改了几句、保存后要重跑什么」一次说清。
    */
   const [multiPanelHint, setMultiPanelHint] = useState('');
+  /* Patch v4.38：音效曲库（24 个标准键 + 盘面可用情况）。 */
+  const [sfxLibrary, setSfxLibrary] = useState<SfxLibraryItem[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    fetchSfxLibrary()
+      .then((data) => {
+        if (!cancelled) setSfxLibrary(data.items ?? []);
+      })
+      .catch(() => {
+        /* 音效曲库拉不到不阻塞审核台：下拉退化成只有「无音效」 */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   // ---- Patch v4.35：审核台命令栏的本地派生状态 ----
   /** 即时搜索框的关键词（beat_id / 字幕 / 角色 / 目标分镜）。 */
   const [scriptQuery, setScriptQuery] = useState('');
@@ -2567,7 +2685,9 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
       draftBeatsRef.current = next;
       setDraftBeats(next);
       // Patch v4.8：改了句间停顿就必须重建时间轴，否则从 S7 重跑会吃到旧停顿。
-      if (key === 'pause_after_ms') {
+      // Patch v4.38：改了音效提示同理——S6 排音效事件、S7 取素材，
+      // 不重跑 S6~S7 就还是旧的音效。
+      if (key === 'pause_after_ms' || key === 'sfx_cue') {
         setNeedsTimelineRebuild(true);
       }
       markTableDirty();
@@ -3683,6 +3803,19 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
         '保存解说稿后重跑 S6~S7 即可生效（无需重跑配音）。'
     );
   }, [markTableDirty]);
+
+  /**
+   * Patch v4.38：改这一句的音效提示。
+   *
+   * 置空时传 `null`（后端 `NULLABLE_BEAT_FIELDS` 含 sfx_cue，传 null 才是
+   * 真的清空，传空串会被当成「不改」继承旧值）。
+   */
+  const handleRowChangeSfxCue = useCallback(
+    (beatId: string, sfxKey: string | null) => {
+      updateBeatField(beatId, 'sfx_cue', sfxKey);
+    },
+    [updateBeatField]
+  );
 
   const handleRowChangeScene = useCallback(
     (beatId: string, sceneId: string | null) =>
@@ -5452,6 +5585,8 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                                   scopePanelIds={scopePanelIds}
                                   panelsById={panelMap}
                                   onAddPanelAt={handleRowAddPanelAt}
+                                  sfxLibrary={sfxLibrary}
+                                  onChangeSfxCue={handleRowChangeSfxCue}
                                   onChangeScene={handleRowChangeScene}
                                   onToggleTagPicker={handleRowToggleTagPicker}
                                   onPickTag={handleRowPickTag}

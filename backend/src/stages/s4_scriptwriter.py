@@ -1099,7 +1099,8 @@ PACE_TURN_KEYWORDS: tuple[str, ...] = (
 )
 #: 可触发转折留白的音效标签。
 PACE_TURN_SFX: frozenset[str] = frozenset(
-    {"heart_thump", "gasp", "crash", "door_slam"}
+    {"heart_thump", "gasp", "crash", "door_slam", "slap", "punch",
+     "sword_clash", "glass_shatter", "boom_hit", "thunder"}
 )
 #: 悬念 / 震惊尾句标点组合。
 PACE_SUSPENSE_ENDINGS: tuple[str, ...] = ("……", "…？", "？！", "...？")
@@ -1515,7 +1516,8 @@ MOTION_IMPACT_SFX: frozenset[str] = frozenset(
 )
 #: 视作「物理冲击」的标准音效标签（``core.normalize.SFX_CUE_KEYS`` 里的物理动作音）。
 MOTION_IMPACT_SFX_CUES: frozenset[str] = frozenset(
-    {"crash", "heart_thump", "door_slam", "whoosh", "footstep"}
+    {"crash", "heart_thump", "door_slam", "whoosh", "footstep",
+     "slap", "punch", "sword_clash", "glass_shatter", "boom_hit", "thunder"}
 )
 #: 触发震动镜头的情绪（愤怒 / 震惊）。
 MOTION_IMPACT_EMOTIONS: frozenset[str] = frozenset({"angry", "shocked"})

@@ -100,10 +100,28 @@
 - **大转折 / 跨场景 / 悬念揭示 / 高潮短句**（时空跳转、秘密揭穿、关键证据曝光、震惊反问或悬念尾句）：
   `900 ~ 1200`（跨场景结尾约 `1150`，大转折约 `950`），全话控制在 6~10 处左右，宁缺毋滥，不要句句都标重停顿。
 
-【铁律二点九：可选音效提示 `sfx_cue`（Patch v3.1 Patch 10）】
+【铁律二点九：可选音效提示 `sfx_cue`（Patch v3.1 Patch 10 / Patch v4.38 扩到 24 个 key）】
 - 仅在**剧情高潮或明显的物理动作点**输出 1 个标准 key，普通对话与叙述留空或省略。
-- 合法 key 只有这 7 个：`heart_thump` / `door_slam` / `whoosh` / `gasp` / `phone_msg` / `footstep` / `crash`。
+- 合法 key 共 **24 个**，按分类取用（用错 key 会被丢弃，等于白写）：
+
+  | 分类 | 合法 key |
+  | --- | --- |
+  | 生理 | `heart_thump`（心跳）/ `gasp`（倒吸气） |
+  | 门 | `door_slam`（摔门）/ `door_open`（开门） |
+  | 脚步 | `footstep`（脚步） |
+  | 击打 | `slap`（耳光）/ `punch`（拳击）/ `sword_clash`（刀剑交击） |
+  | 爆炸 | `boom_hit`（轰击）/ `crash`（撞击）/ `thunder`（雷声） |
+  | 碎裂 | `glass_shatter`（玻璃碎裂） |
+  | 摩擦 | `cloth_rustle`（衣料摩擦）/ `whoosh`（破空） |
+  | 人群 | `applause`（掌声） |
+  | 钟表 | `clock_tick`（钟表滴答） |
+  | 纸页 | `page_turn`（翻页） |
+  | 相机 | `camera_shutter`（快门） |
+  | 交通 | `car_horn`（鸣笛） |
+  | 通讯 | `phone_msg`（短信提示）/ `phone_ringing`（电话铃响）/ `phone_vibrating`（手机震动）/ `phone_call`（通话接通）/ `phone_unavailable`（忙音） |
+
 - **全话最多 4~8 处，切忌每句都加**（宁缺毋滥，避免吵）。
+- **一条 beat 只能给 1 个 key**，不要给数组、不要再补别的同义 key。
 
 【铁律三：tts_text 禁拼音】
 - `tts_text` 是**整句送音文本**，不是单个词：字幕为脱敏字或特殊口语（如 `混X`、`靠X`）时，把脱敏字换成**标准汉字同音词**（如「混蛋」「混账」「靠北」）后，把**整句**写进 `tts_text`。

@@ -503,7 +503,7 @@ def test_sidechain_uses_gentle_v32_ducking(monkeypatch, tmp_path: Path) -> None:
     attack=30ms / release=350ms），分段之间会因各自响度不同而跳变；现在改成
     在整片母带阶段闪避一次（双源侧链：人声 + 音效都能压 BGM），
     参数为 threshold=0.06 / ratio=2.4 / attack=25ms / release=350ms
-    （FFmpeg 的 sidechaincompress 用**秒**，故实际传入 0.025 / 0.350）。
+    （FFmpeg 的 sidechaincompress 的 attack/release 单位就是**毫秒**，原值传入）。
     """
     from stages import s7_renderer
 
@@ -543,11 +543,11 @@ def test_sidechain_uses_gentle_v32_ducking(monkeypatch, tmp_path: Path) -> None:
 
     joined = " ".join(" ".join(call) for call in captured)
     assert "sidechaincompress=" in joined
-    # sidechaincompress 的 attack/release 单位是**秒**，毫秒常量必须换算后再传。
+    # sidechaincompress 的 attack/release 单位是**毫秒**（ffmpeg 文档默认 20 / 250）。
     assert (
         f"threshold={s7_renderer._DUCK_THRESHOLD}:ratio={s7_renderer._DUCK_RATIO}:"
-        f"attack={s7_renderer._DUCK_ATTACK_MS / 1000.0:.3f}:"
-        f"release={s7_renderer._DUCK_RELEASE_MS / 1000.0:.3f}"
+        f"attack={s7_renderer._DUCK_ATTACK_MS}:"
+        f"release={s7_renderer._DUCK_RELEASE_MS}"
     ) in joined
     assert exports_dir_for(tmp_path) == tmp_path / "exports"
 

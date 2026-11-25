@@ -167,12 +167,16 @@ def test_parse_loudnorm_stats_returns_none_on_garbage() -> None:
     assert s7_renderer._parse_loudnorm_stats("{ broken") is None
 
 
-def test_measure_audio_lufs_falls_back_to_zero_for_missing_file() -> None:
-    """量不到就回退 0.0 偏置，绝不抛异常把渲染打断。"""
+def test_measure_audio_lufs_returns_none_for_missing_file() -> None:
+    """量不到就返回 ``None``，绝不抛异常把渲染打断。
+
+    Patch v4.38：以前回退 ``0.0``，调用方会把它当成实测响度去算 -16dB 的
+    校准偏置——等于把底噪放大。无声素材必须**不校准**。
+    """
     measured = s7_renderer._measure_audio_lufs(
         Path("/nonexistent/does-not-exist.wav"), ffmpeg_bin=FFMPEG_BIN or "ffmpeg"
     )
-    assert measured == 0.0
+    assert measured is None
 
 
 def test_v437_constants_are_pinned() -> None:
@@ -192,15 +196,16 @@ def test_v437_constants_are_pinned() -> None:
     assert s7_renderer._DUCK_RELEASE_MS == 350
 
 
-def test_duck_attack_release_are_converted_to_seconds() -> None:
-    """sidechaincompress 的 attack/release 单位是**秒**——毫秒常量必须换算。
+def test_duck_attack_release_are_passed_in_milliseconds() -> None:
+    """sidechaincompress 的 attack/release 单位是**毫秒**（ffmpeg 文档默认 20 / 250）。
 
-    旧分段链路误传 ``attack=30``（= 30 秒），压缩永远来不及起效，
-    「闪避」事实上一直是关着的。
+    Patch v4.38 修正：v4.37 误按「秒」换算传了 0.025 / 0.350，
+    那是 25 微秒 / 0.35 毫秒——压得死但每个音节都在抽水。
     """
     source = Path(s7_renderer.__file__).read_text(encoding="utf-8")
-    assert "attack={_DUCK_ATTACK_MS / 1000.0:.3f}" in source
-    assert "release={_DUCK_RELEASE_MS / 1000.0:.3f}" in source
+    assert "attack={_DUCK_ATTACK_MS}" in source
+    assert "release={_DUCK_RELEASE_MS}" in source
+    assert "attack={_DUCK_ATTACK_MS / 1000.0" not in source
 
 
 # --------------------------------------------------------------------------
@@ -309,8 +314,8 @@ def test_measure_lufs_ignores_leading_silence(tmp_path: Path) -> None:
 
     measured_plain = s7_renderer._measure_audio_lufs(plain, ffmpeg_bin=FFMPEG_BIN)
     measured_padded = s7_renderer._measure_audio_lufs(padded, ffmpeg_bin=FFMPEG_BIN)
-    assert measured_plain != 0.0
-    assert measured_padded != 0.0
+    assert measured_plain is not None
+    assert measured_padded is not None
     # 带 2 秒静音的素材，量出来的响度必须与纯净素材基本一致。
     assert abs(measured_padded - measured_plain) < 1.0
 
@@ -374,7 +379,7 @@ def test_master_wav_hits_target_loudness(tmp_path: Path) -> None:
         assert handle.getsampwidth() == 2
 
     measured = s7_renderer._measure_audio_lufs(master, ffmpeg_bin=FFMPEG_BIN)
-    assert measured != 0.0
+    assert measured is not None
     assert -15.5 <= measured <= -12.5, f"母带响度 {measured:.2f} LUFS 偏离 -14 目标过远"
 
     # 峰值不削波：限幅把峰值压在 -1dBFS 附近，不允许触顶。

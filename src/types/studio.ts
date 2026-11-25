@@ -94,7 +94,7 @@ export interface ScriptBeat {
   speaker_role?: string;
   /** Stage 4 产出的说话人性别（male / female / unknown），Patch v3.2 Patch 12。 */
   speaker_gender?: 'male' | 'female' | 'unknown';
-  /** Stage 4 产出的可选音效提示（heart_thump / door_slam / whoosh / gasp / phone_msg / footstep / crash）。 */
+  /** Stage 4 产出的可选音效提示（24 个标准 key，见 SfxLibraryItem）。 */
   sfx_cue?: string | null;
   /** 取景提示（full / top / bottom / center）。 */
   focus_hint?: string;
@@ -106,6 +106,34 @@ export interface ScriptBeat {
   speed_override?: number | null;
   /** Patch v4.13：这条解说归属的镜头组（幕）scene_id；缺省表示尚未归属。 */
   scene_id?: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Patch v4.38：音效曲库（24 个标准音效键）
+// ---------------------------------------------------------------------------
+/** 音效曲库里的一条（对应后端 core.normalize.SFX_CUE_CATALOG）。 */
+export interface SfxLibraryItem {
+  /** 标准音效键（如 heart_thump / door_slam / phone_ringing）。 */
+  key: string;
+  /** 中文名（前端展示）。 */
+  label: string;
+  /** 分类（生理 / 门 / 击打 / 通讯 …），前端按分类分组。 */
+  category: string;
+  /** 盘面是否已有该音效的可用素材（可能靠 fallback 回源）。 */
+  available: boolean;
+  /** 实际会用到的文件名（空串 = 盘面完全没有）。 */
+  resolved_filename: string;
+  /** 缺素材时的兜底音效键（空串 = 没有兜底）。 */
+  fallback_key: string;
+  /** 试听地址。 */
+  url: string;
+}
+
+/** 音效曲库响应体。 */
+export interface SfxLibraryResponse {
+  items: SfxLibraryItem[];
+  aliases: Record<string, string>;
+  allowed_suffixes: string[];
 }
 
 /** 百炼官方音色的一条配音规格（Patch v3.2 Patch 13）。 */

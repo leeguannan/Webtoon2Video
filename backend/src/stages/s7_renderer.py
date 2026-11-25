@@ -48,6 +48,7 @@ from core.branding_render import (
     resolve_effective_branding,
 )
 from core.config import AppConfig, SeriesConfig, assets_root, load_series_config
+from core.normalize import sfx_fallback_key
 from core.schemas import (
     EpisodeStoryboard,
     RenderTimeline,
@@ -1074,9 +1075,30 @@ def resolve_sfx_asset(
     *,
     assets_dir: str | Path | None = None,
 ) -> Path | None:
-    """按音效键找素材文件（``sfx/<key>.<ext>``）；找不到返回 ``None``。"""
+    """按音效键找素材文件（``sfx/<key>.<ext>``）；找不到返回 ``None``。
+
+    Patch v4.38：盘面暂时没有该 key 的真实素材时，按
+    :data:`core.normalize.SFX_CUE_CATALOG` 里的 ``fallback_key`` **回源复用**
+    通用音效（例如 ``slap`` 缺失 → 用 ``door_slam``；``punch`` 缺失 → 用
+    ``crash``；``door_open`` 缺失 → 用 ``whoosh``）。
+
+    规则：
+
+    * ``<sfx_key>.*`` 有真实文件就**优先命中真实文件**（不回落）；
+    * 没有就按 catalog 的 ``fallback_key`` 回源，回源同样先找真实文件；
+    * 回源链最多两级（``fallback`` 的 fallback 不再追），且不会成环；
+    * 两者都没有 → 返回 ``None``（成片里这一条音效就没有，不静默换别的）。
+    """
     root = Path(assets_dir).expanduser() if assets_dir else assets_root()
-    return resolve_audio_asset(root / SFX_DIR_NAME, sfx_key)
+    sfx_dir = root / SFX_DIR_NAME
+    direct = resolve_audio_asset(sfx_dir, sfx_key)
+    if direct is not None:
+        return direct
+
+    fallback = sfx_fallback_key(sfx_key)
+    if not fallback:
+        return None
+    return resolve_audio_asset(sfx_dir, fallback)
 
 
 # --------------------------------------------------------------------------
@@ -1552,9 +1574,9 @@ def _measure_audio_lufs(
     audio_path: Path,
     *,
     ffmpeg_bin: str = "ffmpeg",
-    cache: dict[str, float] | None = None,
-) -> float:
-    """测量音频的**有效响度**（LUFS），完全测不出时回退 ``0.0``。
+    cache: dict[str, float | None] | None = None,
+) -> float | None:
+    """测量音频的**有效响度**（LUFS）；完全测不出时返回 ``None``。
 
     **为什么必须先掐掉前导静音**：素材常带几百毫秒到几秒的静音，直接
     ``ebur128`` 会把静音算进积分窗口，响度被系统性拉低——于是「按目标
@@ -1566,7 +1588,11 @@ def _measure_audio_lufs(
 
     * 优先取积分响度 ``I``；
     * 极短音频（积分窗口填不满）退回「最大瞬时响度 ``M``」；
-    * 全静音 / 解析失败 → ``0.0`` 偏置（调用方据此夹住增益）。
+    * **全静音 / 解析失败 / 文件缺失 → 返回 ``None``**（Patch v4.38 修正）。
+
+    Patch v4.38 修正：以前这里回退 ``0.0``，而调用方把 ``0.0`` 当成「实测
+    响度」去算校准增益，等于给一条**完全无声**的素材硬塞 ``-16dB`` 的偏置
+    （等于把底噪放大）。现在改成返回 ``None``，调用方一律按「不校准」处理。
 
     ``cache`` 按文件路径缓存：同一次备音里同一条素材只测一次。
     """
@@ -1574,7 +1600,7 @@ def _measure_audio_lufs(
     if cache is not None and key in cache:
         return cache[key]
 
-    measured = 0.0
+    measured: float | None = None
     try:
         completed = subprocess.run(
             [
@@ -1602,10 +1628,8 @@ def _measure_audio_lufs(
             measured = integrated
         elif max_momentary is not None and max_momentary > -60.0:
             measured = max_momentary
-        else:
-            measured = 0.0
     except (OSError, subprocess.SubprocessError, ValueError):
-        measured = 0.0
+        measured = None
 
     if cache is not None:
         cache[key] = measured
@@ -1793,7 +1817,7 @@ def _prepare_audio(
         chains.append(bgm_filters)
 
     sfx_labels: list[str] = []
-    lufs_cache: dict[str, float] = {}
+    lufs_cache: dict[str, float | None] = {}
     for offset, (path, start, gain) in enumerate(sfx_inputs):
         # Patch v4.37：SFX 整形链改成「先量有效响度 → 校准 → 叠加配置增益
         # → 淡入保护 → 限幅防爆音 → 最后才 adelay 对齐事件时间点」。
@@ -1803,10 +1827,15 @@ def _prepare_audio(
         # 素材落在不同时刻的音量完全对不上（长延迟的音效能差出十几 dB）。
         # 现在改成「先量去静音后的有效响度再校准」，落点只影响时间、不影响电平。
         measured = _measure_audio_lufs(path, ffmpeg_bin=ffmpeg_bin, cache=lufs_cache)
-        calibration = max(
-            -_SFX_CALIBRATION_LIMIT_DB,
-            min(_SFX_CALIBRATION_LIMIT_DB, _SFX_TARGET_LUFS - measured),
-        )
+        # Patch v4.38：测不出响度（无声素材 / 文件缺失）时**不做校准**，
+        # 绝不能把 0.0 当成实测值去算 -16dB 的偏置（那等于放大底噪）。
+        if measured is None:
+            calibration = 0.0
+        else:
+            calibration = max(
+                -_SFX_CALIBRATION_LIMIT_DB,
+                min(_SFX_CALIBRATION_LIMIT_DB, _SFX_TARGET_LUFS - measured),
+            )
         chain = (
             f"[{sfx_base + offset}:a]aformat=sample_fmts=fltp:sample_rates={_AUDIO_RATE}:"
             f"channel_layouts={_AUDIO_LAYOUT},"
@@ -1844,7 +1873,10 @@ def _prepare_audio(
     # _VOICE_LUFS_TOLERANCE 时线性微调并过限幅；正常范围内**保持原样**，
     # 不做无谓的二次重算（全片重算一次人声轨并不便宜）。
     voice_lufs = _measure_audio_lufs(voice_path, ffmpeg_bin=ffmpeg_bin, cache=lufs_cache)
-    if voice_lufs != 0.0 and abs(voice_lufs - _VOICE_TARGET_LUFS) > _VOICE_LUFS_TOLERANCE:
+    if (
+        voice_lufs is not None
+        and abs(voice_lufs - _VOICE_TARGET_LUFS) > _VOICE_LUFS_TOLERANCE
+    ):
         correction = max(
             -_VOICE_CORRECTION_LIMIT_DB,
             min(_VOICE_CORRECTION_LIMIT_DB, _VOICE_TARGET_LUFS - voice_lufs),
@@ -1945,11 +1977,14 @@ def _mix_and_master_audio(
                 "-filter_complex",
                 f"[0:a][1:a]sidechaincompress=threshold={_DUCK_THRESHOLD}:"
                 f"ratio={_DUCK_RATIO}:"
-                # 注意：sidechaincompress 的 attack/release 单位是**秒**（ffmpeg 文档
-                # 默认 0.01），不是毫秒。旧分段链路误传 30 / 350 实际等于 30 秒 /
-                # 350 秒——压缩永远来不及起效，「闪避」事实上一直是关着的。
-                f"attack={_DUCK_ATTACK_MS / 1000.0:.3f}:"
-                f"release={_DUCK_RELEASE_MS / 1000.0:.3f}[out]",
+                # sidechaincompress 的 attack / release 单位是**毫秒**
+                # （``ffmpeg -h filter=sidechaincompress``：attack 0.01~2000 默认 20，
+                # release 0.01~9000 默认 250）。
+                # Patch v4.38 修正：v4.37 误按「秒」换算传了 0.025 / 0.350，
+                # 那是 25 微秒 / 0.35 毫秒——压得死但每个音节都在抽水。
+                # 现在按毫秒原值传 25 / 350。
+                f"attack={_DUCK_ATTACK_MS}:"
+                f"release={_DUCK_RELEASE_MS}[out]",
                 "-map", "[out]",
                 "-c:a", "pcm_s16le", "-ar", str(_AUDIO_RATE), "-ac", "2",
                 str(ducked),

@@ -48,15 +48,101 @@ PLOT_THREAD_STATUS: tuple[str, ...] = ("open", "resolved")
 #: Stage 4B 只在剧情高潮或明显物理动作点给 beat 标一个音效 key；Stage 6 据此
 #: 生成 :class:`core.schemas.SfxEvent`（全话最多 8 个、间隔 >= 6000ms），
 #: Stage 7 再去 ``assets/sfx/<sfx_key>.wav`` 取素材。非法值一律丢弃。
+#:
+#: Patch v4.38：白名单从 7 个扩到 **24 个**——保留原有 7 个，启用盘面已存在
+#: 但一直没挂载的 4 个手机类（``phone_ringing`` / ``phone_vibrating`` /
+#: ``phone_call`` / ``phone_unavailable``），再加 13 个新类（开门、耳光、
+#: 拳击、刀剑交击、衣料摩擦、轰击、掌声、玻璃碎裂、雷声、钟表滴答、翻页、
+#: 快门、鸣笛）。
 SFX_CUE_KEYS: tuple[str, ...] = (
     "heart_thump",
     "door_slam",
+    "door_open",
+    "footstep",
+    "slap",
+    "punch",
+    "sword_clash",
+    "cloth_rustle",
     "whoosh",
     "gasp",
-    "phone_msg",
-    "footstep",
+    "boom_hit",
+    "applause",
     "crash",
+    "glass_shatter",
+    "thunder",
+    "clock_tick",
+    "page_turn",
+    "phone_msg",
+    "phone_ringing",
+    "phone_vibrating",
+    "phone_call",
+    "phone_unavailable",
+    "camera_shutter",
+    "car_horn",
 )
+
+#: Patch v4.38：音效曲库目录（前端「音效」下拉与试听面板的数据源）。
+#:
+#: 每个条目包含：
+#:
+#: * ``key`` —— :data:`SFX_CUE_KEYS` 里的白名单键；
+#: * ``label`` —— 中文名（前端展示用）；
+#: * ``category`` —— 分类（前端按分类分组下拉）；
+#: * ``fallback_key`` —— **盘面暂时没有该素材时回源复用的通用音效键**
+#:   （``None`` 表示没有兜底，缺素材就真缺）。回源链最长两级，不会递归成环。
+SFX_CUE_CATALOG: tuple[dict[str, str], ...] = (
+    {"key": "heart_thump", "label": "心跳", "category": "生理", "fallback_key": ""},
+    {"key": "gasp", "label": "倒吸一口气", "category": "生理", "fallback_key": ""},
+    {"key": "door_slam", "label": "摔门", "category": "门", "fallback_key": "crash"},
+    {"key": "door_open", "label": "开门", "category": "门", "fallback_key": "whoosh"},
+    {"key": "footstep", "label": "脚步", "category": "脚步", "fallback_key": ""},
+    {"key": "slap", "label": "耳光", "category": "击打", "fallback_key": "door_slam"},
+    {"key": "punch", "label": "拳击", "category": "击打", "fallback_key": "crash"},
+    {"key": "sword_clash", "label": "刀剑交击", "category": "击打", "fallback_key": "crash"},
+    {"key": "boom_hit", "label": "轰击", "category": "爆炸", "fallback_key": "crash"},
+    {"key": "crash", "label": "撞击", "category": "爆炸", "fallback_key": ""},
+    {"key": "glass_shatter", "label": "玻璃碎裂", "category": "碎裂", "fallback_key": "crash"},
+    {"key": "thunder", "label": "雷声", "category": "爆炸", "fallback_key": "crash"},
+    {"key": "cloth_rustle", "label": "衣料摩擦", "category": "摩擦", "fallback_key": "whoosh"},
+    {"key": "whoosh", "label": "破空", "category": "摩擦", "fallback_key": ""},
+    {"key": "applause", "label": "掌声", "category": "人群", "fallback_key": "gasp"},
+    {"key": "clock_tick", "label": "钟表滴答", "category": "钟表", "fallback_key": ""},
+    {"key": "page_turn", "label": "翻页", "category": "纸页", "fallback_key": "whoosh"},
+    {"key": "camera_shutter", "label": "快门", "category": "相机", "fallback_key": "whoosh"},
+    {"key": "car_horn", "label": "鸣笛", "category": "交通", "fallback_key": "whoosh"},
+    {"key": "phone_msg", "label": "短信提示", "category": "通讯", "fallback_key": ""},
+    {"key": "phone_ringing", "label": "电话铃响", "category": "通讯", "fallback_key": ""},
+    {"key": "phone_vibrating", "label": "手机震动", "category": "通讯", "fallback_key": ""},
+    {"key": "phone_call", "label": "通话接通", "category": "通讯", "fallback_key": "phone_msg"},
+    {"key": "phone_unavailable", "label": "忙音", "category": "通讯", "fallback_key": "phone_msg"},
+)
+
+#: Patch v4.38：音效键别名（小规模，只收敛**明确同义**的写法）。
+#:
+#: 只做「一个词明确指向同一个音效」的收敛；``none`` / ``not_a_real_key``
+#: 这类不是同义词、而是「没有音效」，一律不在表里，照旧归一化成 ``None``。
+SFX_CUE_ALIASES: dict[str, str] = {
+    "slap_face": "slap",
+    "phone_ring": "phone_ringing",
+    "vibrating": "phone_vibrating",
+    "explosion": "boom_hit",
+}
+
+#: Patch v4.38：音效键 → 兜底键（由 :data:`SFX_CUE_CATALOG` 派生）。
+#:
+#: 空串表示「没有兜底」——盘面缺素材就是真缺，不静默换一个不相干的音效。
+SFX_CUE_FALLBACKS: dict[str, str] = {
+    entry["key"]: (entry.get("fallback_key") or "")
+    for entry in SFX_CUE_CATALOG
+}
+
+
+def sfx_fallback_key(sfx_key: str) -> str:
+    """返回音效键的**兜底键**（没有兜底则返回空串）。
+
+    Patch v4.38：Stage 7 找不到 ``sfx/<key>.*`` 真实素材时，用它回源复用通用音效。
+    """
+    return SFX_CUE_FALLBACKS.get(str(sfx_key or "").strip().lower(), "")
 
 # 契约里的长度上限
 MAX_NARRATION_CHARS = 120
@@ -734,8 +820,10 @@ def normalize_script_payload(
             # 截断可能把停顿标签留在句尾（变成孤立停顿），兜底再规范化一次。
             tts_text = normalize_minimax_pause_tags(tts_text) or None
         # Patch v3.1 Patch 10：可选音效标签（白名单收敛，非法值 / "none" 丢弃）。
+        # Patch v4.38：先过一遍**同义别名**表（只收敛明确同义写法），再查白名单。
         sfx_cue_raw = item.get("sfx_cue")
         sfx_cue = coerce_str(sfx_cue_raw).lower() if sfx_cue_raw is not None else ""
+        sfx_cue = SFX_CUE_ALIASES.get(sfx_cue, sfx_cue)
         if sfx_cue not in SFX_CUE_KEYS:
             sfx_cue = None
         # Patch v3.2 Patch 12：说话人性别（male / female / unknown）。
