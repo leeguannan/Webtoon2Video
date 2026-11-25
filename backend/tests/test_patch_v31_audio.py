@@ -474,10 +474,12 @@ def test_render_timeline_mixes_sfx_events(tmp_path: Path, monkeypatch: pytest.Mo
     # 沿用渲染配置的默认（SFX 增益 Patch v4.0 Patch 18 起为 -2.0dB），
     # 且每条 SFX 链先过 dynaudnorm。
     assert "adelay=200|200" in joined
-    assert "dynaudnorm" in joined
+    assert "alimiter=limit=-1.5dB:attack=2:release=40" in joined
     assert "volume=-2.0dB" in joined
     assert "[sfx]" in joined
-    # 成片混音：人声 + 音效两路。
+    # Patch v4.37：dynaudnorm 已退出 SFX 链（先量去静音后的有效响度再校准）。
+    assert "dynaudnorm" not in joined
+    # 母带阶段：人声 + 音效两路预混。
     assert "amix=inputs=2" in joined
 
 

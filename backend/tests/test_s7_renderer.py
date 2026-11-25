@@ -496,24 +496,31 @@ def test_path_helpers(tmp_path: Path) -> None:
 
 
 def test_sidechain_uses_gentle_v32_ducking(monkeypatch, tmp_path: Path) -> None:
-    """Patch v3.2 Patch 14：柔和漫评闪避参数被钉死（Patch v4.0 Patch 18 微调）。
+    """柔和漫评闪避参数被钉死（Patch v4.37 起闪避上移到整片母带阶段）。
 
-    BGM 先经 ``loudnorm`` 统一到 -16 LUFS 再降 -8.0dB（Patch 18 由 -11.5dB 上调），
-    基线已规范化，侧链压缩改为 threshold=0.06 / ratio=2.0 / attack=30ms / release=350ms，
-    说话时温和退让 4~6dB、停顿时自然托底；旧的深压参数（0.01 / ratio=8）
-    会让配乐忽大忽小，不得回退。
+    BGM 先经 ``loudnorm`` 统一到 -16 LUFS 再降 -8.0dB，基线已规范化。
+    Patch v4.37 之前闪避在**每个分段**里跑（threshold=0.06 / ratio=2.0 /
+    attack=30ms / release=350ms），分段之间会因各自响度不同而跳变；现在改成
+    在整片母带阶段闪避一次（双源侧链：人声 + 音效都能压 BGM），
+    参数为 threshold=0.06 / ratio=2.4 / attack=25ms / release=350ms
+    （FFmpeg 的 sidechaincompress 用**秒**，故实际传入 0.025 / 0.350）。
     """
     from stages import s7_renderer
 
+    # 旧的分段实时混音参数保留（向后兼容分支仍在），但整片母带走新参数。
     assert s7_renderer._SIDECHAIN_THRESHOLD == 0.06
     assert s7_renderer._SIDECHAIN_RATIO == 2.0
     assert s7_renderer._SIDECHAIN_ATTACK_MS == 30
     assert s7_renderer._SIDECHAIN_RELEASE_MS == 350
+    assert s7_renderer._DUCK_THRESHOLD == 0.06
+    assert s7_renderer._DUCK_RATIO == 2.4
+    assert s7_renderer._DUCK_ATTACK_MS == 25
+    assert s7_renderer._DUCK_RELEASE_MS == 350
 
-    captured: dict[str, list[str]] = {}
+    captured: list[list[str]] = []
 
     def fake_run_ffmpeg(args, *, ffmpeg_bin="ffmpeg", timeout_s=900):
-        captured["args"] = list(args)
+        captured.append(list(args))
         # 真的 ffmpeg 会写出产物；这里只造占位文件，让 render_timeline 的产物校验通过。
         target = Path(args[-1])
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -534,11 +541,13 @@ def test_sidechain_uses_gentle_v32_ducking(monkeypatch, tmp_path: Path) -> None:
         work_dir=tmp_path / "work",
     )
 
-    joined = " ".join(captured["args"])
+    joined = " ".join(" ".join(call) for call in captured)
     assert "sidechaincompress=" in joined
+    # sidechaincompress 的 attack/release 单位是**秒**，毫秒常量必须换算后再传。
     assert (
-        f"threshold={s7_renderer._SIDECHAIN_THRESHOLD}:ratio={s7_renderer._SIDECHAIN_RATIO}:"
-        f"attack={s7_renderer._SIDECHAIN_ATTACK_MS}:release={s7_renderer._SIDECHAIN_RELEASE_MS}"
+        f"threshold={s7_renderer._DUCK_THRESHOLD}:ratio={s7_renderer._DUCK_RATIO}:"
+        f"attack={s7_renderer._DUCK_ATTACK_MS / 1000.0:.3f}:"
+        f"release={s7_renderer._DUCK_RELEASE_MS / 1000.0:.3f}"
     ) in joined
     assert exports_dir_for(tmp_path) == tmp_path / "exports"
 

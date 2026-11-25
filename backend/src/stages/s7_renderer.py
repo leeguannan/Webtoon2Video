@@ -142,6 +142,49 @@ _SIDECHAIN_RATIO = 2.0
 _SIDECHAIN_ATTACK_MS = 30
 _SIDECHAIN_RELEASE_MS = 350
 
+# --------------------------------------------------------------------------
+# Patch v4.37：第 1 次音频升级
+#   ① SFX 瞬时响度对齐（先量有效响度再校准，取代 dynaudnorm）
+#   ② 双源侧链避让（人声 + 音效都能压 BGM）
+#   ③ 整片 -14 LUFS 两遍母带（消除分段接缝的动态跳变）
+# --------------------------------------------------------------------------
+#: SFX 校准目标响度（LUFS）：每条音效先被校准到这个响度基线，再叠加渲染
+#: 配置 / 事件增益（默认 -2.0dB），最终落在人声基准下方 2 LU。
+_SFX_TARGET_LUFS = -16.0
+#: SFX 校准增益的夹取范围（dB）：素材响度再离谱也不会被拉爆。
+_SFX_CALIBRATION_LIMIT_DB = 12.0
+#: 人声总线目标响度（LUFS）与允许偏差（LU）。
+_VOICE_TARGET_LUFS = -16.0
+_VOICE_LUFS_TOLERANCE = 1.2
+#: 人声总线线性修正的夹取范围（dB）。
+_VOICE_CORRECTION_LIMIT_DB = 6.0
+#: 母带目标：整片 -14 LUFS、真峰 -1.5 dBTP、响度范围 9 LU。
+_MASTER_TARGET_LUFS = -14.0
+_MASTER_TRUE_PEAK = -1.5
+_MASTER_LRA = 9
+#: 母带总线限幅（预混阶段）。
+_MASTER_LIMIT = "-1.0dB"
+#: 单条音效限幅（整形阶段，防止爆音）。
+_SFX_LIMIT = "-1.5dB"
+#: 双源侧链闪避：触发轨里音效额外抬升量（dB），让强音效也能压住 BGM。
+_DUCK_TRIGGER_SFX_BOOST_DB = 3.0
+#: 双源侧链闪避参数（比旧 _SIDECHAIN_* 略快略狠，因为触发源含音效）。
+_DUCK_THRESHOLD = 0.06
+_DUCK_RATIO = 2.4
+_DUCK_ATTACK_MS = 25
+_DUCK_RELEASE_MS = 350
+
+#: ``ebur128`` 逐帧行：``t: 0.1  M: -16.0 S: -17.0  I: -16.0 LUFS ...``
+_EBUR128_FRAME_RE = re.compile(
+    r"M:\s*(-?\d+(?:\.\d+)?)\s+S:\s*(-?\d+(?:\.\d+)?)\s+I:\s*(-?\d+(?:\.\d+)?)\s*LUFS"
+)
+#: ``ebur128`` 汇总块里的积分响度 ``I:``。
+_EBUR128_SUMMARY_RE = re.compile(
+    r"Integrated loudness:\s*\n\s*I:\s*(-?\d+(?:\.\d+)?)\s*LUFS"
+)
+#: ``loudnorm=print_format=json`` 打到 stderr 的 JSON 块。
+_LOUDNORM_JSON_RE = re.compile(r"\{[^{}]*\}", re.S)
+
 #: 视频编码参数（Patch v4.10：码率提质）。
 #:
 #: 旧链路是 ``-preset veryfast -crf 20``，1080×1920 竖屏实测只有 ~800kbps，
@@ -1505,6 +1548,95 @@ def _beat_start_map(scenes: Sequence[TimelineScene], clips: Sequence[Any]) -> di
     return starts
 
 
+def _measure_audio_lufs(
+    audio_path: Path,
+    *,
+    ffmpeg_bin: str = "ffmpeg",
+    cache: dict[str, float] | None = None,
+) -> float:
+    """测量音频的**有效响度**（LUFS），完全测不出时回退 ``0.0``。
+
+    **为什么必须先掐掉前导静音**：素材常带几百毫秒到几秒的静音，直接
+    ``ebur128`` 会把静音算进积分窗口，响度被系统性拉低——于是「按目标
+    响度校准」退化成「按静音占比乱校准」。长延迟的音效尤其明显：同一段
+    素材落在不同时刻，电平会差出好几 dB。
+
+    因此测量链固定为 ``silenceremove=start_periods=1:start_threshold=-45dB``
+    + ``ebur128=peak=true``：先掐前导静音再量。
+
+    * 优先取积分响度 ``I``；
+    * 极短音频（积分窗口填不满）退回「最大瞬时响度 ``M``」；
+    * 全静音 / 解析失败 → ``0.0`` 偏置（调用方据此夹住增益）。
+
+    ``cache`` 按文件路径缓存：同一次备音里同一条素材只测一次。
+    """
+    key = str(audio_path)
+    if cache is not None and key in cache:
+        return cache[key]
+
+    measured = 0.0
+    try:
+        completed = subprocess.run(
+            [
+                str(ffmpeg_bin), "-hide_banner", "-nostats",
+                "-i", str(audio_path),
+                "-af",
+                "silenceremove=start_periods=1:start_threshold=-45dB,"
+                "ebur128=peak=true",
+                "-f", "null", "-",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        stderr = completed.stderr or ""
+        summary = _EBUR128_SUMMARY_RE.search(stderr)
+        integrated = float(summary.group(1)) if summary else None
+        moments = [
+            float(match.group(1))
+            for match in _EBUR128_FRAME_RE.finditer(stderr)
+        ]
+        max_momentary = max(moments) if moments else None
+        if integrated is not None and integrated > -60.0:
+            measured = integrated
+        elif max_momentary is not None and max_momentary > -60.0:
+            measured = max_momentary
+        else:
+            measured = 0.0
+    except (OSError, subprocess.SubprocessError, ValueError):
+        measured = 0.0
+
+    if cache is not None:
+        cache[key] = measured
+    return measured
+
+
+def _parse_loudnorm_stats(text: str) -> dict[str, float] | None:
+    """解析 ``loudnorm=print_format=json`` 打到 stderr 的实测数据。
+
+    解析不出来就返回 ``None``（调用方据此降级为「直接用预混结果」）。
+    """
+    if not text:
+        return None
+    for match in _LOUDNORM_JSON_RE.findall(text):
+        try:
+            payload = json.loads(match)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        stats: dict[str, float] = {}
+        for key, value in payload.items():
+            try:
+                stats[str(key)] = float(value)
+            except (TypeError, ValueError):
+                continue
+        if stats:
+            return stats
+    return None
+
+
 def _prepare_audio(
     timeline: RenderTimeline,
     *,
@@ -1661,15 +1793,38 @@ def _prepare_audio(
         chains.append(bgm_filters)
 
     sfx_labels: list[str] = []
-    for offset, (_path, start, gain) in enumerate(sfx_inputs):
-        # Patch 14：adelay 对齐事件时间点 → dynaudnorm 动态峰值归一（清晰且不爆音）
-        # → volume 施加配置/事件增益。
-        chains.append(
+    lufs_cache: dict[str, float] = {}
+    for offset, (path, start, gain) in enumerate(sfx_inputs):
+        # Patch v4.37：SFX 整形链改成「先量有效响度 → 校准 → 叠加配置增益
+        # → 淡入保护 → 限幅防爆音 → 最后才 adelay 对齐事件时间点」。
+        #
+        # **为什么不再用 dynaudnorm**：旧链是「adelay → dynaudnorm → volume」，
+        # dynaudnorm 会把前导静音当成「素材本身电平低」，于是越抬越响——同一条
+        # 素材落在不同时刻的音量完全对不上（长延迟的音效能差出十几 dB）。
+        # 现在改成「先量去静音后的有效响度再校准」，落点只影响时间、不影响电平。
+        measured = _measure_audio_lufs(path, ffmpeg_bin=ffmpeg_bin, cache=lufs_cache)
+        calibration = max(
+            -_SFX_CALIBRATION_LIMIT_DB,
+            min(_SFX_CALIBRATION_LIMIT_DB, _SFX_TARGET_LUFS - measured),
+        )
+        chain = (
             f"[{sfx_base + offset}:a]aformat=sample_fmts=fltp:sample_rates={_AUDIO_RATE}:"
-            f"channel_layouts={_AUDIO_LAYOUT},adelay={start}|{start},dynaudnorm,"
-            f"volume={gain:.1f}dB,"
+            f"channel_layouts={_AUDIO_LAYOUT},"
+            f"volume={calibration:.1f}dB,volume={gain:.1f}dB,"
+        )
+        try:
+            material_ms = probe_duration_ms(path, ffmpeg_bin=ffmpeg_bin)
+        except (RenderError, OSError, subprocess.SubprocessError):
+            material_ms = 0
+        if material_ms > 20:
+            # 5ms 淡入：去掉数字采样首帧的咔哒声。
+            chain += "afade=t=in:st=0:d=0.005,"
+        chain += (
+            f"alimiter=limit={_SFX_LIMIT}:attack=2:release=40,"
+            f"adelay={start}|{start},"
             f"apad,atrim=0:{total_s:.3f}[sx{offset}]"
         )
+        chains.append(chain)
         sfx_labels.append(f"sx{offset}")
     if sfx_labels:
         mixed_sfx, sfx_chains = _mix_labels(sfx_labels, prefix="s")
@@ -1684,11 +1839,217 @@ def _prepare_audio(
         args += ["-map", "[sfx]", "-c:a", "pcm_s16le", "-ar", str(_AUDIO_RATE), "-ac", "2", str(sfx_norm_path)]
 
     run_ffmpeg(args, ffmpeg_bin=ffmpeg_bin)
+
+    # Patch v4.37：人声总线偏差校验。整话人声偏离 _VOICE_TARGET_LUFS 超过
+    # _VOICE_LUFS_TOLERANCE 时线性微调并过限幅；正常范围内**保持原样**，
+    # 不做无谓的二次重算（全片重算一次人声轨并不便宜）。
+    voice_lufs = _measure_audio_lufs(voice_path, ffmpeg_bin=ffmpeg_bin, cache=lufs_cache)
+    if voice_lufs != 0.0 and abs(voice_lufs - _VOICE_TARGET_LUFS) > _VOICE_LUFS_TOLERANCE:
+        correction = max(
+            -_VOICE_CORRECTION_LIMIT_DB,
+            min(_VOICE_CORRECTION_LIMIT_DB, _VOICE_TARGET_LUFS - voice_lufs),
+        )
+        corrected = work_dir / "voice_corrected.wav"
+        run_ffmpeg(
+            [
+                "-y", "-hide_banner",
+                "-i", str(voice_path),
+                "-af",
+                f"volume={correction:.2f}dB,"
+                f"alimiter=limit={_SFX_LIMIT}:attack=2:release=40",
+                "-c:a", "pcm_s16le", "-ar", str(_AUDIO_RATE), "-ac", "2",
+                str(corrected),
+            ],
+            ffmpeg_bin=ffmpeg_bin,
+        )
+        shutil.copyfile(corrected, voice_path)
+        print(
+            f"[s7] 人声总线校准：实测 {voice_lufs:.1f} LUFS → 目标 "
+            f"{_VOICE_TARGET_LUFS:.1f} LUFS（修正 {correction:+.2f}dB）"
+        )
+
     return (
         voice_path,
         (bgm_norm_path if bgm_path is not None else None),
         (sfx_norm_path if sfx_labels else None),
     )
+
+
+def _mix_and_master_audio(
+    *,
+    voice_path: Path,
+    bgm_path: Path | None,
+    sfx_path: Path | None,
+    total_s: float,
+    work_dir: Path,
+    ffmpeg_bin: str = "ffmpeg",
+) -> Path:
+    """把三条备音轨混成**一条整片母带**，返回 ``master.wav``。
+
+    **为什么要有整片母带**：旧链路是「每个分段各自跑一次 sidechaincompress
+    + 多路 amix」，分段与分段之间的闪避深度会随各段自身响度轻微跳变，听感
+    上像「一段一段的」。整片只混一次，闪避曲线与总线动态在整条时间轴上连续。
+
+    **双源侧链闪避**：人声 + 音效两路都能压 BGM。做法是先合成一条触发控制轨
+    ``duck_trigger.wav``（人声 + 放大 3dB 的音效），再用它去闪避 BGM；没有
+    音效时直接用人声当侧链。
+
+    **两遍 loudnorm**：Pass 1 量出实测值（``print_format=json``），Pass 2 带
+    ``linear=true`` 线性归一到 -14 LUFS。Pass 2 必须显式指定 ``-ar 44100
+    -ac 2 -c:a pcm_s16le``——否则 loudnorm 会把采样率抬到 192kHz，文件体积
+    直接翻几倍。
+
+    全静音 / 解析异常时**平滑降级**：直接复制 ``pre_master.wav`` 为
+    ``master.wav``，绝不抛异常把整条渲染打断。
+    """
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    pre_master = work_dir / "pre_master.wav"
+    master_path = work_dir / "master.wav"
+
+    # ---- 1. 双源侧链：合成触发控制轨 ----
+    trigger_path: Path | None = None
+    bgm_source = bgm_path
+    if bgm_path is not None:
+        if sfx_path is not None:
+            trigger_path = work_dir / "duck_trigger.wav"
+            run_ffmpeg(
+                [
+                    "-y", "-hide_banner",
+                    "-i", str(voice_path),
+                    "-i", str(sfx_path),
+                    "-filter_complex",
+                    f"[0:a]aformat=sample_fmts=fltp:sample_rates={_AUDIO_RATE}:"
+                    f"channel_layouts={_AUDIO_LAYOUT}[v];"
+                    f"[1:a]aformat=sample_fmts=fltp:sample_rates={_AUDIO_RATE}:"
+                    f"channel_layouts={_AUDIO_LAYOUT},"
+                    f"volume={_DUCK_TRIGGER_SFX_BOOST_DB:.1f}dB[s];"
+                    f"[v][s]amix=inputs=2:duration=first:normalize=0[dt]",
+                    "-map", "[dt]",
+                    "-c:a", "pcm_s16le", "-ar", str(_AUDIO_RATE), "-ac", "2",
+                    str(trigger_path),
+                ],
+                ffmpeg_bin=ffmpeg_bin,
+            )
+        else:
+            trigger_path = voice_path
+
+        # sidechaincompress 的侧链必须是**输入文件流**（图内 label 不接受），
+        # 所以先把闪避结果落盘成真实 WAV。
+        ducked = work_dir / "bgm_ducked.wav"
+        run_ffmpeg(
+            [
+                "-y", "-hide_banner",
+                "-i", str(bgm_path),
+                "-i", str(trigger_path),
+                "-filter_complex",
+                f"[0:a][1:a]sidechaincompress=threshold={_DUCK_THRESHOLD}:"
+                f"ratio={_DUCK_RATIO}:"
+                # 注意：sidechaincompress 的 attack/release 单位是**秒**（ffmpeg 文档
+                # 默认 0.01），不是毫秒。旧分段链路误传 30 / 350 实际等于 30 秒 /
+                # 350 秒——压缩永远来不及起效，「闪避」事实上一直是关着的。
+                f"attack={_DUCK_ATTACK_MS / 1000.0:.3f}:"
+                f"release={_DUCK_RELEASE_MS / 1000.0:.3f}[out]",
+                "-map", "[out]",
+                "-c:a", "pcm_s16le", "-ar", str(_AUDIO_RATE), "-ac", "2",
+                str(ducked),
+            ],
+            ffmpeg_bin=ffmpeg_bin,
+        )
+        bgm_source = ducked
+
+    # ---- 2. 总线预混（人声 + 闪避后 BGM + SFX）+ 限幅 ----
+    mix_args: list[str] = ["-y", "-hide_banner"]
+    mix_labels: list[str] = []
+    mix_args += ["-i", str(voice_path)]
+    mix_labels.append("0:a")
+    index = 1
+    if bgm_source is not None:
+        mix_args += ["-i", str(bgm_source)]
+        mix_labels.append(f"{index}:a")
+        index += 1
+    if sfx_path is not None:
+        mix_args += ["-i", str(sfx_path)]
+        mix_labels.append(f"{index}:a")
+        index += 1
+
+    mix_chain = "".join(f"[{label}]" for label in mix_labels)
+    mix_chain += f"amix=inputs={len(mix_labels)}:duration=first:normalize=0,"
+    mix_chain += f"alimiter=limit={_MASTER_LIMIT}:attack=5:release=60[out]"
+    mix_args += [
+        "-filter_complex", mix_chain,
+        "-map", "[out]",
+        "-c:a", "pcm_s16le", "-ar", str(_AUDIO_RATE), "-ac", "2",
+        str(pre_master),
+    ]
+    run_ffmpeg(mix_args, ffmpeg_bin=ffmpeg_bin)
+
+    # ---- 3. 两遍 loudnorm 母带 ----
+    loudnorm_base = (
+        f"loudnorm=I={_MASTER_TARGET_LUFS}:TP={_MASTER_TRUE_PEAK}:LRA={_MASTER_LRA}"
+    )
+    stats: dict[str, float] | None = None
+    try:
+        completed = subprocess.run(
+            [
+                str(ffmpeg_bin), "-hide_banner", "-nostats",
+                "-i", str(pre_master),
+                "-af", f"{loudnorm_base}:print_format=json",
+                "-f", "null", "-",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+        stats = _parse_loudnorm_stats(completed.stderr or "")
+    except (OSError, subprocess.SubprocessError):
+        stats = None
+
+    input_i = (stats or {}).get("input_i")
+    if stats is None or input_i is None or input_i <= -60.0:
+        # 全静音 / 解析失败：平滑降级，直接用预混结果当母带。
+        print("[s7] 母带：实测响度不可用，退化为预混结果（不做 loudnorm 归一）")
+        shutil.copyfile(pre_master, master_path)
+        return master_path
+
+    # measured_* 必须落在 loudnorm 允许的区间内，否则 ffmpeg 会直接报错。
+    measured_i = max(-99.0, min(0.0, float(stats.get("input_i", _MASTER_TARGET_LUFS))))
+    measured_tp = max(-99.0, min(0.0, float(stats.get("input_tp", _MASTER_TRUE_PEAK))))
+    measured_lra = max(1.0, min(50.0, float(stats.get("input_lra", _MASTER_LRA))))
+    measured_thresh = max(-99.0, min(0.0, float(stats.get("input_thresh", -70.0))))
+    offset = float(stats.get("target_offset", 0.0))
+
+    pass2 = (
+        f"{loudnorm_base}"
+        f":measured_I={measured_i:.2f}:measured_TP={measured_tp:.2f}"
+        f":measured_LRA={measured_lra:.2f}:measured_thresh={measured_thresh:.2f}"
+        f":offset={offset:.2f}:linear=true"
+    )
+    try:
+        run_ffmpeg(
+            [
+                "-y", "-hide_banner",
+                "-i", str(pre_master),
+                "-af", pass2,
+                # 关键：显式钉死采样率/声道/编码，避免 loudnorm 升频到 192kHz。
+                "-ar", str(_AUDIO_RATE),
+                "-ac", "2",
+                "-c:a", "pcm_s16le",
+                str(master_path),
+            ],
+            ffmpeg_bin=ffmpeg_bin,
+        )
+    except RenderError:
+        print("[s7] 母带：loudnorm 第二遍失败，退化为预混结果")
+        shutil.copyfile(pre_master, master_path)
+        return master_path
+
+    print(
+        f"[s7] 母带完成：{_MASTER_TARGET_LUFS:.1f} LUFS "
+        f"（实测 {input_i:.1f} LUFS，修正 {offset:+.2f}dB）"
+    )
+    return master_path
 
 
 def _prepare_background(
@@ -1793,6 +2154,7 @@ def _render_segment(
     seg_audio_start_ms: int | None = None,
     seg_audio_len_ms: int | None = None,
     subtitle_shift_ms: int = 0,
+    master_audio_path: Path | None = None,
 ) -> Path:
     """渲染一个分段，输出带音轨的独立 mp4。
 
@@ -1893,15 +2255,27 @@ def _render_segment(
 
     bgm_index = next_input
     voice_index = bgm_index
-    if bgm_path is not None:
-        args += [
-            "-ss", f"{audio_start_s:.3f}", "-t", f"{audio_len_s:.3f}", "-i", str(bgm_path),
-        ]
-        voice_index = bgm_index + 1
-    args += ["-ss", f"{audio_start_s:.3f}", "-t", f"{audio_len_s:.3f}", "-i", str(voice_path)]
     sfx_index = voice_index + 1
-    if sfx_path is not None:
-        args += ["-ss", f"{audio_start_s:.3f}", "-t", f"{audio_len_s:.3f}", "-i", str(sfx_path)]
+    master_index: int | None = None
+    if master_audio_path is not None:
+        # Patch v4.37：整片母带已在母带阶段混好并做过两遍 loudnorm，
+        # 分段只需按时间窗切片直接并入 [aout]——不再各跑一次 sidechaincompress
+        # 与多路 amix，消除分段接缝处的动态跳变。
+        master_index = next_input
+        next_input += 1
+        args += [
+            "-ss", f"{audio_start_s:.3f}", "-t", f"{audio_len_s:.3f}",
+            "-i", str(master_audio_path),
+        ]
+    else:
+        if bgm_path is not None:
+            args += [
+                "-ss", f"{audio_start_s:.3f}", "-t", f"{audio_len_s:.3f}", "-i", str(bgm_path),
+            ]
+            voice_index = bgm_index + 1
+        args += ["-ss", f"{audio_start_s:.3f}", "-t", f"{audio_len_s:.3f}", "-i", str(voice_path)]
+        if sfx_path is not None:
+            args += ["-ss", f"{audio_start_s:.3f}", "-t", f"{audio_len_s:.3f}", "-i", str(sfx_path)]
 
     # ---- 画面链 ----
     chains: list[str] = []
@@ -1994,7 +2368,13 @@ def _render_segment(
         video_label = "vfinal"
 
     # ---- 音频链（切片/补齐时长统一用 audio_len_s，无片包时等于 seg_s）----
-    if bgm_path is not None:
+    if master_audio_path is not None:
+        # Patch v4.37：整片母带直切直并（母带阶段已完成闪避与母带处理）。
+        chains.append(
+            f"[{master_index}:a]aformat=sample_fmts=fltp:sample_rates={_AUDIO_RATE}:"
+            f"channel_layouts={_AUDIO_LAYOUT},apad,atrim=0:{audio_len_s:.3f}[aout]"
+        )
+    elif bgm_path is not None:
         # 两个输入都写成「输入文件流」：sidechaincompress 的 request pad 不接受图内 label。
         chains.append(
             f"[{bgm_index}:a][{voice_index}:a]sidechaincompress="
@@ -2104,7 +2484,8 @@ def render_timeline(
 ) -> Path:
     """按时间轴渲染成片，返回成片路径。
 
-    流程：调用 A 备音（人声 + BGM + 音效）→ 调用 B 成片（画面 + 字幕 + 闪避 + 混音）。
+    流程：调用 A 备音（人声 + BGM + 音效）→ 调用 B 母带（整片混一次 +
+    两遍 loudnorm）→ 调用 C 成片（画面 + 字幕 + 母带切片）。
 
     * 画面：每个场景一条滤镜片段 → ``concat`` 串成一条；
     * 字幕：``06_plan/subtitles/{index:04d}.png`` 逐条 ``overlay``，
@@ -2116,6 +2497,10 @@ def render_timeline(
     Patch v4.5：``cover_png`` 只接到第一段、``outro_png`` 只接到最后一段；
     备音轨按封页时长整体后移人声/音效并加长到「封页 + 正文 + 结尾」，
     BGM 首尾可加 ``afade``。不传任何片包参数时与历史链路完全一致。
+
+    Patch v4.37：新增整片母带——备音之后先 ``_mix_and_master_audio`` 把
+    人声 / 闪避后 BGM / 音效混成一条 ``master.wav``（-14 LUFS 两遍 loudnorm），
+    分段渲染只按时间窗切片并入，消除分段接缝的动态跳变。
     """
     episode_dir = Path(episode_dir).expanduser()
     out_path = Path(out_path).expanduser()
@@ -2179,6 +2564,16 @@ def render_timeline(
         bgm_fade_in_ms=bgm_fade_in_ms if branding_on else 0,
         bgm_fade_out_ms=bgm_fade_out_ms if branding_on else 0,
         bgm_pre_mixed=bgm_pre_mixed,
+    )
+
+    # ---- Patch v4.37：整片母带（人声 + 闪避后 BGM + SFX → -14 LUFS 两遍母带）----
+    master_audio_path = _mix_and_master_audio(
+        voice_path=voice_path,
+        bgm_path=bgm_norm_path,
+        sfx_path=sfx_norm_path,
+        total_s=total_s,
+        work_dir=work_dir,
+        ffmpeg_bin=ffmpeg_bin,
     )
 
     # ---- 字幕 PNG ----
@@ -2288,6 +2683,7 @@ def render_timeline(
             seg_audio_start_ms=seg_audio_start_ms,
             seg_audio_len_ms=seg_audio_len_ms,
             subtitle_shift_ms=seg_cover_ms,
+            master_audio_path=master_audio_path,
         )
         segment_paths.append(seg_out)
 

@@ -186,10 +186,16 @@ def test_prepare_audio_bgm_chain_loudnorm_before_gain(
     assert bgm_chain.index("loudnorm") < bgm_chain.index("volume=")
 
 
-def test_prepare_audio_sfx_chain_adelay_dynaudnorm_and_gain(
+def test_prepare_audio_sfx_chain_calibrates_before_adelay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """SFX 链：adelay 对齐 → dynaudnorm 峰值归一 → -2.0dB 增益，并单独成轨。"""
+    """SFX 链（Patch v4.37）：响度校准 → 淡入 → 限幅 → **最后**才 adelay 对齐。
+
+    旧链是「adelay → dynaudnorm → volume」：前导静音会让 dynaudnorm 误判
+    「素材本身电平低」并越抬越响，同一条素材落在不同时刻的音量对不上。
+    新链先量去静音后的有效响度再校准，adelay 只负责时间对齐。
+    """
+    monkeypatch.setattr(s7_renderer, "probe_duration_ms", lambda *a, **k: 500)
     recorder, _, _ = _prepare_with_bgm_and_sfx(
         tmp_path,
         monkeypatch,
@@ -197,14 +203,17 @@ def test_prepare_audio_sfx_chain_adelay_dynaudnorm_and_gain(
     )
     joined = recorder.joined
     assert "adelay=200|200" in joined
-    assert "dynaudnorm" in joined
     assert "volume=-2.0dB" in joined
+    assert "afade=t=in:st=0:d=0.005" in joined
+    assert "alimiter=limit=-1.5dB:attack=2:release=40" in joined
+    assert "dynaudnorm" not in joined
     assert "[sfx]" in joined
     sfx_chain = next(part for part in joined.split(";") if "adelay=200|200" in part)
     assert (
-        sfx_chain.index("adelay")
-        < sfx_chain.index("dynaudnorm")
-        < sfx_chain.index("volume=")
+        sfx_chain.index("volume=")
+        < sfx_chain.index("afade=")
+        < sfx_chain.index("alimiter=")
+        < sfx_chain.index("adelay")
     )
 
 
