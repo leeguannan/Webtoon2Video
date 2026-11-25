@@ -18,7 +18,8 @@
 
 * 只收 **CC0**（``Creative Commons 0``）素材；其它许可证一律丢弃。
 * 预览音频用 FFmpeg 统一处理：去首尾静音 → 裁到 ``--max-duration`` → 尾部淡出
-  → ``loudnorm`` 响度归一 → 44.1kHz 立体声 192kbps。
+  → 按实测峰值归一 + 限幅 → 44.1kHz 立体声 192kbps。
+  （不用 ``loudnorm``：音效普遍短于 3 秒，EBU R128 的 400ms 积分窗口量不到瞬态。）
 * **默认不覆盖已存在的文件**（``--overwrite`` 才覆盖）。
 * 网络异常一律降级：打印警告、返回空候选，**不抛异常、不影响退出码**。
 
@@ -48,7 +49,7 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
@@ -65,6 +66,19 @@ FREESOUND_LICENSE_FILTER = 'license:"Creative Commons 0"'
 DEFAULT_MAX_DURATION_S = 3.0
 #: 打分时的目标时长（秒）：短促音效最常用。
 TARGET_DURATION_S = 1.2
+#: 可用素材的时长上限（秒）：超过就是环境录音，当不了单音音效用。
+_MAX_USABLE_DURATION_S = 8.0
+#: 检索词里的通用词：几乎每个素材名都带，用它们做名称匹配毫无区分度。
+_GENERIC_QUERY_WORDS = frozenset(
+    {"sound", "sounds", "effect", "effects", "audio", "clip", "fx", "sfx"}
+)
+#: 素材落盘后的目标峰值电平（dBFS）：留 1.5dB 余量给限幅器。
+_SFX_TARGET_PEAK_DBFS = -3.0
+#: 峰值归一的增益上下限（dB）：太安静的素材别硬推，太响的必须压下来。
+_SFX_MIN_GAIN_DB = -6.0
+_SFX_MAX_GAIN_DB = 24.0
+#: 限幅器系数：0.8413 == -1.5 dBFS。
+_SFX_LIMITER_COEFF = 0.8413
 #: 盘面上可能出现的音效文件后缀（判定某个 key 是否「已存在」）。
 SFX_SUFFIXES: tuple[str, ...] = (".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac")
 #: 溯源清单文件名。
@@ -86,7 +100,7 @@ CURATED_SFX_QUERIES: dict[str, tuple[str, ...]] = {
     "boom_hit": ("boom hit", "cinematic boom", "impact boom"),
     "applause": ("applause", "clapping crowd", "crowd applause"),
     "glass_shatter": ("glass shatter", "breaking glass", "glass break"),
-    "thunder": ("thunder", "thunderstorm", "thunder crack"),
+    "thunder": ("thunder crack", "thunder clap", "thunder rumble", "thunder sound effect"),
     "clock_tick": ("clock tick", "clock ticking", "tick tock"),
     "page_turn": ("page turn", "turning pages", "paper page"),
     "camera_shutter": ("camera shutter", "shutter click", "photo camera"),
@@ -108,6 +122,10 @@ class FreesoundCandidate:
     num_downloads: int
     preview_url: str
     page_url: str
+    #: 预览音频的备用地址（首选地址下载失败时回退）。
+    preview_fallback_url: str = ""
+    #: 命中这条候选时用的检索词（打分时按它做名称相关性加权）。
+    matched_query: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +136,14 @@ class FreesoundCandidate:
 _SOUND_ID_RE = re.compile(r"id=[\"']sound-(\d+)[\"']", re.IGNORECASE)
 #: 详情页链接里的 sound id（备用策略）。
 _SOUNDS_LINK_RE = re.compile(r"/sounds/(\d+)/")
+#: 新版搜索结果卡片容器（每个卡片 = 一条候选）。
+_CARD_RE = re.compile(r'class="[^"]*\bbw-search__result\b[^"]*"', re.IGNORECASE)
+#: 卡片里的播放器标签：新版把标题/时长/下载量/预览地址都放在它的 data-* 属性上。
+_PLAYER_TAG_RE = re.compile(r"<div[^>]*\bbw-player\b[^>]*>", re.IGNORECASE)
+#: 播放器标签上的 data-* 属性。
+_PLAYER_ATTR_RE = re.compile(r"data-([a-z0-9-]+)=\"([^\"]*)\"", re.IGNORECASE)
+#: 新版预览音频的 CDN 根地址（旧的 ``freesound.org/data/previews/...`` 已下线）。
+_FREESOUND_CDN = "https://cdn.freesound.org/previews"
 #: 时长文本（``0:03`` / ``0:03.21``）。
 _CLOCK_RE = re.compile(r"(\d{1,3}):(\d{2}(?:\.\d+)?)")
 
@@ -218,6 +244,13 @@ def _parse_clock(text: str) -> float | None:
 
 def _extract_duration(block: str) -> float:
     """从候选块里取时长（秒）；取不到返回 ``0.0``。"""
+    attrs = _player_attrs(block)
+    raw = attrs.get("duration", "")
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
     found = re.search(
         r'class="[^"]*\bduration\b[^"]*"[^>]*>(.*?)<',
         block,
@@ -233,6 +266,10 @@ def _extract_duration(block: str) -> float:
 
 def _extract_downloads(block: str) -> int:
     """从候选块里取下载量；取不到返回 ``0``。"""
+    attrs = _player_attrs(block)
+    raw = attrs.get("num-downloads", "")
+    if raw.isdigit():
+        return int(raw)
     found = re.search(r"num-downloads[^>]*>(.*?)<", block, re.IGNORECASE | re.DOTALL)
     if found:
         digits = re.sub(r"\D", "", _strip_tags(found.group(1)))
@@ -251,6 +288,18 @@ def _extract_downloads(block: str) -> int:
 
 def _extract_author(block: str) -> tuple[str, str]:
     """从候选块里取作者，返回 ``(用户名 slug, 显示名)``。"""
+    # 0) 新版播放器属性里直接带作者 slug
+    attrs = _player_attrs(block)
+    slug = attrs.get("username", "")
+    if slug:
+        # 显示名仍走作者主页链接的链接文本（拿不到就用 slug）
+        found = re.search(
+            r'<a[^>]+href="[^"]*?/people/' + re.escape(slug) + r'/"[^>]*>(.*?)</a>',
+            block,
+            re.IGNORECASE | re.DOTALL,
+        )
+        text = _strip_tags(found.group(1)) if found else ""
+        return slug, text or slug
     # 1) 作者主页链接：``/people/<slug>/``（链接文本是显示名）
     found = re.search(
         r'<a[^>]+href="[^"]*?/people/([^/"?#]+)/"[^>]*>(.*?)</a>',
@@ -278,7 +327,10 @@ def _extract_author(block: str) -> tuple[str, str]:
 
 
 def _extract_name(block: str, sound_id: str) -> str:
-    """取音效名称：优先 ``/sounds/<id>/`` 链接文本，其次 ``div.title``。"""
+    """取音效名称：优先 ``data-title``，其次 ``/sounds/<id>/`` 链接文本。"""
+    title = _player_attrs(block).get("title", "")
+    if title:
+        return title
     found = re.search(
         r'<a[^>]+href="[^"]*/sounds/' + re.escape(sound_id) + r'/[^"]*"[^>]*>(.*?)</a>',
         block,
@@ -320,10 +372,19 @@ def _extract_description(block: str) -> str:
 
 
 def _extract_preview_url(block: str, sound_id: str) -> str:
-    """取预览音频地址。
+    """取预览音频地址（首选地址）。
 
-    优先 ``_hq.mp3``；页面没写时按 Freesound 的固定命名规则兜底拼一个。
+    新版页面：``bw-player`` 的 ``data-mp3`` 直接给出 CDN 地址；已知作者 uid 时
+    按 Freesound 的命名规则拼一个更高码率的 ``_hq.mp3``。
+    旧版页面：``/data/previews/<id>/<id>_hq.mp3``。
     """
+    attrs = _player_attrs(block)
+    low = attrs.get("mp3", "")
+    user_id = attrs.get("user-id", "")
+    if user_id.isdigit():
+        return f"{_FREESOUND_CDN}/{int(sound_id) // 1000}/{sound_id}_{user_id}-hq.mp3"
+    if low:
+        return low
     found = re.search(
         r"(https?://freesound\.org)?(/data/previews/[^\"'\s>]+_hq\.mp3)",
         block,
@@ -342,14 +403,49 @@ def _extract_preview_url(block: str, sound_id: str) -> str:
     return f"{FREESOUND_BASE_URL}/data/previews/{sound_id}/{sound_id}_hq.mp3"
 
 
+def _extract_preview_fallback_url(block: str, sound_id: str) -> str:
+    """取预览音频的备用地址（首选地址 404 时回退）。"""
+    low = _player_attrs(block).get("mp3", "")
+    if low:
+        return low
+    return ""
+
+
+def _player_attrs(block: str) -> dict[str, str]:
+    """取候选块里 ``bw-player`` 标签上的 ``data-*`` 属性。
+
+    新版 Freesound 搜索页把标题、时长、下载量、预览地址、作者都放在这里，
+    用普通标签文本正则一个都抓不到，必须直接读属性。
+    """
+    found = _PLAYER_TAG_RE.search(block)
+    if not found:
+        return {}
+    return {key.lower(): value for key, value in _PLAYER_ATTR_RE.findall(found.group(0))}
+
+
 def _split_sound_blocks(html: str) -> list[tuple[str, str]]:
     """把搜索结果 HTML 切成若干「候选块」。
 
-    先试 ``id="sound-<id>"``（真实页面里容器 div 上的 id），
-    找不到再退到 ``/sounds/<id>/`` 链接；切分点之间的原文就是一块。
+    新版页面：按 ``class="bw-search__result"`` 卡片切分，sound id 取自卡片里
+    ``bw-player`` 的 ``data-sound-id``。
+
+    旧版页面：先试 ``id="sound-<id>"``（容器 div 上的 id），找不到再退到
+    ``/sounds/<id>/`` 链接；切分点之间的原文就是一块。
 
     切分点会往前退到最近的 ``<``，免得把 ``<a href="...`` 之类的开标签切掉。
     """
+    cards = list(_CARD_RE.finditer(html))
+    if cards:
+        blocks: list[tuple[str, str]] = []
+        for index, card in enumerate(cards):
+            end = cards[index + 1].start() if index + 1 < len(cards) else len(html)
+            chunk = html[card.start() : end]
+            attrs = _player_attrs(chunk)
+            sound_id = attrs.get("sound-id", "")
+            if sound_id:
+                blocks.append((sound_id, chunk))
+        if blocks:
+            return blocks
     matches = list(_SOUND_ID_RE.finditer(html))
     if not matches:
         matches = list(_SOUNDS_LINK_RE.finditer(html))
@@ -357,7 +453,7 @@ def _split_sound_blocks(html: str) -> list[tuple[str, str]]:
     for match in matches:
         head = html.rfind("<", 0, match.start())
         starts.append(head if head >= 0 else match.start())
-    blocks: list[tuple[str, str]] = []
+    blocks = []
     for index, match in enumerate(matches):
         end = starts[index + 1] if index + 1 < len(starts) else len(html)
         blocks.append((match.group(1), html[starts[index] : end]))
@@ -382,6 +478,7 @@ def _parse_candidate(sound_id: str, block: str) -> FreesoundCandidate | None:
         num_downloads=_extract_downloads(block),
         preview_url=_extract_preview_url(block, sound_id),
         page_url=page_url,
+        preview_fallback_url=_extract_preview_fallback_url(block, sound_id),
     )
 
 
@@ -435,10 +532,16 @@ def _http_get_text(url: str, *, timeout_s: float) -> str:
 
 
 def score_candidate(candidate: FreesoundCandidate, *, target_duration_s: float = 1.2) -> float:
-    """候选打分：下载量越高越好、时长越接近 target_duration_s 越好。"""
+    """候选打分：下载量越高越好、时长越接近 target_duration_s 越好。
+
+    超过 ``_MAX_USABLE_DURATION_S`` 的候选直接判 0 分——那是环境录音（雷雨、
+    街道、整段掌声），裁到 3 秒只剩一段噪声，当不了音效用。
+    """
     downloads = max(0, int(candidate.num_downloads))
     target = max(0.05, float(target_duration_s))
     duration = float(candidate.duration_s)
+    if duration > _MAX_USABLE_DURATION_S:
+        return 0.0
     # 下载量：取对数并压到 0~1（100 万次下载 ≈ 1.0）
     download_score = min(1.0, math.log10(downloads + 1) / 6.0)
     # 时长拟合：差一个目标长度就衰减到 1/e
@@ -446,7 +549,22 @@ def score_candidate(candidate: FreesoundCandidate, *, target_duration_s: float =
         duration_fit = 0.3
     else:
         duration_fit = math.exp(-abs(duration - target) / target)
-    return download_score * 0.6 + duration_fit * 0.4
+    score = download_score * 0.6 + duration_fit * 0.4
+    # 名称相关性：Freesound 是全文检索，同一批结果里混着「手指弹响」这种
+    # 名字完全不相干但被标签命中的素材。名字里带检索词才加分，不带就压分。
+    query = str(getattr(candidate, "matched_query", "") or "")
+    words = [
+        word
+        for word in re.split(r"\W+", query.lower())
+        if len(word) >= 3 and word not in _GENERIC_QUERY_WORDS
+    ]
+    if words:
+        name = candidate.name.lower()
+        if any(word in name for word in words):
+            score += 0.12
+        else:
+            score *= 0.55
+    return score
 
 
 def search_freesound_cc0(
@@ -492,8 +610,12 @@ def _fmt_secs(value: float) -> str:
     return text + "0" if text.endswith(".") else text
 
 
-def _build_filter_chain(max_duration_s: float) -> str:
-    """拼 FFmpeg 滤镜链（顺序固定，不可调换）。"""
+def _build_filter_chain(max_duration_s: float, gain_db: float, *, channels: int = 2) -> str:
+    """拼 FFmpeg 滤镜链（顺序固定，不可调换）。
+
+    ``gain_db`` 是按实测峰值算出的整体增益（见 :func:`_measure_peak_dbfs`）；
+    ``channels`` 是源声道数（单声道时显式复制成双声道）。
+    """
     silence = "silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.05"
     parts = [
         # 1) 去首静音；反向再走一遍去尾静音
@@ -505,9 +627,83 @@ def _build_filter_chain(max_duration_s: float) -> str:
     if max_duration_s >= 0.3:
         fade_start = max(0.0, max_duration_s - 0.15)
         parts.append(f"afade=t=out:st={_fmt_secs(fade_start)}:d=0.15")
-    # 3) 响度归一
-    parts.append("loudnorm=I=-16:TP=-1.5:LRA=11")
+    # 3) 峰值归一 + 限幅（不用 loudnorm：音效普遍短于 3 秒，
+    #    EBU R128 的 400ms 积分窗口量不到瞬态，loudnorm 会失准甚至静音）
+    if abs(gain_db) >= 0.05:
+        parts.append(f"volume={gain_db:.2f}dB")
+    # 4) 单声道显式复制成双声道：让 ffmpeg 的默认重矩阵（-3dB）不要生效，
+    #    否则峰值归一的增益会被这 3dB 悄悄吃掉
+    if channels == 1:
+        parts.append("pan=stereo|c0=c0|c1=c0")
+    elif channels and channels != 2:
+        parts.append("aformat=channel_layouts=stereo")
+    parts.append(f"alimiter=limit={_SFX_LIMITER_COEFF:.4f}:level=disabled")
     return ",".join(parts)
+
+
+def _measure_peak_dbfs(src: Path, *, ffmpeg_bin: str = "ffmpeg") -> float | None:
+    """量一份音频的峰值电平（dBFS）；量不到返回 ``None``。
+
+    用 ``volumedetect`` 的 ``max_volume``（样本峰值），它对短瞬态也稳定，
+    不像 EBU R128 的 LUFS 那样需要 400ms 积分窗口。
+    """
+    command = [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-nostats",
+        "-nostdin",
+        "-i",
+        str(src),
+        "-af",
+        "volumedetect",
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"找不到 ffmpeg 可执行文件（{ffmpeg_bin}）") from exc
+    if result.returncode != 0:
+        return None
+    found = re.search(r"max_volume:\s*(-?[0-9.]+)\s*dB", result.stderr or "")
+    if not found:
+        return None
+    try:
+        return float(found.group(1))
+    except ValueError:
+        return None
+
+
+def _probe_channels(src: Path, *, ffmpeg_bin: str = "ffmpeg") -> int:
+    """探测源音频的声道数；探测不到返回 ``0``（表示未知）。"""
+    command = [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-nostats",
+        "-nostdin",
+        "-i",
+        str(src),
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        return 0
+    found = re.search(r"Hz,\s*([a-z0-9]+(?:\.[0-9])?)\s*,", result.stderr or "")
+    if not found:
+        return 0
+    raw = found.group(1).lower()
+    if raw == "mono":
+        return 1
+    if raw == "stereo":
+        return 2
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
 
 
 def preprocess_audio(
@@ -524,13 +720,25 @@ def preprocess_audio(
          并用 ``areverse,silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.05,areverse`` 去尾静音；
       2) ``atrim=0:{max_duration_s}`` + ``afade=t=out:st={max_duration_s - 0.15}:d=0.15``（尾部 0.15s 淡出，
          max_duration_s < 0.3 时只保留 atrim 不加 afade）；
-      3) ``loudnorm=I=-16:TP=-1.5:LRA=11``；
+      3) ``volume={gain}dB`` + ``alimiter=limit=0.8413:level=disabled``——按实测峰值把素材推到
+         ``_SFX_TARGET_PEAK_DBFS``（-3 dBFS）并限幅，防止削波；
       4) 输出 ``-ar 44100 -ac 2 -b:a 192k``。
+
+    为什么不 ``loudnorm``：音效素材普遍短于 3 秒（这里最短的只有 0.25 秒），
+    EBU R128 的 400ms 积分窗口量不到这种瞬态，``loudnorm`` 的 ``input_i`` 会直接
+    报 ``-inf``/``-70``，对瞬态还可能把增益压死导致成片里听不见。峰值归一对
+    任意长度都成立，结果也可复现。
     返回 dst。
     """
     src = Path(src)
     dst = Path(dst)
     dst.parent.mkdir(parents=True, exist_ok=True)
+    peak = _measure_peak_dbfs(src, ffmpeg_bin=ffmpeg_bin)
+    if peak is None:
+        gain_db = 0.0
+    else:
+        gain_db = max(_SFX_MIN_GAIN_DB, min(_SFX_MAX_GAIN_DB, _SFX_TARGET_PEAK_DBFS - peak))
+    channels = _probe_channels(src, ffmpeg_bin=ffmpeg_bin)
     command = [
         ffmpeg_bin,
         "-y",
@@ -542,7 +750,7 @@ def preprocess_audio(
         str(src),
         "-vn",
         "-af",
-        _build_filter_chain(max_duration_s),
+        _build_filter_chain(max_duration_s, gain_db, channels=channels),
         "-ar",
         "44100",
         "-ac",
@@ -582,20 +790,34 @@ def download_candidate(
     ffmpeg_bin: str = "ffmpeg",
     max_duration_s: float = DEFAULT_MAX_DURATION_S,
 ) -> Path:
-    """下载候选预览音频并预处理落盘。下载失败抛 RuntimeError。"""
-    if not candidate.preview_url:
+    """下载候选预览音频并预处理落盘。下载失败抛 RuntimeError。
+
+    首选地址（通常是高码率 CDN 直链）失败时自动回退到备用地址。
+    """
+    urls = [candidate.preview_url]
+    if candidate.preview_fallback_url and candidate.preview_fallback_url not in urls:
+        urls.append(candidate.preview_fallback_url)
+    urls = [url for url in urls if url]
+    if not urls:
         raise RuntimeError(f"候选 {candidate.sound_id} 没有预览音频地址，无法下载")
     dst = Path(dst)
     dst.parent.mkdir(parents=True, exist_ok=True)
     handle, temp_name = tempfile.mkstemp(prefix="cc0_sfx_", suffix=".mp3")
     os.close(handle)
     temp_path = Path(temp_name)
+    errors: list[str] = []
     try:
-        _http_download(candidate.preview_url, temp_path, timeout_s=DOWNLOAD_TIMEOUT_S)
-        preprocess_audio(temp_path, dst, ffmpeg_bin=ffmpeg_bin, max_duration_s=max_duration_s)
+        for url in urls:
+            try:
+                _http_download(url, temp_path, timeout_s=DOWNLOAD_TIMEOUT_S)
+            except RuntimeError as exc:
+                errors.append(str(exc))
+                continue
+            preprocess_audio(temp_path, dst, ffmpeg_bin=ffmpeg_bin, max_duration_s=max_duration_s)
+            return dst
+        raise RuntimeError("；".join(errors))
     finally:
         temp_path.unlink(missing_ok=True)
-    return dst
 
 
 # ---------------------------------------------------------------------------
@@ -682,7 +904,7 @@ def _collect_candidates(
             if candidate.sound_id in seen:
                 continue
             seen.add(candidate.sound_id)
-            candidates.append(candidate)
+            candidates.append(replace(candidate, matched_query=query))
     candidates.sort(key=lambda item: score_candidate(item), reverse=True)
     return candidates
 

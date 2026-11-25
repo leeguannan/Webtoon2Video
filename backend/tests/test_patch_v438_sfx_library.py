@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -381,3 +382,134 @@ def test_fetch_tool_survives_garbage_html() -> None:
     module = _load_fetch_module()
     assert module.parse_freesound_html("") == []
     assert module.parse_freesound_html("<html><body>没有声音</body></html>") == []
+
+
+# ---------------------------------------------------------------------------
+# 7) 采编工具：Freesound 新版页面解析 / 排序 / 响度链 / 下载回退
+# ---------------------------------------------------------------------------
+NEW_FREESOUND_HTML = """
+<html><body>
+  <div class="bw-search__result">
+    <div class="bw-player" data-sound-id="406464" data-username="kretopi"
+         data-user-id="2825490" data-mp3="https://cdn.freesound.org/previews/406/406464_2825490-lq.mp3"
+         data-title="Punching-005.wav" data-duration="0.518083"
+         data-num-downloads="750"></div>
+    <a class="bw-link--black" href="/people/kretopi/sounds/406464/">Punching-005.wav</a>
+    <div class="bw-icon-zero" title="License: Creative Commons 0"></div>
+  </div>
+  <div class="bw-search__result">
+    <div class="bw-player" data-sound-id="777001" data-username="longrec"
+         data-user-id="9999" data-mp3="https://cdn.freesound.org/previews/777/777001_9999-lq.mp3"
+         data-title="Rain and Thunder" data-duration="99.5"
+         data-num-downloads="24360"></div>
+    <div class="bw-icon-zero" title="License: Creative Commons 0"></div>
+  </div>
+</body></html>
+"""
+
+
+def test_fetch_tool_reads_new_freesound_card_attributes() -> None:
+    module = _load_fetch_module()
+    candidates = module.parse_freesound_html(NEW_FREESOUND_HTML)
+    assert len(candidates) == 2
+    first = candidates[0]
+    assert first.sound_id == "406464"
+    assert first.name == "Punching-005.wav"
+    assert first.author == "kretopi"
+    assert first.duration_s == pytest.approx(0.518083, abs=1e-6)
+    assert first.num_downloads == 750
+    # 预览地址走新版 CDN（带 user id 的高码率直链）
+    assert first.preview_url == (
+        "https://cdn.freesound.org/previews/406/406464_2825490-hq.mp3"
+    )
+    # 备用地址是页面上直接给的低码率直链
+    assert first.preview_fallback_url == (
+        "https://cdn.freesound.org/previews/406/406464_2825490-lq.mp3"
+    )
+
+
+def test_fetch_tool_scores_long_recordings_as_unusable() -> None:
+    module = _load_fetch_module()
+    long_one = module.parse_freesound_html(NEW_FREESOUND_HTML)[1]
+    assert module.score_candidate(long_one) == 0.0
+
+
+def test_fetch_tool_prefers_candidates_whose_name_matches_the_query() -> None:
+    module = _load_fetch_module()
+    base = module.parse_freesound_html(NEW_FREESOUND_HTML)[0]
+    matching = module.replace(base, name="Thunder crack", matched_query="thunder crack")
+    unrelated = module.replace(base, name="Magic - Finger snap", matched_query="thunder crack")
+    assert module.score_candidate(matching) > module.score_candidate(unrelated)
+
+
+def test_fetch_tool_uses_peak_normalization_instead_of_loudnorm() -> None:
+    module = _load_fetch_module()
+    chain = module._build_filter_chain(3.0, 2.5)
+    assert "loudnorm" not in chain
+    assert "volume=2.50dB" in chain
+    assert "alimiter=limit=0.8413:level=disabled" in chain
+
+
+def test_fetch_tool_copies_mono_to_stereo_without_attenuating() -> None:
+    module = _load_fetch_module()
+    mono_chain = module._build_filter_chain(3.0, 2.5, channels=1)
+    stereo_chain = module._build_filter_chain(3.0, 2.5, channels=2)
+    # 单声道必须显式复制，否则 ffmpeg 默认重矩阵会吃掉 3dB 峰值归一的增益
+    assert "pan=stereo|c0=c0|c1=c0" in mono_chain
+    assert "pan=stereo" not in stereo_chain
+
+
+def test_fetch_tool_preprocess_lands_near_target_peak(tmp_path: Path) -> None:
+    module = _load_fetch_module()
+    source = tmp_path / "raw.mp3"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+            "-i", "sine=frequency=440:duration=1.2:sample_rate=44100",
+            str(source),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    target = tmp_path / "out.mp3"
+    module.preprocess_audio(source, target)
+    peak = module._measure_peak_dbfs(target)
+    assert peak is not None
+    # 目标峰值 -3 dBFS，限幅器兜底 -1.5 dBFS
+    assert -4.5 <= peak <= -1.0
+
+
+def test_fetch_tool_download_falls_back_to_second_url(tmp_path: Path, monkeypatch: Any) -> None:
+    module = _load_fetch_module()
+    candidate = module.parse_freesound_html(NEW_FREESOUND_HTML)[0]
+    seen: list[str] = []
+
+    def fake_download(url: str, dst: Path, *, timeout_s: float) -> None:
+        seen.append(url)
+        if url.endswith("-hq.mp3"):
+            raise RuntimeError("下载失败：404")
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+                "-i", "sine=frequency=440:duration=0.5:sample_rate=44100",
+                str(dst),
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+    monkeypatch.setattr(module, "_http_download", fake_download)
+    target = tmp_path / "punch.mp3"
+    module.download_candidate(candidate, target)
+    assert target.exists()
+    assert len(seen) == 2
+    assert seen[0].endswith("-hq.mp3")
+    assert seen[1].endswith("-lq.mp3")
+
+
+def test_fetch_tool_curated_thunder_query_avoids_storm_recordings() -> None:
+    module = _load_fetch_module()
+    queries = module.CURATED_SFX_QUERIES["thunder"]
+    assert queries
+    # 泛词会把整段雷雨录音搜出来，门槛只能拦时长，检索词也要收紧
+    assert "thunderstorm" not in queries
