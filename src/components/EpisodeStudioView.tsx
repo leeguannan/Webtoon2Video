@@ -43,6 +43,7 @@ import type {
   EpisodeItem,
   EpisodeRenderOptions,
   EpisodeStoryboard,
+  OrderViolation,
   OutroMode,
   PanelItem,
   PronunciationRule,
@@ -381,6 +382,61 @@ const RECOMMENDED_MOTIONS: CameraMotion[] = [
  */
 const motionOptions = (current: CameraMotion): CameraMotion[] =>
   RECOMMENDED_MOTIONS.includes(current) ? RECOMMENDED_MOTIONS : [current, ...RECOMMENDED_MOTIONS];
+
+// ---------------------------------------------------------------------------
+// Patch v4.39：按幕归属排序（与后端 core.panel_scope.order_beats_by_scene 同口径）
+// ---------------------------------------------------------------------------
+
+/**
+ * 按「幕归属」给解说句排序 —— 成片播放顺序的唯一口径。
+ *
+ * Stage 4 是逐幕写作的（4B 一章一章生成），合并进全话数组时可能把
+ * A 幕的句子落在 B 幕的句子中间。那句话的画面本身是对的（就是 A 幕
+ * 那格分镜），可它挂在数组里更靠后的位置，成片按数组顺序播放，于是
+ * 那句话的画面会出现在剧情该出现之后 —— 用户报的「画面和配音跑到了
+ * 不该在的位置」正是这一类。
+ *
+ * 规则：幕按镜头编排的顺序，幕内保持原有先后（不破坏叙事顺序）；
+ * 没写归属幕的句子按第一张目标分镜反查所属幕；仍认不出的按原序置末。
+ * 幂等：连排两次结果相同。
+ */
+function orderBeatsByScene(
+  beats: ScriptBeat[],
+  scenes: StoryboardScene[]
+): ScriptBeat[] {
+  const enabled = scenes.filter((scene) => scene.enabled !== false);
+  if (enabled.length === 0) return beats;
+  const sceneIds = new Set(enabled.map((scene) => scene.scene_id));
+  const owner = new Map<string, string>();
+  for (const scene of enabled) {
+    for (const panelId of scene.panel_ids) {
+      if (!owner.has(panelId)) owner.set(panelId, scene.scene_id);
+    }
+  }
+  const buckets = new Map<string, ScriptBeat[]>();
+  const orphans: ScriptBeat[] = [];
+  for (const beat of beats) {
+    let sceneId = (beat.scene_id ?? '').trim();
+    if (!sceneIds.has(sceneId)) {
+      const first = beat.target_panel_ids?.[0];
+      const guessed = first ? owner.get(first) : undefined;
+      sceneId = guessed ?? '';
+    }
+    if (sceneIds.has(sceneId)) {
+      const bucket = buckets.get(sceneId) ?? [];
+      bucket.push(beat);
+      buckets.set(sceneId, bucket);
+    } else {
+      orphans.push(beat);
+    }
+  }
+  const ordered: ScriptBeat[] = [];
+  for (const scene of enabled) {
+    ordered.push(...(buckets.get(scene.scene_id) ?? []));
+  }
+  ordered.push(...orphans);
+  return ordered;
+}
 
 // ---------------------------------------------------------------------------
 // Patch v4.35：折叠偏好（localStorage 记忆）
@@ -2062,6 +2118,37 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   }, [episode.episode_id, episode.beats, episode.panels]);
 
   /**
+   * Patch v4.39：镜头编排到位后，把草稿按「幕归属」排一次。
+   *
+   * 成片严格按剧本数组顺序播放。Stage 4 是逐幕写作的（4B 一章一章生成），
+   * 合并进全话数组时可能把 A 幕的句子落在 B 幕的句子中间 —— 那句话的
+   * 画面本身没错（就是 A 幕那格分镜），可它挂在数组里更靠后的位置，
+   * 成片看上去就成了「画面和配音跑到了不该在的位置」。
+   *
+   * 审核台按幕分组展示，所以「草稿顺序 = 展示顺序 = 成片顺序」必须成立。
+   * 用户有未保存改动时不动草稿（不打断正在编辑的内容）。
+   */
+  useEffect(() => {
+    if (!sceneStoryboard || sceneStoryboard.episode_id !== episode.episode_id) return;
+    if (
+      tableDirtyRef.current &&
+      tableDirtyEpisodeRef.current === episode.episode_id
+    ) {
+      return;
+    }
+    const current = draftBeatsRef.current;
+    const ordered = orderBeatsByScene(current, sceneStoryboard.scenes);
+    if (
+      ordered.length === current.length &&
+      ordered.every((beat, index) => beat.beat_id === current[index]?.beat_id)
+    ) {
+      return;
+    }
+    draftBeatsRef.current = ordered;
+    setDraftBeats(ordered);
+  }, [sceneStoryboard, episode.episode_id, episode.beats]);
+
+  /**
    * Patch v4.29：重跑 Stage 4 后本话的 beats 会整体换一批（编排重组后
    * 解说跟着重排）。若幕编排还是重组前的那份，按幕分组渲染就会把新剧本
    * 挂到旧幕上——审核页看到的就是「分镜头乱序、内容与画面对不上」。
@@ -2816,10 +2903,16 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
     const { episodeId } = pending;
     // 提交当前**最新**草稿而不是 pending 里的快照：弹窗打开期间表格可能又改了字，
     // 用旧快照落盘会把表格里的改动整份丢掉。
-    const beats = draftBeatsRef.current;
+    // Patch v4.39：提交前按幕归属排一次 —— 提交的数组顺序就是成片的播放顺序，
+    // 审核台看到的行顺序与成片顺序必须一致。
+    const beats = orderBeatsByScene(
+      draftBeatsRef.current,
+      sceneStoryboard?.scenes ?? []
+    );
     setSaveStatus('saving');
     try {
       let warnings: CharacterCheckWarning[] = [];
+      let orderViolations: OrderViolation[] = [];
       if (!onAutoSaveBeats) {
         // 没有独立通道时退化为普通保存（不触发重跑配音）
         const outcome = await onUpdateBeats(episodeId, beats, false);
@@ -2827,12 +2920,14 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
           throw new Error('保存失败，请检查后端服务后重试');
         }
         warnings = outcome.warnings ?? [];
+        orderViolations = outcome.order_violations ?? [];
       } else {
         const outcome = await onAutoSaveBeats(episodeId, beats);
         if (outcome && outcome.ok === false) {
           throw new Error('保存失败，请检查后端服务后重试');
         }
         warnings = outcome?.warnings ?? [];
+        orderViolations = outcome?.order_violations ?? [];
       }
       pendingRef.current = null;
       tableDirtyRef.current = false;
@@ -2840,7 +2935,14 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
       setTableDirty(false);
       setSaveStatus('saved');
       setSaveMessage(new Date().toLocaleTimeString('zh-CN', { hour12: false }));
-      if (warnings.length > 0) {
+      if (orderViolations.length > 0) {
+        // Patch v4.39：后端已按镜头编排的幕顺序重排过，仍有残留说明是用户
+        // 主动把某句挂到了更早的画面上，成片会「回头看」，必须提示。
+        setSaveHint(
+          `已保存，但仍有 ${orderViolations.length} 处画面顺序回退`
+          + '（成片会回头看前面的画面），请改一下该句对应的画面。'
+        );
+      } else if (warnings.length > 0) {
         setSaveHint(
           `已保存，但有 ${warnings.length} 处角色名写法与规范名不一致（点「保存解说稿」可查看详情）。`
         );
@@ -2855,7 +2957,7 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
       setSaveMessage(err instanceof Error ? err.message : String(err));
       return false;
     }
-  }, [onAutoSaveBeats, onUpdateBeats]);
+  }, [onAutoSaveBeats, onUpdateBeats, sceneStoryboard]);
 
   /** 弹窗内改一个字段：只改本地草稿，落盘交给切格 / 关闭时统一做 */
   const updateZoomBeat = <K extends keyof ScriptBeat>(

@@ -43,6 +43,7 @@ from core.normalize import (
 )
 from core.memory import Stage4Context, StoryBibleManager
 from core.panel_ids import PanelIdResolver, panel_sort_key
+from core.panel_scope import order_beats_by_scene
 from core.schemas import (
     ArcSummary,
     CameraMotion,
@@ -1059,6 +1060,67 @@ def _splice_scene_beats(
         if later_index is not None:
             insert_at = later_index
     return kept[:insert_at] + list(new_beats) + kept[insert_at:]
+
+
+def _order_beats_by_scene(
+    beats: Sequence[dict[str, Any]],
+    scenes: Sequence[StoryboardScene] | None,
+) -> list[dict[str, Any]]:
+    """Patch v4.39：按「幕归属」给解说句排一次序。
+
+    **为什么必须排**：Stage 4 是**逐幕**写解说句的（4B 一章一章生成），
+    但合并进全话数组时，模型可能把 A 幕的句子落在 B 幕的句子中间——
+    典型例子是「写第 4 章时复述了第 3 章的结论句，并把第 3 章那格分镜
+    一起带上」。那句话的**画面是对的**（就是第 3 章那格），可它挂在数组里
+    更靠后的位置，成片按数组顺序播放，于是那句话的画面会出现在剧情该
+    出现之后（用户报的「画面和配音跑到了不该在的位置」就是这一类）。
+
+    成片严格按 beat 数组顺序渲染，所以「这句话属于哪一幕」就是它的权威
+    位置依据。这里按 ``scene_index`` 升序重排：幕内保持原有先后（模型的
+    叙事顺序不打乱），认不出归属的句子按原序放到最后。
+
+    幂等：连排两次结果相同，因此可以在重试、补写、落盘三个节点都调用。
+    """
+    scene_list = [
+        scene
+        for scene in (scenes or ())
+        if coerce_str(getattr(scene, "scene_id", ""))
+    ]
+    if not scene_list:
+        return list(beats)
+    scene_list.sort(
+        key=lambda scene: (
+            int(getattr(scene, "scene_index", 0) or 0),
+            coerce_str(getattr(scene, "scene_id", "")),
+        )
+    )
+    scene_order = [
+        coerce_str(getattr(scene, "scene_id", "")) for scene in scene_list
+    ]
+    panel_owner: dict[str, str] = {}
+    for scene in scene_list:
+        scene_id = coerce_str(getattr(scene, "scene_id", ""))
+        for panel_id in coerce_str_list(getattr(scene, "panel_ids", None) or []):
+            panel_owner.setdefault(panel_id, scene_id)
+    return order_beats_by_scene(
+        beats,
+        scene_order=scene_order,
+        panel_owner=panel_owner,
+    )
+
+
+def _renumber_beats(beats: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """按当前顺序重新连续编号 ``beat_id``（``b1``、``b2``……）。
+
+    Patch v4.39：重排会改变下标，编号必须跟着走，否则落盘剧本的
+    ``beat_id`` 与数组位置对不上（下游按 ``beat_id`` 认句子）。
+    """
+    renumbered: list[dict[str, Any]] = []
+    for index, beat in enumerate(beats, start=1):
+        if isinstance(beat, dict):
+            beat["beat_id"] = f"b{index}"
+        renumbered.append(beat)
+    return renumbered
 
 #: 篇章摘要压缩器（Stage 4 用百炼 ``qwen-plus`` 压缩待归档原文）。
 ArcCompressor = Callable[[str], Awaitable[str]]
@@ -3371,33 +3433,46 @@ def _clamp_regressive_beats(
                 # Patch v4.29：这条解说属于某一幕，锚点必须留在**本幕**内。
                 # 旧实现锚到「上一幕末尾分镜」，等于把本幕的解说挂到别的幕上，
                 # 重组编排后就会成片出现「讲 A 幕、配 B 幕画面」的错位。
-                earlier = sorted(
-                    (
-                        panel_id
-                        for panel_id in scene_panels
-                        if index_of[panel_id] <= last_index
-                    ),
-                    key=lambda panel_id: index_of[panel_id],
-                )
-                if earlier:
-                    anchor_id = earlier[-1]
+                #
+                # Patch v4.39：锚点还必须**不早于当前进度**（index >= last_index）。
+                # 旧实现取本幕内「index <= last_index」的最后一格，那一格本身
+                # 仍然是回看的画面——等于把回看原样保留，钳制形同虚设，
+                # 落盘剧本照样「回头讲前面的画面」（真实案例：wt_5081/ep_007）。
+                forward = [
+                    panel_id
+                    for panel_id in scene_panels
+                    if index_of[panel_id] >= last_index
+                ]
+                if forward:
+                    # 本幕里还没讲到（或正好讲到）的第一格：向前推进，留在本幕。
+                    anchor_id = min(forward, key=lambda panel_id: index_of[panel_id])
+                    suffix = (
+                        f"（原锚点 {fallback_anchor} 属于其他幕）"
+                        if anchor_id != fallback_anchor
+                        else ""
+                    )
+                    logs.append(
+                        f"第 {position} 条解说回看 {original_ids}，属于第 "
+                        f"{beat_scene_id} 幕，已钳制到本幕分镜 {anchor_id}{suffix}"
+                    )
                 else:
-                    anchor_id = min(scene_panels, key=lambda panel_id: index_of[panel_id])
-                suffix = (
-                    f"（原锚点 {fallback_anchor} 属于其他幕）"
-                    if anchor_id != fallback_anchor
-                    else ""
-                )
-                logs.append(
-                    f"第 {position} 条解说回看 {original_ids}，属于第 "
-                    f"{beat_scene_id} 幕，已钳制到本幕分镜 {anchor_id}{suffix}"
-                )
+                    # 本幕已经全部讲过：本幕内没有「不早于当前进度」的格子可选，
+                    # 只能停在当前主画面，保证全局单调不减。
+                    anchor_id = fallback_anchor
+                    logs.append(
+                        f"第 {position} 条解说回看 {original_ids}，属于第 "
+                        f"{beat_scene_id} 幕，但本幕已讲完，钳制到当前主画面 "
+                        f"{anchor_id}"
+                    )
             else:
                 anchor_id = fallback_anchor
                 logs.append(
                     f"第 {position} 条解说回看 {original_ids}，钳制到当前主画面 {anchor_id}"
                 )
             beat["target_panel_ids"] = [anchor_id]
+            # Patch v4.39：锚点可能落在「当前进度之后」（本幕还没讲到的那格），
+            # 进度必须跟着推进，否则后面的句子会被误判成回看。
+            last_index = max(last_index, index_of.get(anchor_id, last_index))
             continue
         beat["target_panel_ids"] = deduped
         if deduped != original_ids:
@@ -3875,6 +3950,15 @@ async def write_episode_script(
             beat["beat_id"] = f"b{index}"
 
         errors = chapter_errors
+        # Patch v4.39：校验前先按「幕归属」重排一次。模型是逐幕写作的，
+        # 合并后可能把 A 幕的句子落在 B 幕的句子中间（画面本身没错，位置错了），
+        # 顺位校验必须建立在「按幕排好」的顺序上，否则报出来的「回看」是假阳性，
+        # 而真的回看又会被淹没在假阳性里。
+        merged_beats = _renumber_beats(
+            _order_beats_by_scene(
+                merged_beats, active_scenes if scene_mode else None
+            )
+        )
         errors += validate_beat_alignment(
             merged_beats,
             ordered_panel_ids,
@@ -3994,8 +4078,13 @@ async def write_episode_script(
             )
             merged_beats = deduplicate_adjacent_beats(merged_beats)
             merged_beats = apply_dialogue_speaker_inheritance(merged_beats)
-            for index, beat in enumerate(merged_beats, start=1):
-                beat["beat_id"] = f"b{index}"
+            # Patch v4.39：补写是「整幕重讲」，补进来的句子必须回到本幕的
+            # 位置上，否则会挂在别的幕的句子中间（画面是对的、位置是错的）。
+            merged_beats = _renumber_beats(
+                _order_beats_by_scene(
+                    merged_beats, active_scenes if scene_mode else None
+                )
+            )
             errors = validate_beat_alignment(
                 merged_beats,
                 ordered_panel_ids,
@@ -4043,6 +4132,12 @@ async def write_episode_script(
                 f"beat={pacing_report.changed_beat_ids}",
                 file=sys.stderr,
             )
+
+    # Patch v4.39：落盘前最后按幕排一次（幂等）。保证 script.json 里的
+    # beats 顺序 = 成片播放顺序 = 审核台分组展示顺序，三者只有一个口径。
+    merged_beats = _renumber_beats(
+        _order_beats_by_scene(merged_beats, active_scenes if scene_mode else None)
+    )
 
     # Patch v4.28：全自动分配画面动效。按分镜几何（超长竖格 / 横向宽格）与
     # 情绪（冲击 / 紧张）自动挑运镜，用户不必再手工调动效。分镜尺寸从本话

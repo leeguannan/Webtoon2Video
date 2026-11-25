@@ -51,6 +51,12 @@ class PanelScope:
     allowed_panel_ids: frozenset[str] = frozenset()
     #: ``scene_id → 该幕引用的分镜集合``（原始写法）。
     scene_panel_ids: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    #: 启用幕的先后顺序（``scene_id`` 序列）。
+    #:
+    #: Patch v4.39：成片的**逻辑播放顺序**是「幕顺序 × 幕内分镜顺序」，
+    #: 不是分镜号的自然序（用户可以在镜头编排页把后面某一格调到前面那一幕）。
+    #: 顺位校验必须用这一个口径，否则会把用户合法的编排误判成「回头看」。
+    scene_order: tuple[str, ...] = ()
     #: 数据来源：``"storyboard"``（读到了编排文件）/ ``"empty"``（无启用幕，不约束）。
     source: str = "empty"
 
@@ -76,11 +82,47 @@ class PanelScope:
         """按自然序返回范围内的全部分镜。"""
         return sorted(self.allowed_panel_ids, key=panel_sort_key)
 
+    def ordered_by_scene(self) -> list[str]:
+        """按「幕顺序 × 幕内自然序」展开范围内的全部分镜。
+
+        这是**成片的逻辑播放顺序**（Patch v4.39）：Stage 6 按 beat 数组顺序
+        逐句取画面，而 beat 的归属幕决定了它在片中的位置。
+
+        没有编排信息时退回自然序，保持旧行为不变。
+        """
+        if not self.scene_order:
+            return self.ordered_allowed()
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for scene_id in self.scene_order:
+            for panel_id in self.scene_panels(scene_id):
+                if panel_id not in seen:
+                    seen.add(panel_id)
+                    ordered.append(panel_id)
+        # 编排里没被任何启用幕覆盖到的分镜（理论上不会有）按自然序补在末尾。
+        for panel_id in self.ordered_allowed():
+            if panel_id not in seen:
+                seen.add(panel_id)
+                ordered.append(panel_id)
+        return ordered
+
     def scene_panels(self, scene_id: str | None) -> list[str]:
         """某幕引用的分镜（自然序）。"""
         if not scene_id:
             return []
         return sorted(self.scene_panel_ids.get(scene_id, frozenset()), key=panel_sort_key)
+
+    def panel_owner_map(self) -> dict[str, str]:
+        """分镜 → 所属幕的反查表（一格只归一幕）。
+
+        Patch v4.39：审核台与 Stage 4 都要用「这条解说属于哪一幕」来
+        排顺序，反查表必须与 :meth:`ordered_by_scene` 同源。
+        """
+        owner: dict[str, str] = {}
+        for scene_id in self.scene_order or sorted(self.scene_panel_ids):
+            for panel_id in self.scene_panels(scene_id):
+                owner.setdefault(panel_id, scene_id)
+        return owner
 
     def nearest_allowed(self, panel_id: str | None) -> str | None:
         """找出编排范围内与给定分镜**序位最接近**的一格（用于越界兜底替换）。"""
@@ -129,17 +171,20 @@ def scope_from_storyboard(storyboard: EpisodeStoryboard | None) -> PanelScope:
         return PanelScope()
     allowed: set[str] = set()
     scene_panel_ids: dict[str, frozenset[str]] = {}
+    scene_order: list[str] = []
     for scene in storyboard.scenes:
         if not scene.enabled:
             continue
         panels = frozenset(str(pid) for pid in (scene.panel_ids or []) if str(pid))
         scene_panel_ids[str(scene.scene_id)] = panels
         allowed |= panels
+        scene_order.append(str(scene.scene_id))
     if not allowed:
         return PanelScope()
     return PanelScope(
         allowed_panel_ids=frozenset(allowed),
         scene_panel_ids=scene_panel_ids,
+        scene_order=tuple(scene_order),
         source="storyboard",
     )
 
@@ -222,3 +267,72 @@ def violations_payload(violations: Sequence[ScopeViolation]) -> list[dict[str, A
         }
         for item in violations
     ]
+
+
+def _beat_scene_id(beat: Any) -> str:
+    """读出 beat 归属的幕（兼容 dict 与 pydantic 模型两种形态）。"""
+    if isinstance(beat, Mapping):
+        return str(beat.get("scene_id") or "").strip()
+    return str(getattr(beat, "scene_id", None) or "").strip()
+
+
+def _beat_target_panel_ids(beat: Any) -> list[str]:
+    """读出 beat 的目标分镜（兼容 dict 与 pydantic 模型两种形态）。"""
+    if isinstance(beat, Mapping):
+        raw = beat.get("target_panel_ids")
+    else:
+        raw = getattr(beat, "target_panel_ids", None)
+    return [str(pid) for pid in (raw or []) if str(pid)]
+
+
+def order_beats_by_scene(
+    beats: Sequence[Any],
+    *,
+    scene_order: Sequence[str],
+    panel_owner: Mapping[str, str],
+) -> list[Any]:
+    """Patch v4.39：按「幕归属」重排解说句——成片播放顺序的唯一口径。
+
+    **背景**：Stage 4 是逐幕写作的（4B 一章一章生成），合并进全话数组时
+    可能把 A 幕的句子落在 B 幕的句子中间。那句话的画面本身是对的
+    （就是 A 幕那格分镜），可它挂在数组里更靠后的位置，成片按数组顺序
+    播放，于是那句话的画面会出现在剧情该出现之后——用户报的
+    「画面和配音跑到了不该在的位置」正是这一类。
+
+    规则：
+
+    * 幕按 ``scene_order`` 升序；幕内保持原有先后（不破坏模型叙事顺序）；
+    * beat 没写 ``scene_id`` 时按第一张目标分镜反查所属幕
+      （与审核台的分组口径一致）；
+    * 认不出归属的句子按原序放到最后。
+
+    幂等：连排两次结果相同。
+    """
+    if not scene_order:
+        return list(beats)
+    rank: dict[str, int] = {}
+    for scene_id in scene_order:
+        key = str(scene_id)
+        if key and key not in rank:
+            rank[key] = len(rank)
+    if not rank:
+        return list(beats)
+    buckets: dict[str, list[Any]] = {scene_id: [] for scene_id in rank}
+    orphans: list[Any] = []
+    for beat in beats:
+        scene_id = _beat_scene_id(beat)
+        if scene_id not in rank:
+            for panel_id in _beat_target_panel_ids(beat):
+                owner = panel_owner.get(panel_id)
+                if owner in rank:
+                    scene_id = owner
+                    break
+        if scene_id in rank:
+            buckets[scene_id].append(beat)
+        else:
+            orphans.append(beat)
+    ordered: list[Any] = []
+    for scene_id in rank:
+        ordered.extend(buckets[scene_id])
+    ordered.extend(orphans)
+    return ordered

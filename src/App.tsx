@@ -1185,6 +1185,8 @@ export default function App() {
         warnings: res?.character_warnings ?? [],
         // Patch v4.32：后端把编排范围外的分镜引用收口了，这里如实回传给审核台提示。
         scope_violations: res?.panel_scope_violations ?? [],
+        // Patch v4.39：按幕顺序重排后仍有残留的画面回退，如实回传提示。
+        order_violations: res?.order_violations ?? [],
       };
     } catch (err) {
       reportError('保存脚本失败', err);
@@ -1218,6 +1220,8 @@ export default function App() {
       ok: true,
       warnings: res?.character_warnings ?? [],
       scope_violations: res?.panel_scope_violations ?? [],
+      // Patch v4.39：按幕顺序重排后仍有残留的画面回退，如实回传提示。
+      order_violations: res?.order_violations ?? [],
     };
   };
 

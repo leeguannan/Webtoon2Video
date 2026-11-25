@@ -196,6 +196,25 @@ export interface PanelScopeViolation {
   replacement: string | null;
 }
 
+/**
+ * Patch v4.39：一次「画面回退」的顺位告警。
+ *
+ * 成片严格按剧本数组顺序渲染。若某句解说指向的分镜比上一句更靠前，
+ * 成片就会「回头看」前面的画面 —— 用户的说法是「画面和配音跑到了
+ * 不该在的位置」。后端保存时会先按镜头编排的幕顺序重排一次，
+ * 重排后仍有残留就把明细回传，前端据此提示。
+ */
+export interface OrderViolation {
+  /** 出问题的解说句 ID。 */
+  beat_id: string;
+  /** 上一句解说句 ID（回退的参照点）。 */
+  previous_beat_id: string;
+  /** 出问题这句的目标分镜。 */
+  panel_ids: string[];
+  /** 给人看的一句话说明。 */
+  message: string;
+}
+
 /** PUT /script 的响应（Patch v4.23 起带角色名告警）。 */
 export interface ScriptUpdateResponse {
   script: { beats: ScriptBeat[] } & Record<string, unknown>;
@@ -203,6 +222,8 @@ export interface ScriptUpdateResponse {
   character_warnings: CharacterCheckWarning[];
   /** Patch v4.32：被收口的编排外分镜引用（空数组＝没有越界）。 */
   panel_scope_violations?: PanelScopeViolation[];
+  /** Patch v4.39：重排后仍存在的画面回退（空数组＝顺序没问题）。 */
+  order_violations?: OrderViolation[];
 }
 
 /** 前端保存解说稿后的结果（用于刷新本地数据与温和提示）。 */
@@ -213,6 +234,8 @@ export interface ScriptSaveOutcome {
   warnings: CharacterCheckWarning[];
   /** Patch v4.32：被后端收口的编排外分镜引用（默认保存时通常为空）。 */
   scope_violations?: PanelScopeViolation[];
+  /** Patch v4.39：重排后仍存在的画面回退（默认保存时通常为空）。 */
+  order_violations?: OrderViolation[];
 }
 
 // ---------------------------------------------------------------------------

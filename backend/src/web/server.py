@@ -90,6 +90,7 @@ from core.panel_scope import (
     PanelScope,
     clamp_beats_to_scope,
     load_panel_scope,
+    order_beats_by_scene,
     violations_payload,
 )
 from core.normalize import (
@@ -675,6 +676,69 @@ NULLABLE_BEAT_FIELDS: frozenset[str] = frozenset(
 )
 
 _MISSING = object()
+
+
+def _detect_order_violations(
+    beats: Sequence[ScriptBeat],
+    scope: PanelScope | None,
+) -> list[dict[str, Any]]:
+    """检测剧本顺序里的「画面回退」——成片会回头讲前面的画面。
+
+    顺位口径 = 镜头编排的「幕顺序 × 幕内自然序」
+    （:meth:`PanelScope.ordered_by_scene`），这正是成片的逻辑播放顺序。
+
+    Patch v4.39：Stage 4 逐幕写作，合并后可能把 A 幕的句子落在 B 幕的
+    句子中间（画面本身没错、位置错了），人工在审核台挪句子也会造成同样
+    的结果。这类剧本落盘后成片一定「顺序不对」，必须在写回层就能看见。
+    """
+    if scope is None or scope.is_empty:
+        return []
+    ordered = scope.ordered_by_scene()
+    index_of = {panel_id: index for index, panel_id in enumerate(ordered)}
+    violations: list[dict[str, Any]] = []
+    last_index = -1
+    last_beat_id = ""
+    for beat in beats:
+        targets = [str(pid) for pid in (getattr(beat, "target_panel_ids", None) or [])]
+        indexes = [index_of[pid] for pid in targets if pid in index_of]
+        if not indexes:
+            continue
+        beat_id = str(getattr(beat, "beat_id", "") or "")
+        if indexes[0] < last_index:
+            violations.append(
+                {
+                    "beat_id": beat_id,
+                    "previous_beat_id": last_beat_id,
+                    "panel_ids": targets,
+                    "message": (
+                        f"{beat_id} 的画面（{targets[0]}）排在了 {last_beat_id} "
+                        "之后更早的分镜上，成片会「回头看」"
+                    ),
+                }
+            )
+        last_index = max(last_index, indexes[-1])
+        last_beat_id = beat_id
+    return violations
+
+
+def _reorder_beats_by_scene(
+    beats: Sequence[ScriptBeat],
+    scope: PanelScope | None,
+) -> list[ScriptBeat]:
+    """按幕归属重排解说句（Patch v4.39）。
+
+    人工在审核台挪句子、或 Stage 4 逐幕写作合并后，剧本可能出现
+    「A 幕的句子落在 B 幕的句子中间」。这类顺序落盘后成片必然错位，
+    保存时按幕重排一次即可自愈（**不改动 beat_id**，用户手加的
+    ``b_new_*`` 编号必须原样保留）。
+    """
+    if scope is None or scope.is_empty or not scope.scene_order:
+        return list(beats)
+    return order_beats_by_scene(
+        beats,
+        scene_order=scope.scene_order,
+        panel_owner=scope.panel_owner_map(),
+    )
 
 
 def _merge_script_beats(
@@ -2593,6 +2657,27 @@ def create_app(
                 ),
                 file=sys.stderr,
             )
+        # Patch v4.39：按幕归属重排一次。人工挪句子、或 Stage 4 逐幕写作
+        # 合并后，都可能让 A 幕的句子落在 B 幕的句子中间——画面本身没错，
+        # 但成片按数组顺序播放，看上去就是「画面和配音跑到了不该在的位置」。
+        order_violations = _detect_order_violations(beats, scope)
+        if order_violations:
+            reordered = _reorder_beats_by_scene(beats, scope)
+            remaining = _detect_order_violations(reordered, scope)
+            if len(remaining) < len(order_violations):
+                beats = reordered
+                order_violations = remaining
+                print(
+                    "[server] 剧本顺序存在画面回退，已按镜头编排的幕顺序重排："
+                    f"剩余 {len(order_violations)} 处",
+                    file=sys.stderr,
+                )
+        if order_violations:
+            print(
+                "[server] 剧本顺序仍存在画面回退（重排后未收敛）："
+                + "; ".join(item["message"] for item in order_violations),
+                file=sys.stderr,
+            )
         series_dir = view.registry.series_dir(series_id)
         # Patch v4.25：用户勾选的档案同步**先落地**，再算角色名告警——
         # 这样「记为规范名」之后同一句不会再被报成别名写法。
@@ -2628,6 +2713,8 @@ def create_app(
             "character_warnings": character_warnings,
             # Patch v4.32：被收口的越界分镜引用，前端据此提示「已改回编排范围内」。
             "panel_scope_violations": violations_payload(scope_violations),
+            # Patch v4.39：仍存在的「画面回退」，前端据此提示用户手动调整。
+            "order_violations": order_violations,
         }
         if payload.from_stage:
             job = await job_runner.submit_episode(
@@ -2716,6 +2803,13 @@ def create_app(
         # 用户没在分镜里选过的画面。
         scope = load_panel_scope(episode_dir)
         paced_beats = _clamp_beat_dicts(paced_beats, scope)
+        # Patch v4.39：按幕归属重排——与 S4 落盘、审核台展示保持同一个口径。
+        if scope is not None and scope.scene_order:
+            paced_beats = order_beats_by_scene(
+                paced_beats,
+                scene_order=scope.scene_order,
+                panel_owner=scope.panel_owner_map(),
+            )
         try:
             updated_script = NarrationScript.model_validate(
                 {**script.model_dump(), "beats": paced_beats}
@@ -2791,6 +2885,13 @@ def create_app(
         # Patch v4.32：写回前把越界（编排范围外）的分镜引用收口。
         scope = load_panel_scope(episode_dir)
         assigned_beats = _clamp_beat_dicts(assigned_beats, scope)
+        # Patch v4.39：按幕归属重排——与 S4 落盘、审核台展示保持同一个口径。
+        if scope is not None and scope.scene_order:
+            assigned_beats = order_beats_by_scene(
+                assigned_beats,
+                scene_order=scope.scene_order,
+                panel_owner=scope.panel_owner_map(),
+            )
         try:
             updated_script = NarrationScript.model_validate(
                 {**script.model_dump(), "beats": assigned_beats}
