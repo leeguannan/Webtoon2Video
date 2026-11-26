@@ -750,20 +750,56 @@ MAX_SPEED_OVERRIDE = 2.0
 _T2S_CONVERTER: Any = None
 _T2S_READY = False
 
+#: Patch v4.44：转换配置候选（按优先级）。
+#:
+#: ``tw2sp`` = 繁体中文 → 简体 + 台湾常用词 → 大陆常用词（带词汇转换），
+#: 对「後臺 / 計畫 / 資訊」这类繁台用词更友好；缺该配置时无缝降级 ``t2s``
+#: （只换字形、不动词汇），再不行才降级为「不转换」。
+_T2S_CONFIGS: tuple[str, ...] = ("tw2sp", "t2s")
+
+#: 当前生效的 OpenCC 配置名（``None`` = 未启用转换）。
+_T2S_ACTIVE_CONFIG: str | None = None
+
+
+def _load_opencc_converter(config_name: str) -> Any:
+    """按配置名创建 OpenCC 转换器；不可用返回 ``None``（只降级）。"""
+    try:
+        from opencc import OpenCC
+    except Exception as exc:  # noqa: BLE001 - 缺依赖只降级，不阻断流水线
+        logger.warning("[normalize] OpenCC 不可用，繁简转换降级为不转换：%s", exc)
+        return None
+    try:
+        return OpenCC(config_name)
+    except Exception as exc:  # noqa: BLE001 - 单个配置不可用就试下一个
+        logger.warning(
+            "[normalize] OpenCC 配置 %s 不可用（%s），尝试下一个降级配置",
+            config_name,
+            exc,
+        )
+        return None
+
 
 def _get_t2s_converter() -> Any:
-    """惰性创建 OpenCC ``t2s`` 转换器；缺依赖或初始化失败时返回 ``None``。"""
-    global _T2S_CONVERTER, _T2S_READY
+    """惰性创建 OpenCC 转换器；优先 ``tw2sp``，缺配置时降级 ``t2s``。
+
+    Patch v4.44：繁中作品入库的台词常带台湾用词（後臺、計畫、資訊），
+    只做字形转换会留下繁台词汇；``tw2sp`` 能连词汇一起转简体。
+
+    缺依赖或初始化失败时返回 ``None``（只降级，不阻断流水线）。
+    """
+    global _T2S_CONVERTER, _T2S_READY, _T2S_ACTIVE_CONFIG
     if _T2S_READY:
         return _T2S_CONVERTER
     _T2S_READY = True
-    try:
-        from opencc import OpenCC
-
-        _T2S_CONVERTER = OpenCC("t2s")
-    except Exception as exc:  # noqa: BLE001 - 缺依赖只降级，不阻断流水线
-        logger.warning("[normalize] OpenCC 不可用，繁简转换降级为不转换：%s", exc)
-        _T2S_CONVERTER = None
+    for config_name in _T2S_CONFIGS:
+        converter = _load_opencc_converter(config_name)
+        if converter is not None:
+            _T2S_CONVERTER = converter
+            _T2S_ACTIVE_CONFIG = config_name
+            logger.info("[normalize] OpenCC 繁简转换器已启用：%s", config_name)
+            break
+    if _T2S_CONVERTER is None:
+        logger.warning("[normalize] 没有可用的 OpenCC 配置，繁简转换降级为不转换")
     return _T2S_CONVERTER
 
 
@@ -790,10 +826,22 @@ def to_simplified_chinese(text: str) -> str:
     if converter is None:
         return text
     try:
-        return converter.convert(text)
+        converted = converter.convert(text)
     except Exception as exc:  # noqa: BLE001 - 转换失败只降级，不阻断流水线
         logger.warning("[normalize] 繁简转换失败，原样返回：%s", exc)
         return text
+    # Patch v4.44：``tw2sp`` 是「台湾用语 → 大陆用语」的整句转换，对**已经是
+    # 简体**的文本会反向劣化（例如「为什么」→「为什幺」）。只有原文确实含
+    # 繁体字时才做转换；纯简体文本原样返回（零回归铁律）。
+    if _T2S_ACTIVE_CONFIG == "tw2sp":
+        plain = _load_opencc_converter("t2s")
+        if plain is not None:
+            try:
+                if plain.convert(text) == text:
+                    return text
+            except Exception:  # noqa: BLE001 - 判断失败就按转换结果走
+                pass
+    return converted
 
 
 def spoken_length(text: str) -> int:

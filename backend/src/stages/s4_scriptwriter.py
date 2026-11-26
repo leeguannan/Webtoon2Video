@@ -38,6 +38,7 @@ from core.normalize import (
     coerce_str_list,
     deduplicate_adjacent_beats,
     get_effective_sfx_keys,
+    to_simplified_chinese,
     is_psychological_lead,
     normalize_dialogue_quotes,
     normalize_script_payload,
@@ -55,11 +56,18 @@ from core.schemas import (
     NarrationScript,
     PanelMeta,
     PanelVisionInfo,
+    ScriptBeat,
     StoryboardScene,
     StoryChapter,
     VisionWindowOutput,
     load_model,
     save_model,
+)
+from core.style_profiles import (
+    DEFAULT_STYLE_PROFILE_ID,
+    StyleProfileSpec,
+    get_style_profile,
+    resolve_series_style_profile,
 )
 from providers.llm_base import (
     ChatMessage,
@@ -592,6 +600,7 @@ async def _resolve_storyboard_context(
     panels_dir: Path | None,
     reset_storyboard: bool,
     storyboard_sink: list[EpisodeStoryboard] | None,
+    style_profile: StyleProfileSpec | None = None,
 ) -> tuple[EpisodeStoryboard | None, list[StoryboardScene], bool]:
     """解析本话镜头组编排，返回 ``(编排, 启用幕列表, 是否启用逐幕模式)``。
 
@@ -620,10 +629,13 @@ async def _resolve_storyboard_context(
             storyboard_path=Path(storyboard_path),
             model=story_model or model,
             reset=reset_storyboard,
+            style_profile=style_profile,
         )
         scene_mode = True
     else:
-        resolved_storyboard = s3b_scenes.auto_build_storyboard(episode_id, vision)
+        resolved_storyboard = s3b_scenes.auto_build_storyboard(
+            episode_id, vision, style_profile=style_profile
+        )
     active_scenes: list[StoryboardScene] = []
     if resolved_storyboard is not None:
         active_scenes = [scene for scene in resolved_storyboard.scenes if scene.enabled]
@@ -1337,6 +1349,17 @@ def _beat_first_panel_id(beat: dict[str, Any]) -> str | None:
     return None
 
 
+def _beat_panel_count(beat: dict[str, Any]) -> int:
+    """该 beat 绑定的分镜数量（蒙太奇 Beat 会 > 1）。"""
+    return len(
+        [
+            panel_id
+            for panel_id in (beat.get("target_panel_ids") or [])
+            if str(panel_id or "").strip()
+        ]
+    )
+
+
 def apply_narrative_pacing(
     beats: Sequence[dict[str, Any]],
     *,
@@ -1345,6 +1368,7 @@ def apply_narrative_pacing(
     min_long_gap_beats: int = PACE_MIN_BEAT_GAP,
     streak_trigger_ms: int = PACE_STREAK_TRIGGER_MS,
     panel_switch_ms: int = PACE_PANEL_SWITCH_MS,
+    style_profile: StyleProfileSpec | None = None,
 ) -> tuple[list[dict[str, Any]], PacingReport]:
     """对解说句的 ``pause_after_ms`` 做叙事节奏留白（纯函数，不改入参）。
 
@@ -1359,11 +1383,37 @@ def apply_narrative_pacing(
 
     规则 D 命中时**不**重置连说累计（``streak_ms``）也不更新长停顿间隔基准
     （``last_long_idx``），因此它不会连带影响后续规则 B / C 的触发。
+
+    **Patch v4.44**：``style_profile`` 传入时用风格规格的 ``pacing`` 维度覆盖
+    规则 A/B/C/D/E 的留白数值（未传或 ``drama_suspense`` 基线时与 4.43 完全
+    一致 —— 基线数值与原常量逐项相等）。
     """
     paced = [dict(beat) for beat in beats]
     report = PacingReport()
     if not paced:
         return paced, report
+
+    #: Patch v4.44：风格化的留白数值（未给风格 → 沿用 4.43 常量）。
+    pacing_spec = style_profile.pacing if style_profile is not None else None
+    scene_end_ms = (
+        int(pacing_spec.scene_end_ms) if pacing_spec else PACE_SCENE_END_MS
+    )
+    turn_ms = int(pacing_spec.turn_ms) if pacing_spec else PACE_TURN_MS
+    breath_ms = int(pacing_spec.breath_ms) if pacing_spec else PACE_BREATH_MS
+    same_panel_min_ms = (
+        int(pacing_spec.same_panel_min_ms)
+        if pacing_spec
+        else PACE_SAME_PANEL_MIN_MS
+    )
+    effective_panel_switch_ms = (
+        int(pacing_spec.panel_switch_ms) if pacing_spec else int(panel_switch_ms)
+    )
+    #: Patch v4.44：语速偏置（1.0 = 不动；只有偏离 1.0 才改写 speed_override）。
+    speed_bias = (
+        float(pacing_spec.default_speed_bias)
+        if pacing_spec
+        else 1.0
+    )
 
     durations = dict(audio_durations_ms or {})
     panel_to_scene = _scene_panel_index(scenes)
@@ -1434,7 +1484,7 @@ def apply_narrative_pacing(
             # 全话最后一条且存在 >=2 个启用幕：收尾留白。
             crosses_scene = True
         if crosses_scene:
-            raised = max(original, PACE_SCENE_END_MS)
+            raised = max(original, scene_end_ms)
             if raised > original:
                 new_pause = raised
                 rule_hit = "scene_end"
@@ -1452,7 +1502,7 @@ def apply_narrative_pacing(
                 or _is_suspense_ending(text)
                 or any(key in PACE_TURN_SFX for key in sfx_keys)
             ):
-                raised = max(original, PACE_TURN_MS)
+                raised = max(original, turn_ms)
                 if raised > original:
                     new_pause = raised
                     rule_hit = "turn"
@@ -1481,7 +1531,7 @@ def apply_narrative_pacing(
                 next_boundary is None or (next_boundary - i) >= 3
             )
             if boundary_ok:
-                raised = max(original, PACE_BREATH_MS)
+                raised = max(original, breath_ms)
                 if raised > original:
                     new_pause = raised
                     rule_hit = "breath"
@@ -1489,7 +1539,7 @@ def apply_narrative_pacing(
         # ---- 规则 D：跨分镜切换底线留白 400ms（Patch v4.9）----
         # 画面从当前 beat 的最后一张分镜图切到下一条 beat 的第一张分镜图时，
         # 给一句缓冲；刻意低于 420/450，不参与换气口与长停顿的判定。
-        if rule_hit is None and panel_switch_ms > 0 and i + 1 < total:
+        if rule_hit is None and effective_panel_switch_ms > 0 and i + 1 < total:
             current_panel = _beat_last_panel_id(beat)
             next_panel = _beat_first_panel_id(next_beat) if next_beat else None
             if (
@@ -1497,7 +1547,7 @@ def apply_narrative_pacing(
                 and next_panel is not None
                 and current_panel != next_panel
             ):
-                raised = max(original, panel_switch_ms)
+                raised = max(original, effective_panel_switch_ms)
                 if raised > original:
                     new_pause = raised
                     rule_hit = "panel_switch"
@@ -1505,8 +1555,8 @@ def apply_narrative_pacing(
         # ---- 规则 E：同图最小保底留白 150ms（Patch v4.10）----
         # 同一张分镜图内连说时也留一点呼吸，避免两句话硬贴在一起、听感上
         # 像「完全没停顿」。规则 A/B/C/D 都命中不了时才生效，只抬高不压低。
-        if rule_hit is None and original < PACE_SAME_PANEL_MIN_MS:
-            raised = max(original, PACE_SAME_PANEL_MIN_MS)
+        if rule_hit is None and original < same_panel_min_ms:
+            raised = max(original, same_panel_min_ms)
             if raised > original:
                 new_pause = raised
                 rule_hit = "same_panel_min"
@@ -1543,6 +1593,17 @@ def apply_narrative_pacing(
             PACE_PAUSE_MIN_MS,
             min(PACE_PAUSE_MAX_MS, int(beat.get("pause_after_ms") or 0)),
         )
+    # Patch v4.44：风格语速偏置（默认 1.0 = 完全不动，避免回归）。
+    if abs(speed_bias - 1.0) > 1e-9:
+        for beat in paced:
+            raw_speed = beat.get("speed_override")
+            if raw_speed is None:
+                continue
+            try:
+                current = float(raw_speed)
+            except (TypeError, ValueError):
+                continue
+            beat["speed_override"] = round(current * speed_bias, 4)
     report.updated_count = len(report.changed_beat_ids)
     return paced, report
 
@@ -1908,6 +1969,7 @@ def apply_auto_motions(
     *,
     panel_metas: Sequence[PanelMeta] | Mapping[str, PanelMeta] | None = None,
     scenes: Sequence[StoryboardScene] | None = None,
+    style_profile: StyleProfileSpec | None = None,
 ) -> tuple[list[dict[str, Any]], MotionAssignReport]:
     """按分镜几何 + 情绪自动分配画面运镜（纯函数，不改入参）。
 
@@ -1945,6 +2007,30 @@ def apply_auto_motions(
     panel_to_scene = _scene_panel_index(scenes)
     scene_ordinals = _scene_ordinal_index(scenes)
 
+    #: Patch v4.44：风格化的运镜数值（未给风格 → 沿用 4.43 常量）。
+    motion_spec = style_profile.motion if style_profile is not None else None
+    wide_pan_ratio = (
+        float(motion_spec.wide_pan_ratio) if motion_spec else MOTION_WIDE_RATIO
+    )
+    max_shake_streak = (
+        int(motion_spec.max_shake_streak)
+        if motion_spec
+        else MOTION_MAX_SHAKE_STREAK
+    )
+    max_dynamic_streak = (
+        int(motion_spec.max_dynamic_streak)
+        if motion_spec
+        else MOTION_MAX_DYNAMIC_STREAK
+    )
+    #: Patch v4.44：动作模式下一条 Beat 绑了多张分镜（蒙太奇）时不再叠加强烈
+    #: 震动 —— 多图连切本身就够晃了，再叠 shake 会让人眩晕。
+    #: ``0`` = 不限制（基线行为，保证零回归）。
+    montage_beat_limit = (
+        3
+        if style_profile is not None and style_profile.montage.allow_action_combo
+        else 0
+    )
+
     assigned: list[dict[str, Any]] = [dict(beat) for beat in beats]
     report = MotionAssignReport()
 
@@ -1973,7 +2059,7 @@ def apply_auto_motions(
         panel_id = _beat_first_panel_id(beat) or ""
         meta = metas.get(panel_id)
         width, height, is_tall = _panel_geometry(meta)
-        is_wide = (not is_tall) and width / height >= MOTION_WIDE_RATIO
+        is_wide = (not is_tall) and width / height >= wide_pan_ratio
         impact = _beat_is_impact(beat)
         emotion = _beat_emotion(beat)
         scene_ordinal = _beat_scene_ordinal(beat, panel_to_scene, scene_ordinals)
@@ -1990,7 +2076,8 @@ def apply_auto_motions(
             if (
                 impact
                 and prev_motion != shake_value
-                and shake_streak < MOTION_MAX_SHAKE_STREAK
+                and shake_streak < max_shake_streak
+                and not (montage_beat_limit and _beat_panel_count(beat) >= montage_beat_limit)
             ):
                 motion = shake_value
             else:
@@ -1998,7 +2085,8 @@ def apply_auto_motions(
         elif (
             impact
             and prev_motion != shake_value
-            and shake_streak < MOTION_MAX_SHAKE_STREAK
+            and shake_streak < max_shake_streak
+            and not (montage_beat_limit and _beat_panel_count(beat) >= montage_beat_limit)
         ):
             # 规则 B：高燃冲击 → 震动（禁止连震）。
             motion = shake_value
@@ -2026,7 +2114,7 @@ def apply_auto_motions(
         ):
             # 规则 D：天然静帧（短引导句 / 情绪平稳且非新幕开篇）。
             motion = static_value
-        elif motion_streak >= MOTION_MAX_DYNAMIC_STREAK and not impact and not is_wide:
+        elif motion_streak >= max_dynamic_streak and not impact and not is_wide:
             # 规则 D（续）：连续动态达上限 → 插一拍静止呼吸。
             motion = static_value
         elif static_streak >= 3 and first_beat_of_panel:
@@ -2131,6 +2219,222 @@ def load_prompt_template(name: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def load_style_guidance(style_profile: StyleProfileSpec | None) -> str:
+    """读取风格提示词片段（Patch v4.44）。
+
+    风格片段来自 ``backend/prompts/styles/<file>``；``drama_suspense`` 的片段
+    **只复述既有铁律、不新增任何要求**（保证与 4.43 语义等价）。
+
+    片段缺失时返回空串（只降级，不阻断流水线）。
+    """
+    profile = (
+        style_profile
+        if style_profile is not None
+        else get_style_profile(DEFAULT_STYLE_PROFILE_ID)
+    )
+    fragment_file = profile.narrative.prompt_fragment_file
+    if not fragment_file:
+        return ""
+    try:
+        return load_prompt_template(f"styles/{fragment_file}").strip()
+    except ScriptWriterError as exc:
+        logger.warning("[stage4] 风格提示词片段缺失，按无片段继续：%s", exc)
+        return ""
+
+
+#: Patch v4.44：蒙太奇总括句的字数区间（动作版要求短促）。
+MONTAGE_TEXT_MIN_CHARS = 8
+MONTAGE_TEXT_MAX_CHARS = 18
+
+
+def _montage_fallback_text(chunk: list[ScriptBeat]) -> str:
+    """无 LLM 时的确定性总括句（取首句、裁到 18 字以内）。"""
+    texts = [str(beat.narration_text or "").strip() for beat in chunk]
+    texts = [item for item in texts if item]
+    if not texts:
+        return "连续交手。"
+    base = texts[0].rstrip("。！？!?，,、；; ")
+    if len(base) > MONTAGE_TEXT_MAX_CHARS:
+        base = base[:MONTAGE_TEXT_MAX_CHARS].rstrip("，,、；; ") + "…"
+    if len(base) < MONTAGE_TEXT_MIN_CHARS:
+        base = f"{base}，接连出手"
+    return base + "。"
+
+
+async def compress_scene_montage(
+    beats: list[ScriptBeat],
+    *,
+    scene_id: str,
+    vision: VisionWindowOutput | None = None,
+    style_profile: StyleProfileSpec | None = None,
+    client: LLMClient | None = None,
+    model: str = "",
+) -> tuple[list[ScriptBeat], dict[str, Any]]:
+    """把一个幕内连续的动作 Beat 压成一条多镜蒙太奇 Beat（Patch v4.44）。
+
+    * 只处理 ``scene_id`` 指定的**那一幕**的 Beat，**绝不跨幕**；
+    * 连续动作 Beat 段长度达到 ``montage.combo_min_panels`` 才合并，
+      超过 ``montage.combo_max_panels`` 按上限切段；
+    * 合并后保留**全部涉及分镜**（``target_panel_ids`` 按序去重），
+      画面是「一组镜头快切」，解说却只占一句；
+    * 优先让 LLM 把整段改写成 8~18 字短促总括句，LLM 不可用 / 出错时
+      退回确定性规则（取首句裁短）。
+
+    返回 ``(新 beats, 报告)``；报告里带 ``changed`` / ``merged_count`` /
+    ``removed_beat_ids`` / ``runs`` / ``reason``。
+    """
+    profile = (
+        style_profile
+        if style_profile is not None
+        else get_style_profile(DEFAULT_STYLE_PROFILE_ID)
+    )
+    montage = profile.montage
+    report: dict[str, Any] = {
+        "scene_id": scene_id,
+        "changed": False,
+        "merged_count": 0,
+        "removed_beat_ids": [],
+        "runs": [],
+        "reason": "",
+    }
+    if not montage.allow_action_combo:
+        report["reason"] = "当前风格未启用连招蒙太奇（montage.allow_action_combo=false）"
+        return list(beats), report
+
+    from stages.s3_vision import ACTION_BEAT_KEYWORDS
+
+    action_panels: set[str] = set()
+    if vision is not None:
+        for panel in vision.panels:
+            if getattr(panel, "is_action_beat", False):
+                action_panels.add(str(panel.panel_id))
+
+    def _beat_is_action(beat: ScriptBeat) -> bool:
+        panels = [str(item) for item in (beat.target_panel_ids or [])]
+        if action_panels and any(item in action_panels for item in panels):
+            return True
+        text = f"{beat.narration_text} {beat.tts_text or ''}"
+        return any(word in text for word in ACTION_BEAT_KEYWORDS)
+
+    scene_indices = [
+        index
+        for index, beat in enumerate(beats)
+        if str(beat.scene_id or "") == str(scene_id)
+    ]
+    if not scene_indices:
+        report["reason"] = "该幕没有可压缩的解说句"
+        return list(beats), report
+
+    runs: list[list[int]] = []
+    current: list[int] = []
+    for index in scene_indices:
+        if _beat_is_action(beats[index]):
+            current.append(index)
+        else:
+            if current:
+                runs.append(current)
+            current = []
+    if current:
+        runs.append(current)
+
+    max_panels = max(1, int(montage.combo_max_panels))
+    min_panels = max(1, int(montage.combo_min_panels))
+    usable: list[list[int]] = []
+    for run in runs:
+        for start in range(0, len(run), max_panels):
+            chunk = run[start : start + max_panels]
+            if len(chunk) >= min_panels:
+                usable.append(chunk)
+    if not usable:
+        report["reason"] = f"该幕没有连续 {min_panels} 拍以上的动作句"
+        return list(beats), report
+
+    chunk_by_first = {chunk[0]: chunk for chunk in usable}
+    # 被合并掉的段内后续 Beat：整条替换，绝不在输出里重复出现。
+    skipped_indices: set[int] = set()
+    for chunk in usable:
+        skipped_indices.update(chunk[1:])
+    merged_beats: list[ScriptBeat] = []
+    removed: list[str] = []
+    run_reports: list[dict[str, Any]] = []
+    for index, beat in enumerate(beats):
+        if index in skipped_indices:
+            continue
+        chunk = chunk_by_first.get(index)
+        if chunk is None:
+            merged_beats.append(beat)
+            continue
+        chunk_beats = [beats[position] for position in chunk]
+        panels: list[str] = []
+        for item in chunk_beats:
+            for panel_id in item.target_panel_ids or []:
+                text = str(panel_id)
+                if text not in panels:
+                    panels.append(text)
+        merged = beat.model_copy(deep=True)
+        merged.target_panel_ids = panels
+        merged.narration_text = _montage_fallback_text(chunk_beats)
+        merged.tts_text = merged.narration_text
+        # 多镜快切时强烈抖动会让人眩晕：降级成轻推。
+        if str(merged.motion) == "shake":
+            merged.motion = "zoom_in"
+        merged.pause_after_ms = 0
+        text = merged.narration_text
+        if client is not None and model:
+            try:
+                response = await run_with_model_fallback(
+                    model,
+                    lambda candidate: client.chat(
+                        [
+                            ChatMessage(
+                                role="user",
+                                content=(
+                                    "把下面这几句连续动作解说压缩成**一句**短促总括，"
+                                    f"{MONTAGE_TEXT_MIN_CHARS}~{MONTAGE_TEXT_MAX_CHARS} 个字，"
+                                    "只保留动作本身，不要评价、不要加旁白、"
+                                    "不要出现「他们」「两人」等指代词，结尾用句号。\n"
+                                    "只输出这句话本身，不要引号、不要解释。\n\n"
+                                    + "\n".join(
+                                        f"- {item.narration_text}" for item in chunk_beats
+                                    )
+                                ),
+                            )
+                        ],
+                        model=candidate,
+                        temperature=0.3,
+                        max_tokens=64,
+                        **_NO_THINKING_KWARGS,
+                    ),
+                    label="连招蒙太奇改写",
+                )
+                candidate = (response.content or "").strip().strip("「」\"'")
+                candidate = candidate.splitlines()[0].strip() if candidate else ""
+                if MONTAGE_TEXT_MIN_CHARS <= len(candidate) <= MONTAGE_TEXT_MAX_CHARS:
+                    text = candidate
+                elif 0 < len(candidate) <= MONTAGE_TEXT_MAX_CHARS + 6:
+                    text = candidate
+            except Exception as exc:  # noqa: BLE001 - LLM 失败一律退回确定性规则
+                logger.warning("[stage4] 连招蒙太奇改写失败，用确定性总括：%s", exc)
+        merged.narration_text = text
+        merged.tts_text = text
+        merged_beats.append(merged)
+        removed.extend(beats[position].beat_id for position in chunk[1:])
+        run_reports.append(
+            {
+                "beat_ids": [beats[position].beat_id for position in chunk],
+                "panel_ids": panels,
+                "text": text,
+            }
+        )
+
+    report["changed"] = True
+    report["merged_count"] = len(usable)
+    report["removed_beat_ids"] = removed
+    report["runs"] = run_reports
+    report["reason"] = f"合并 {len(usable)} 段连续动作解说"
+    return merged_beats, report
+
+
 def render_prompt(template: str, mapping: dict[str, str]) -> str:
     """把模板中的 ``{{TOKEN}}`` 占位符替换为实际内容。"""
     rendered = template
@@ -2158,15 +2462,19 @@ def format_panel_list(
     reference_only = {str(item) for item in (reference_only_ids or ())}
     lines: list[str] = []
     for panel in panels:
+        # Patch v4.44：繁中前置规范化 —— 视觉摘要与台词先转简体再喂给 LLM，
+        # 避免同一话里「繁中原文 + 简体脚本」两套字形互相干扰。
+        # to_simplified_chinese 只动汉字，MiniMax 标签与 [sfx:key] 原样透传。
         dialogues = "；".join(
-            f"{item.speaker_guess}：{item.text}" for item in panel.dialogues
+            f"{item.speaker_guess}：{to_simplified_chinese(item.text)}"
+            for item in panel.dialogues
         )
         parts = [f"- {panel.panel_id}："]
         if str(panel.panel_id) in reference_only:
             parts.append("[仅参考剧情·不出镜]")
         if getattr(panel, "is_pure_text_card", False):
             parts.append("[纯字卡]")
-        parts.append(panel.scene_summary)
+        parts.append(to_simplified_chinese(panel.scene_summary))
         if dialogues:
             parts.append(f"对白：{dialogues}")
         if panel.sfx_list:
@@ -3361,6 +3669,7 @@ async def _write_narration_chapter(
     beat_budget: str = "",
     scene_directives: str = "",
     character_lock: str = "",
+    style_profile: StyleProfileSpec | None = None,
 ) -> list[dict]:
     """Step 4B：对一章故事做一次拆拍调用，产出这一章的解说句草稿。
 
@@ -3404,6 +3713,7 @@ async def _write_narration_chapter(
                     beat_budget=chunk_budget,
                     scene_directives=scene_directives,
                     character_lock=character_lock,
+                    style_profile=style_profile,
                 )
             )
         return result
@@ -3425,6 +3735,8 @@ async def _write_narration_chapter(
             "ALIGNMENT_FEEDBACK": alignment_feedback or "（首轮，没有需要修正的问题）",
             "BEAT_BUDGET": beat_budget or "按故事节奏自行决定条数",
             "SCENE_DIRECTIVES": scene_directives or "（本幕没有额外约束）",
+            "STYLE_GUIDANCE": load_style_guidance(style_profile)
+            or "（本作品按标准剧情言情风格撰写）",
         },
     )
     try:
@@ -3465,6 +3777,7 @@ async def _write_narration_chapter(
             beat_budget=half_budgets[0],
             scene_directives=scene_directives,
             character_lock=character_lock,
+            style_profile=style_profile,
         )
         right = await _write_narration_chapter(
             client,
@@ -3483,6 +3796,7 @@ async def _write_narration_chapter(
             beat_budget=half_budgets[1],
             scene_directives=scene_directives,
             character_lock=character_lock,
+            style_profile=style_profile,
         )
         return left + right
     if not isinstance(data, dict):
@@ -3722,6 +4036,7 @@ async def write_episode_script(
     storyboard_sink: list[EpisodeStoryboard] | None = None,
     canonicalizer: CharacterNameCanonicalizer | None = None,
     series_dir: str | Path | None = None,
+    style_profile: StyleProfileSpec | None = None,
 ) -> NarrationScript:
     """Story-First 两步撰稿：先讲清故事，再顺着故事挑图配解说。
 
@@ -3785,6 +4100,7 @@ async def write_episode_script(
         panels_dir=panels_dir,
         reset_storyboard=reset_storyboard,
         storyboard_sink=storyboard_sink,
+        style_profile=style_profile,
     )
     (
         valid_panel_ids,
@@ -4087,6 +4403,7 @@ async def write_episode_script(
                 beat_budget=chapter_budget,
                 scene_directives=_scene_directives_block(scene),
                 character_lock=canonicalizer_lock(canonicalizer),
+                style_profile=style_profile,
             )
             if not raw_beats:
                 chapter_errors.append(
@@ -4232,7 +4549,8 @@ async def write_episode_script(
                     temperature=temperature,
                     beat_budget=budget,
                     scene_directives=_scene_directives_block(scene),
-                character_lock=canonicalizer_lock(canonicalizer),
+                    character_lock=canonicalizer_lock(canonicalizer),
+                    style_profile=style_profile,
                 )
                 if not new_beats:
                     continue
@@ -4292,6 +4610,7 @@ async def write_episode_script(
         merged_beats, pacing_report = apply_narrative_pacing(
             merged_beats,
             scenes=active_scenes if scene_mode else None,
+            style_profile=style_profile,
         )
         if pacing_report.updated_count > 0:
             print(
@@ -4324,6 +4643,7 @@ async def write_episode_script(
             merged_beats,
             panel_metas=auto_panel_metas,
             scenes=active_scenes if scene_mode else None,
+            style_profile=style_profile,
         )
         if motion_report.updated_count > 0:
             print(
@@ -4660,6 +4980,10 @@ async def run_stage4(
                 reset=reset_storyboard,
             )
     storyboard_sink: list[EpisodeStoryboard] = []
+    # Patch v4.44：作品级风格预设（默认 drama_suspense 基线 → 与 4.43 等价）。
+    style_profile = resolve_series_style_profile(
+        _load_series_config_safe(series_root)
+    )
     # Patch v4.16：构建角色名归一器（作品配置 + StoryBible 角色表）。
     episode_canonicalizer = build_episode_canonicalizer(
         series_root, context.characters
@@ -4689,6 +5013,7 @@ async def run_stage4(
         storyboard_sink=storyboard_sink,
         canonicalizer=episode_canonicalizer,
         series_dir=series_root,
+        style_profile=style_profile,
     )
     # Patch v4.0 Patch 20.1：auto 版镜头组**总是**回写（把整幕视觉复核得到的
     # visual_recap 落盘，下次打开镜头编排 Tab 直接能看到摘要）；

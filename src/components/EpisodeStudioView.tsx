@@ -27,6 +27,7 @@ import {
   Wand2,
   Music,
   Sparkles,
+  Scissors,
 } from 'lucide-react';
 import type {
   AutoMotionResponse,
@@ -57,7 +58,7 @@ import type {
   VoiceOption,
 } from '../types/studio';
 import { formatMs, playPreviewTone, resolveSpokenText } from '../utils/pronunciation';
-import { fetchSfxLibrary, sfxFileUrl } from '../api/studioApi';
+import { compressSceneMontage, fetchSfxLibrary, sfxFileUrl } from '../api/studioApi';
 import { formatBytes } from '../utils/format';
 import { PanelZoomModal, type RoleOption, type SaveStatus } from './PanelZoomModal';
 import {
@@ -2066,6 +2067,44 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
   );
   const [showFocusOverlay, setShowFocusOverlay] = useState(true);
   const [draftBeats, setDraftBeats] = useState<ScriptBeat[]>(episode.beats);
+  /** Patch v4.44：某一幕正在做连招蒙太奇压缩。 */
+  const [compressingSceneId, setCompressingSceneId] = useState<string | null>(null);
+
+  /**
+   * Patch v4.44：把这一幕里连续的动作解说压成多镜蒙太奇。
+   *
+   * 后端只动这一幕的 Beat（绝不跨幕），写回 script.json；这里把返回的
+   * 该幕 Beat 换进本地草稿，标记为未保存，由用户决定何时保存并从 S5 重跑配音。
+   */
+  const handleCompressMontage = useCallback(
+    async (sceneId: string) => {
+      if (!sceneId) return;
+      setCompressingSceneId(sceneId);
+      try {
+        const data = await compressSceneMontage(episode.episode_id, sceneId);
+        const incoming = (data.beats ?? []) as unknown as ScriptBeat[];
+        setDraftBeats((prev) => {
+          const firstIndex = prev.findIndex((beat) => (beat.scene_id ?? '') === sceneId);
+          const rest = prev.filter((beat) => (beat.scene_id ?? '') !== sceneId);
+          if (firstIndex < 0) return [...rest, ...incoming];
+          return [...prev.slice(0, firstIndex), ...incoming, ...rest];
+        });
+        const merged = data.report?.merged_count ?? 0;
+        setSaveHint(
+          merged > 0
+            ? `已压缩 ${merged} 段连招（合并 ${data.report?.removed_beat_ids?.length ?? 0} 句），保存后从 Stage 5 重跑配音生效`
+            : data.report?.reason || '这一幕没有可压缩的连续动作解说',
+        );
+      } catch (err) {
+        setSaveHint(`连招蒙太奇压缩失败：${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        setCompressingSceneId(null);
+      }
+    },
+    [episode.episode_id]
+  );
+
+
   /** Patch v4.13：本话的镜头组（幕），供「归属幕」下拉选择。 */
   const storyboardScenes = sceneStoryboard?.scenes ?? EMPTY_SCENES;
   /** Patch v4.7：解说句按 storyboard 启用幕归组，未命中分镜进末尾兜底组。 */
@@ -5796,6 +5835,22 @@ export const EpisodeStudioView: React.FC<EpisodeStudioViewProps> = ({
                             onClick={(event) => event.stopPropagation()}
                             onKeyDown={(event) => event.stopPropagation()}
                           >
+                            {/* Patch v4.44：把这一幕里连续的动作解说压成多镜蒙太奇 */}
+                            <button
+                              type="button"
+                              onClick={() => void handleCompressMontage(scene.scene_id)}
+                              disabled={compressingSceneId === scene.scene_id}
+                              aria-label={`压缩第 ${scene.scene_index} 幕的连招`}
+                              title="把这一幕里连续的动作解说压成一条多镜蒙太奇（只动这一幕）"
+                              className="inline-flex items-center gap-1 px-2 py-1.5 text-[11px] text-slate-600 bg-white border border-slate-200 rounded-lg hover:border-slate-400 hover:text-slate-900 disabled:opacity-50 cursor-pointer whitespace-nowrap"
+                            >
+                              {compressingSceneId === scene.scene_id ? (
+                                <Loader2 className="h-3 w-3 animate-spin" />
+                              ) : (
+                                <Scissors className="h-3 w-3" />
+                              )}
+                              压缩连招
+                            </button>
                             <select
                               value={scene.bgm ?? ''}
                               disabled={sceneBgmSavingId === scene.scene_id}

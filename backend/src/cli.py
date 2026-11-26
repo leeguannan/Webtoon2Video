@@ -35,6 +35,7 @@ from core.config import (
 from core.http_client import build_client, local_path_from_url
 from core.manifest import ManifestManager
 from core.memory import StoryBibleManager
+from core.style_profiles import resolve_series_style_profile
 from core.schemas import (
     EpisodeCatalogItem,
     NarrationScript,
@@ -222,6 +223,8 @@ async def produce_scripts(
     episodes.sort(key=lambda episode: episode.episode_no)
     series_dir = registry.series_dir(series_id)
     series_config = load_series_config(series_dir)
+    # Patch v4.44：作品级风格预设（默认 drama_suspense → 与 4.43 等价）。
+    style_profile = resolve_series_style_profile(series_config)
     vision_model = series_config.model_overrides.get("vision", config.models.vision)
     script_model = series_config.model_overrides.get("script", config.models.script)
     # Patch v3.0-7：4A 故事编剧用专门的模型（默认 qwen3.8-max），未配置则回退 script 模型。
@@ -245,7 +248,11 @@ async def produce_scripts(
                 manifests, episode.episode_no, "s2_segmenter", episode_id=episode.episode_id
             ):
                 s2_segmenter.segment_episode(
-                    raw_dir, panels_dir, episode_id=episode.episode_id
+                    raw_dir,
+                    panels_dir,
+                    episode_id=episode.episode_id,
+                    # Patch v4.44：作品级风格预设（默认 drama_suspense → 与 4.43 等价）。
+                    style_profile=style_profile,
                 )
             return episode.episode_no
 

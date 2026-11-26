@@ -327,6 +327,15 @@ class SeriesConfig(_StrictModel):
     #: Stage 4 产出的角色名写法不一时，用这张表把别名归并到同一个规范名，
     #: 避免同一角色在解说词、角色表与音色表里被拆成好几个人。
     character_aliases: dict[str, str | list[str]] = Field(default_factory=dict)
+    #: Patch v4.44：作品级漫画风格预设 id（见 ``core/style_profiles.py``）。
+    #:
+    #: 默认 ``drama_suspense``（言情悬疑基线）—— 存量作品不配置时行为与
+    #: 4.43 完全一致；想切成动作风格就填 ``action_combat``。
+    style_profile: str = "drama_suspense"
+    #: Patch v4.44：作品级风格局部覆盖（按维度深度合并到预设之上）。
+    #:
+    #: 例：``{"pacing": {"panel_switch_ms": 160}, "motion": {"max_dynamic_streak": 6}}``。
+    style_overrides: dict[str, Any] = Field(default_factory=dict)
 
 
 def _package_root() -> Path:

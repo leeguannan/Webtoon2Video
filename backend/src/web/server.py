@@ -104,6 +104,11 @@ from core.normalize import (
     save_custom_sfx_config,
     to_simplified_chinese,
 )
+from core.style_profiles import (
+    list_style_profiles,
+    resolve_series_style_profile,
+    suggest_style_profile_from_url_or_genre,
+)
 from core.schemas import (
     ArcSummary,
     CharacterProfile,
@@ -358,6 +363,8 @@ class SeriesCreateRequest(BaseModel):
 
     url: str
     title: str = ""
+    #: Patch v4.44：漫画风格预设 id（空串 = 用默认 drama_suspense）。
+    style_profile: str = ""
 
 
 class CharacterRenameSync(BaseModel):
@@ -1272,6 +1279,13 @@ class SeriesTTSConfigRequest(BaseModel):
     default_male: VoiceSpecRequest | None = None
     default_female: VoiceSpecRequest | None = None
     character_voices: dict[str, VoiceSpecRequest] | None = None
+
+
+class StyleProfileRequest(BaseModel):
+    """``PUT /api/series/{sid}/style-profile`` 请求体（字段均可选）。"""
+
+    style_profile: str | None = None
+    style_overrides: dict[str, Any] | None = None
 
 
 class ConfigUpdateRequest(BaseModel):
@@ -2482,6 +2496,24 @@ def create_app(
             catalog = catalog.model_copy(update={"series_title": payload.title})
         view.registry.register(catalog, done_episodes=0)
         view.registry.save_catalog(catalog)
+        # Patch v4.44：新建作品时一并落定风格预设（未知 id 直接忽略，
+        # 严格校验在 PUT /api/series/{sid}/style-profile）。
+        profile_id = str(payload.style_profile or "").strip()
+        known = {str(item["id"]) for item in list_style_profiles()}
+        if profile_id and profile_id in known:
+            series_dir = view.registry.series_dir(catalog.series_id)
+            series_dir.mkdir(parents=True, exist_ok=True)
+            config_path = series_dir / "series_config.yaml"
+            config_data: dict[str, Any] = {}
+            if config_path.is_file():
+                loaded = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    config_data = loaded
+            config_data["style_profile"] = profile_id
+            config_path.write_text(
+                yaml.safe_dump(config_data, allow_unicode=True, sort_keys=False),
+                encoding="utf-8",
+            )
         return view.series_item(catalog.series_id)
 
     @app.get("/api/series/{series_id}")
@@ -2574,6 +2606,127 @@ def create_app(
             yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8"
         )
         return _series_tts_payload(app.state.config, view, series_id)
+
+    # ---- Patch v4.44：漫画风格预设（多风格引擎）----
+    @app.get("/api/style-profiles")
+    async def get_style_profiles() -> dict[str, Any]:
+        """列出全部漫画风格预设（前端作品设置区下拉用）。"""
+        return {"profiles": list_style_profiles()}
+
+    @app.get("/api/style-profiles/suggest")
+    async def suggest_style_profile(url_or_genre: str = "") -> dict[str, Any]:
+        """按来源 URL / 类型标签推荐风格预设（新建作品时自动预选）。"""
+        return {
+            "style_profile": suggest_style_profile_from_url_or_genre(url_or_genre)
+        }
+
+    @app.get("/api/series/{series_id}/style-profile")
+    async def get_series_style_profile(series_id: str) -> dict[str, Any]:
+        """作品当前生效的风格预设（含解析后的完整数值）。"""
+        return _series_style_profile_payload(view, series_id)
+
+    @app.put("/api/series/{series_id}/style-profile")
+    async def put_series_style_profile(
+        series_id: str, payload: StyleProfileRequest
+    ) -> dict[str, Any]:
+        """保存作品级风格预设（写 ``series_config.yaml``）。
+
+        未知预设直接 400 —— 绝不把拼错的 id 静默存进配置。
+        """
+        series_dir = view.registry.series_dir(series_id)
+        series_dir.mkdir(parents=True, exist_ok=True)
+        path = series_dir / "series_config.yaml"
+        data: dict[str, Any] = {}
+        if path.is_file():
+            loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        if payload.style_profile is not None:
+            profile_id = str(payload.style_profile).strip()
+            known = {str(item["id"]) for item in list_style_profiles()}
+            if profile_id not in known:
+                raise HTTPException(
+                    status_code=400, detail=f"未知的漫画风格预设：{profile_id}"
+                )
+            data["style_profile"] = profile_id
+        if payload.style_overrides is not None:
+            data["style_overrides"] = dict(payload.style_overrides)
+        path.write_text(
+            yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8"
+        )
+        return _series_style_profile_payload(view, series_id)
+
+    @app.post("/api/episodes/{episode_id}/scenes/{scene_id}/compress-montage")
+    async def compress_scene_montage_endpoint(
+        episode_id: str, scene_id: str
+    ) -> dict[str, Any]:
+        """把某一幕内连续的动作解说压成多镜蒙太奇（Patch v4.44）。
+
+        * **只动这一幕**：其它幕的 Beat 一字不改，绝不跨幕；
+        * 有 LLM 就让 LLM 改写成短促总括句，没有就用确定性规则兜底；
+        * 写回 ``04_script/script.json`` 与 ``script_readable.md``，
+          音频清单与 S5/S6 **不触发**（配音需从 S5 重跑）。
+        """
+        located = view.find_episode(episode_id)
+        if located is None:
+            raise HTTPException(status_code=404, detail=f"找不到话次：{episode_id}")
+        series_id, episode_no = located
+        episode_dir = view.episode_dir(series_id, episode_no)
+        script_dir = episode_dir / "04_script"
+        script_path = script_dir / "script.json"
+        if not script_path.is_file():
+            raise HTTPException(status_code=404, detail="该话还没有 Stage 4 剧本")
+        script = load_model(NarrationScript, script_path)
+        vision = _load_episode_vision(episode_dir)
+        series_config = load_series_config(view.registry.series_dir(series_id))
+        profile = resolve_series_style_profile(series_config)
+        client = None
+        model = ""
+        try:
+            from providers.llm_bailian import BailianClient
+
+            client = BailianClient(config=app.state.config)
+            model = str(getattr(app.state.config.models, "script", "") or "")
+        except Exception as exc:  # noqa: BLE001 - 没有 LLM 就走确定性兜底
+            print(
+                f"[server] 连招蒙太奇改写不可用，用确定性规则：{exc}",
+                file=sys.stderr,
+            )
+            client = None
+        from stages.s4_scriptwriter import (
+            compress_scene_montage,
+            render_readable_script,
+        )
+
+        beats, report = await compress_scene_montage(
+            script.beats,
+            scene_id=scene_id,
+            vision=vision,
+            style_profile=profile,
+            client=client,
+            model=model,
+        )
+        if report.get("changed"):
+            try:
+                updated = NarrationScript.model_validate(
+                    {**script.model_dump(), "beats": [b.model_dump() for b in beats]}
+                )
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=400, detail=f"连招蒙太奇产出非法剧本：{exc}"
+                ) from exc
+            save_model(updated, script_path)
+            readable_path = script_dir / "script_readable.md"
+            readable_path.write_text(
+                render_readable_script(updated), encoding="utf-8"
+            )
+            script = updated
+        scene_beats = [
+            beat.model_dump()
+            for beat in script.beats
+            if str(beat.scene_id or "") == str(scene_id)
+        ]
+        return {"beats": scene_beats, "report": report}
 
     # ---- Patch v4.5：作品级封页写字 + 双结尾图片包 ----
     @app.get("/api/series/{series_id}/branding")
@@ -4192,6 +4345,26 @@ def _config_payload(config: AppConfig) -> dict[str, Any]:
         "timeoutS": config.api.timeout_s,
         "maxRetries": config.api.max_retries,
         "workspaceRoot": str(config.workspace_root()),
+    }
+
+
+def _series_style_profile_payload(view: WorkspaceView, series_id: str) -> dict[str, Any]:
+    """作品当前生效的漫画风格预设（Patch v4.44）。
+
+    返回：预设 id、解析后的完整数值（预设 ← 作品覆盖 ← 临时覆盖三层合并）、
+    作品级覆盖字典，以及全部可选预设列表。
+    """
+    if view.catalog(series_id) is None:
+        raise HTTPException(status_code=404, detail=f"作品未登记：{series_id}")
+    series_dir = view.registry.series_dir(series_id)
+    series_config = load_series_config(series_dir)
+    resolved = resolve_series_style_profile(series_config)
+    overrides = getattr(series_config, "style_overrides", {}) or {}
+    return {
+        "style_profile": resolved.id,
+        "profile": resolved.to_dict(),
+        "style_overrides": dict(overrides),
+        "available": list_style_profiles(),
     }
 
 

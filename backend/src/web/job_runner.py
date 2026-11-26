@@ -30,6 +30,7 @@ from core.config import (
 from core.manifest import STAGE_DIR_NAMES, ManifestManager
 from core.memory import StoryBibleManager
 from core.schemas import NarrationScript, VisionWindowOutput, load_model
+from core.style_profiles import resolve_series_style_profile
 from stages import (
     s0_catalog,
     s1_crawler,
@@ -534,11 +535,16 @@ class JobRunner:
             if stage == "s1_crawler":
                 await self._stage_download(state, series_dir, episode)
             elif stage == "s2_segmenter":
+                # Patch v4.44：作品级风格预设（默认 drama_suspense → 与 4.43 等价）。
+                style_profile = resolve_series_style_profile(
+                    load_series_config(series_dir)
+                )
                 await asyncio.to_thread(
                     s2_segmenter.segment_episode,
                     s1_crawler.raw_dir_for(series_dir, episode.episode_no),
                     s2_segmenter.panels_dir_for(series_dir, episode.episode_no),
                     episode_id=episode.episode_id,
+                    style_profile=style_profile,
                 )
             elif stage == "s3_vision":
                 characters = manager.build_character_reference(episode.episode_no)

@@ -101,6 +101,66 @@ NON_STORY_BANNER_TYPES = frozenset({"copyright_notice", "promo_banner"})
 #: Patch v3.0-6：只含拟声词特效的画格（同样不进剧本）。
 NON_STORY_SFX_TYPES = frozenset({"sfx_only"})
 
+# --------------------------------------------------------------------------
+# Patch v4.44：动作向分镜标记（连招蒙太奇的输入）
+# --------------------------------------------------------------------------
+#: 画面摘要里出现这些词 → 判定为动作向分镜（模型没给 is_action_beat 时的兜底）。
+#:
+#: 只在**画面没有任何对白**时才生效：动作格与对白格天然互斥。
+ACTION_BEAT_KEYWORDS: tuple[str, ...] = (
+    "搏斗",
+    "格斗",
+    "厮杀",
+    "打斗",
+    "交手",
+    "过招",
+    "缠斗",
+    "对打",
+    "连击",
+    "出拳",
+    "一拳",
+    "挥拳",
+    "格挡",
+    "闪避",
+    "躲闪",
+    "飞踢",
+    "侧踢",
+    "重击",
+    "横扫",
+    "劈砍",
+    "挥刀",
+    "兵器",
+    "刀剑",
+    "长剑",
+    "扑向",
+    "撞向",
+    "揪住",
+    "掐住",
+)
+
+
+def infer_action_beat(payload: dict[str, Any]) -> bool:
+    """判定一格是不是「动作向分镜」（Patch v4.44）。
+
+    * 模型显式给了 ``is_action_beat`` → 直接采信（并收敛为 bool）；
+    * 模型没给（旧 vision.json / 老模型输出）→ **兼容兜底**：
+      画面**没有任何对白**、且摘要里命中 :data:`ACTION_BEAT_KEYWORDS` 时判 True。
+    """
+    raw = payload.get("is_action_beat")
+    if raw is not None:
+        return bool(raw)
+    dialogues = payload.get("dialogues")
+    if isinstance(dialogues, list):
+        has_dialogue = any(
+            str((item or {}).get("text") or "").strip()
+            for item in dialogues
+            if isinstance(item, dict)
+        )
+        if has_dialogue:
+            return False
+    summary = str(payload.get("scene_summary") or payload.get("summary") or "")
+    return any(keyword in summary for keyword in ACTION_BEAT_KEYWORDS)
+
 #: 参与视觉抽取的图片后缀。
 IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp"})
 
@@ -611,6 +671,8 @@ def _panel_info_from_payload(payload: dict[str, Any], *, panel_id: str) -> Panel
     共用同一套规整逻辑，避免两条路径的字段口径漂移。
     """
     normalized = normalize_panel_payload(payload, panel_id=panel_id)
+    # Patch v4.44：动作向分镜标记（连招蒙太奇的输入；旧数据走关键词兜底）。
+    normalized["is_action_beat"] = infer_action_beat(payload)
     # Patch v2.5-1 第二重：core.normalize 不在补丁清单内、不处理 non_story_type，
     # 在此做白名单收敛；模型给出的非法/缺失值一律回落 "none"。
     raw_non_story = payload.get("non_story_type")
@@ -726,6 +788,8 @@ def _merge_tile_payloads(
     valid_sfx_flags: list[bool] = []
     #: 每个「有效切片」（非空白）是否自报纯字卡（Patch v3.1 Patch 10）。
     valid_text_card_flags: list[bool] = []
+    #: 每个「有效切片」（非空白）是否自报动作向分镜（Patch v4.44）。
+    valid_action_flags: list[bool] = []
 
     for tile, payload in tile_payloads:
         # Patch v4.13：视觉抽取结果落盘前统一简体——模型偶尔会照抄画格里的
@@ -770,6 +834,7 @@ def _merge_tile_payloads(
             # 空白切片不算有效切片，不参与 sfx_only 的「全部」判定。
             valid_sfx_flags.append(raw_non_story in NON_STORY_SFX_TYPES)
             valid_text_card_flags.append(bool(payload.get("is_pure_text_card")))
+            valid_action_flags.append(infer_action_beat(payload))
         blank_flags.append(bool(payload.get("is_transition_blank")))
 
     if (
@@ -800,6 +865,10 @@ def _merge_tile_payloads(
         "is_transition_blank": bool(blank_flags) and all(blank_flags),
         "non_story_type": non_story_type,
         "is_pure_text_card": is_pure_text_card,
+        # Patch v4.44：任一有效切片是动作向分镜、且整格没有对白 → 整格算动作向。
+        "is_action_beat": bool(valid_action_flags)
+        and any(valid_action_flags)
+        and not dialogues,
     }
     return merged
 

@@ -90,6 +90,8 @@ FIELD_LOCKS: list[tuple[type, tuple[str, ...]]] = [
             "is_pure_text_card",
             # Patch v2.5-1：非剧情内容标记（默认 "none"，向后兼容）
             "non_story_type",
+            # Patch v4.44：动作向标记（默认 False，向后兼容旧 vision.json）
+            "is_action_beat",
         ),
     ),
     (VisionWindowOutput, ("panels",)),

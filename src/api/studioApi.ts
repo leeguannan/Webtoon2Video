@@ -5,7 +5,12 @@
  * **音效曲库**这三只接口单独收成一个模块，方便审核台组件直接引用，
  * 也避免把曲库逻辑塞进体量已经很大的 `App.tsx`。
  */
-import type { SfxLibraryResponse } from '../types/studio';
+import type {
+  CompressMontageResponse,
+  SeriesStyleProfileResponse,
+  SfxLibraryResponse,
+  StyleProfileSummary,
+} from '../types/studio';
 
 const API_BASE = '/api';
 
@@ -127,6 +132,55 @@ export async function deleteSfxAsset(
 export async function restoreSfxAsset(sfxKey: string): Promise<SfxLibraryResponse> {
   return request<SfxLibraryResponse>(
     `/sfx-library/${encodeURIComponent(sfxKey)}/restore`,
+    { method: 'POST' },
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Patch v4.44：漫画风格预设 + 连招蒙太奇                                  */
+/* ------------------------------------------------------------------ */
+
+/** 拉取全部漫画风格预设。 */
+export async function fetchStyleProfiles(): Promise<StyleProfileSummary[]> {
+  const data = await request<{ profiles: StyleProfileSummary[] }>('/style-profiles');
+  return data.profiles ?? [];
+}
+
+/** 按来源 URL / 类型标签推荐风格预设。 */
+export async function suggestStyleProfile(urlOrGenre: string): Promise<string> {
+  const data = await request<{ style_profile: string }>(
+    `/style-profiles/suggest?url_or_genre=${encodeURIComponent(urlOrGenre)}`,
+  );
+  return data.style_profile;
+}
+
+/** 拉取作品当前生效的风格预设。 */
+export async function fetchSeriesStyleProfile(
+  seriesId: string,
+): Promise<SeriesStyleProfileResponse> {
+  return request<SeriesStyleProfileResponse>(
+    `/series/${encodeURIComponent(seriesId)}/style-profile`,
+  );
+}
+
+/** 保存作品级风格预设（未知预设后端返回 400）。 */
+export async function updateSeriesStyleProfile(
+  seriesId: string,
+  payload: { style_profile?: string; style_overrides?: Record<string, unknown> },
+): Promise<SeriesStyleProfileResponse> {
+  return request<SeriesStyleProfileResponse>(
+    `/series/${encodeURIComponent(seriesId)}/style-profile`,
+    { method: 'PUT', body: JSON.stringify(payload) },
+  );
+}
+
+/** 把某一幕内连续的动作解说压成多镜蒙太奇。 */
+export async function compressSceneMontage(
+  episodeId: string,
+  sceneId: string,
+): Promise<CompressMontageResponse> {
+  return request<CompressMontageResponse>(
+    `/episodes/${encodeURIComponent(episodeId)}/scenes/${encodeURIComponent(sceneId)}/compress-montage`,
     { method: 'POST' },
   );
 }

@@ -40,6 +40,7 @@ import type {
   SeriesCleanupResponse,
   SeriesItem,
   SfxLibraryResponse,
+  StyleProfileSummary,
   StageId,
   StageStatus,
   StudioConfig,
@@ -49,7 +50,14 @@ import { CatalogView } from './components/CatalogView';
 import { EpisodeStudioView } from './components/EpisodeStudioView';
 import { ConfigDictView } from './components/ConfigDictView';
 import { MemoryView } from './components/MemoryView';
-import { SfxLibraryView } from './components/SfxLibraryView';import { fetchSfxLibrary } from './api/studioApi';
+import { SfxLibraryView } from './components/SfxLibraryView';
+import {
+  fetchSfxLibrary,
+  fetchStyleProfiles,
+  fetchSeriesStyleProfile,
+  suggestStyleProfile,
+  updateSeriesStyleProfile,
+} from './api/studioApi';
 import {
   getDesktopNotificationPermission,
   loadRenderNotifyPrefs,
@@ -410,6 +418,13 @@ export default function App() {
   const [showAddSeries, setShowAddSeries] = useState(false);
   const [newSeriesTitle, setNewSeriesTitle] = useState('');
   const [newSeriesUrl, setNewSeriesUrl] = useState('');
+  /** Patch v4.44：漫画风格预设（新建作品时选，之后仍可在作品列表里切换）。 */
+  const [styleProfiles, setStyleProfiles] = useState<StyleProfileSummary[]>([]);
+  const [newSeriesStyle, setNewSeriesStyle] = useState('drama_suspense');
+  /** 用户手动动过下拉 → 不再用 URL 自动推荐覆盖。 */
+  const [newSeriesStyleTouched, setNewSeriesStyleTouched] = useState(false);
+  /** 当前作品生效的风格预设 id。 */
+  const [seriesStyleId, setSeriesStyleId] = useState('');
   const [booted, setBooted] = useState(false);
   /** 后端不保存勾选态，这里单独维护。 */
   const [selectedMap, setSelectedMap] = useState<Record<string, boolean>>({});
@@ -720,6 +735,41 @@ export default function App() {
     };
   }, []);
 
+  /* Patch v4.44：拉一次漫画风格预设列表（新建作品下拉用）。 */
+  useEffect(() => {
+    let cancelled = false;
+    fetchStyleProfiles()
+      .then((items) => {
+        if (!cancelled) setStyleProfiles(items);
+      })
+      .catch(() => {
+        /* 后端没起来时静默降级：下拉只留默认项 */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /* Patch v4.44：切换作品时同步该作品生效的风格预设。 */
+  useEffect(() => {
+    const seriesId = activeSeries?.series_id ?? '';
+    if (!seriesId) {
+      setSeriesStyleId('');
+      return;
+    }
+    let cancelled = false;
+    fetchSeriesStyleProfile(seriesId)
+      .then((data) => {
+        if (!cancelled) setSeriesStyleId(data.style_profile);
+      })
+      .catch(() => {
+        /* 作品还没落盘配置时按默认处理 */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSeries?.series_id]);
+
   /* 切回前台时停止标题闪烁；组件卸载时同样清理。 */
   useEffect(() => {
     const onVisibilityChange = () => {
@@ -868,10 +918,23 @@ export default function App() {
       showToast('请填写 WEBTOON 列表 URL 或本地目录路径');
       return;
     }
+    // Patch v4.44：用户没手动选过时，按来源 URL 自动推荐风格（/action/ → 动作连招）。
+    let styleId = newSeriesStyle;
+    if (!newSeriesStyleTouched) {
+      try {
+        styleId = await suggestStyleProfile(source);
+      } catch {
+        /* 推荐失败就沿用当前选择 */
+      }
+    }
     try {
       const raw = await apiFetch<RawSeries>('/series', {
         method: 'POST',
-        body: JSON.stringify({ url: source, title: newSeriesTitle.trim() }),
+        body: JSON.stringify({
+          url: source,
+          title: newSeriesTitle.trim(),
+          style_profile: styleId,
+        }),
       });
       const item = toSeriesItem(raw);
       applySeries(raw);
@@ -884,6 +947,21 @@ export default function App() {
       showToast(`已创建独立漫画工作区：${item.series_title} (${item.series_id})`);
     } catch (err) {
       reportError('导入漫画失败', err);
+    }
+  };
+
+  /** Patch v4.44：切换作品生效的漫画风格预设。 */
+  const handleChangeSeriesStyle = async (styleId: string) => {
+    const seriesId = activeSeries?.series_id;
+    if (!seriesId) return;
+    const previous = seriesStyleId;
+    setSeriesStyleId(styleId);
+    try {
+      await updateSeriesStyleProfile(seriesId, { style_profile: styleId });
+      showToast(`已切换风格预设：${styleProfiles.find((p) => p.id === styleId)?.label ?? styleId}`);
+    } catch (err) {
+      setSeriesStyleId(previous);
+      reportError('切换漫画风格预设失败', err);
     }
   };
 
@@ -1567,6 +1645,23 @@ export default function App() {
                 placeholder="WEBTOON 列表 URL 或本地目录（必填）"
                 className="w-full px-2.5 py-1.5 text-xs bg-white border border-slate-200 rounded font-mono-tabular"
               />
+              {/* Patch v4.44：漫画风格预设（没手动选时按 URL 自动推荐） */}
+              <select
+                value={newSeriesStyle}
+                onChange={(e) => {
+                  setNewSeriesStyle(e.target.value);
+                  setNewSeriesStyleTouched(true);
+                }}
+                title="漫画风格预设：决定切图策略、分幕密度、解说写法与运镜节奏"
+                className="w-full px-2.5 py-1.5 text-xs bg-white border border-slate-200 rounded"
+              >
+                {styleProfiles.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.label}
+                  </option>
+                ))}
+                {styleProfiles.length === 0 && <option value="drama_suspense">标准剧情</option>}
+              </select>
               <div className="flex justify-end gap-1.5">
                 <button
                   type="button"
@@ -1621,6 +1716,29 @@ export default function App() {
             )}
           </div>
         </div>
+
+        {/* Patch v4.44：当前作品的漫画风格预设切换 */}
+        {booted && activeSeries && (
+          <div className="px-3 pb-2">
+            <label className="block text-[11px] text-slate-500 mb-1" htmlFor="series-style-profile">
+              漫画风格预设
+            </label>
+            <select
+              id="series-style-profile"
+              value={seriesStyleId}
+              onChange={(e) => void handleChangeSeriesStyle(e.target.value)}
+              title="切换后需要重跑 Stage 2~4 才会按新风格出片"
+              className="w-full px-2 py-1 text-xs bg-white border border-slate-200 rounded"
+            >
+              {styleProfiles.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.label}
+                </option>
+              ))}
+              {styleProfiles.length === 0 && <option value={seriesStyleId}>{seriesStyleId}</option>}
+            </select>
+          </div>
+        )}
 
         {/* Navigation */}
         <nav className="p-3 space-y-1">

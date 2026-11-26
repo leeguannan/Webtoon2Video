@@ -763,3 +763,55 @@ export interface BgmLibraryResponse {
   moods: BgmMoodPreset[];
   tracks: BgmTrackItem[];
 }
+
+// ---------------------------------------------------------------------------
+// Patch v4.44：漫画风格预设（多风格引擎）
+// ---------------------------------------------------------------------------
+
+/** 一个风格预设的摘要（前端下拉用）。 */
+export interface StyleProfileSummary {
+  id: string;
+  label: string;
+  description: string;
+  recommended_for: string;
+}
+
+/** 风格预设的五个正交维度（数值全部由后端下发，前端只读）。 */
+export interface StyleProfileSpec {
+  id: string;
+  label: string;
+  description: string;
+  recommended_for: string;
+  segment: Record<string, unknown>;
+  montage: Record<string, unknown>;
+  narrative: Record<string, unknown>;
+  motion: Record<string, unknown>;
+  pacing: Record<string, unknown>;
+}
+
+/** GET /api/series/{id}/style-profile 的响应。 */
+export interface SeriesStyleProfileResponse {
+  /** 当前生效的预设 id。 */
+  style_profile: string;
+  /** 解析后的完整数值（预设 ← 作品覆盖 ← 临时覆盖三层合并）。 */
+  profile: StyleProfileSpec;
+  /** 作品级覆盖字典。 */
+  style_overrides: Record<string, unknown>;
+  /** 全部可选预设。 */
+  available: StyleProfileSummary[];
+}
+
+/** POST /api/episodes/{id}/scenes/{scene_id}/compress-montage 的响应。 */
+export interface CompressMontageResponse {
+  /** 该幕压缩后的 Beat（字典数组）。 */
+  beats: Record<string, unknown>[];
+  /** 压缩报告。 */
+  report: {
+    scene_id: string;
+    changed: boolean;
+    merged_count: number;
+    removed_beat_ids: string[];
+    runs: { beat_ids: string[]; panel_ids: string[]; text: string }[];
+    reason: string;
+  };
+}

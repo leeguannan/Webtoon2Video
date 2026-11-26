@@ -108,6 +108,10 @@ class PanelVisionInfo(BaseModel):
         "promo_banner",
         "sfx_only",
     ] = "none"
+    #: Patch v4.44：动作向分镜标记 —— 本格没有对白、且是连续肢体搏斗 / 闪避 /
+    #: 兵器碰撞等动作画面。动作风格据此把连续动作格合并成一条蒙太奇短句，
+    #: 避免逐格招式播报。旧 vision.json 没有该字段时按 ``False`` 处理。
+    is_action_beat: bool = False
 
 
 class VisionWindowOutput(BaseModel):

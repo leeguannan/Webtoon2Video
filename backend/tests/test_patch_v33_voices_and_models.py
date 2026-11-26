@@ -201,7 +201,8 @@ def test_stage4_call_sites_keep_thinking_disabled() -> None:
     source = (BACKEND_ROOT / "src" / "stages" / "s4_scriptwriter.py").read_text(
         encoding="utf-8"
     )
-    assert source.count("**_NO_THINKING_KWARGS,") == 4
+    # Patch v4.44：连招蒙太奇改写是第 5 处调用，同样必须关思考模式。
+    assert source.count("**_NO_THINKING_KWARGS,") >= 4
     # 四处 LLM 调用都必须包在降级兜底里。
     assert source.count("run_with_model_fallback(") >= 5  # 1 处定义 + 4 处调用
 

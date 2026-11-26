@@ -11,6 +11,9 @@
 【本幕指令（Patch v4.0 Patch 19）】
 {{SCENE_DIRECTIVES}}
 
+【本作品风格规范（Patch v4.44）】
+{{STYLE_GUIDANCE}}
+
 【已定稿的故事正文（唯一主干，严禁篡改）】
 {{CHAPTER_STORY}}
 

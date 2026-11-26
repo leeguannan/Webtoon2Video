@@ -46,6 +46,7 @@
       "focus_region": [0.1, 0.15, 0.85, 0.9],
       "is_transition_blank": false,
       "is_pure_text_card": false,
+      "is_action_beat": false,
       "non_story_type": "none"
     }
   ]
@@ -78,6 +79,7 @@
     就用上一格的说话人 + 上一格的动作延续来判断（这是允许的上下文利用），但**绝不能**
     把上一格的台词搬进本格。
 - `focus_region` 是画面中主要动作或主体的归一化坐标 `[x1, y1, x2, y2]`（0~1）；无法判断时给 `null`。
+- `is_action_beat`（Patch v4.44）：本格**没有任何对白气泡**，且画面是肢体搏斗 / 闪避 / 兵器碰撞 / 冲击这类**动作**时填 `true`；其余一律 `false`。
 - `is_transition_blank` 仅在该格为纯白/过渡空页时为 `true`。
 - `non_story_type` 只能是 `none` / `transition_blank` / `copyright_notice` / `promo_banner` / `sfx_only` 之一，普通剧情格一律填 `none`。
 - **片尾非剧情页判定（任何语言：中/英/韩/日都适用）**：若该格是「LINE WEBTOON / WEBTOON 官方版权声明、著作权或防盗版警告、休刊公告、求赞/订阅/关注推广尾页、平台引流横幅」，`non_story_type` 填 `copyright_notice`（版权/防盗版警告）或 `promo_banner`（休刊/求赞/推广），并**同步把 `is_transition_blank` 置为 `true`**；这类格子没有剧情内容，`scene_summary` 简述其用途即可。

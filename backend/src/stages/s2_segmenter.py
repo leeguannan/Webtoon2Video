@@ -34,6 +34,7 @@ import numpy as np
 
 from core.manifest import STAGE_DIR_NAMES
 from core.schemas import PanelMeta
+from core.style_profiles import StyleProfileSpec
 
 #: 铁律二：单块面板高度上限（送视觉模型前必须切到该高度以内）。
 MAX_PANEL_HEIGHT = 2400
@@ -123,6 +124,14 @@ WHITE_ROW_MEAN_MIN = 200.0
 UNIFORM_ROW_STD_MAX = 8.0
 #: 「单色均匀带」的相邻行平均绝对差上限（同样为 JPEG 噪点放宽）。
 UNIFORM_ROW_DIFF_MAX = 5.0
+#: Patch v4.44：暗色过渡带的行均值上限（动作风格专用）。
+DARK_GUTTER_ROW_MEAN_MAX = 28.0
+#: Patch v4.44：暗色过渡带的行标准差上限（比基线宽松，专吃黑底噪点）。
+DARK_GUTTER_ROW_STD_MAX = 12.0
+#: Patch v4.44：拟声字 / 特效碎片的高度上限（占画幅宽度的比例）。
+SFX_FRAGMENT_MAX_HEIGHT_RATIO = 0.45
+#: Patch v4.44：拟声碎片与相邻主动作画面之间的最大间距（占画幅宽度的比例）。
+SFX_FRAGMENT_MAX_GAP_RATIO = 0.30
 #: 单个原子块的高度上限；超过则触发兜底切分（安全阀）。
 #: Patch v3.0 Patch 6：4000 → 3200，彻底杜绝 45,871px 级别的巨型粘连块。
 MAX_ATOMIC_BLOCK_HEIGHT = 3200
@@ -582,6 +591,7 @@ def segment_episode(
     min_height: int = MIN_PANEL_HEIGHT,
     merge_slices: int = 1,
     blacklist_hashes: tuple[int, ...] | None = None,
+    style_profile: StyleProfileSpec | None = None,
 ) -> list[PanelMeta]:
     """把一话的原始切片切成分镜面板，落盘到 ``02_panels/``。
 
@@ -631,9 +641,27 @@ def segment_episode(
     canvas_width = int(canvas.shape[1])
 
     # 第 1 步：按真实纯白带切出原子块（含 16px 白边裁剪）。
-    blocks = cut_atomic_blocks(canvas, min_gap=min_gap_px(canvas_width))
+    # Patch v4.44：动作风格额外认「暗色低方差过渡带」（黑底漫画的画格分隔带）。
+    segment_spec = (
+        style_profile.segment if style_profile is not None else None
+    )
+    blocks = cut_atomic_blocks(
+        canvas,
+        min_gap=min_gap_px(canvas_width),
+        allow_dark_gutter=bool(
+            segment_spec is not None and segment_spec.allow_dark_gutter
+        ),
+        dark_row_mean_max=(
+            segment_spec.dark_row_mean_max
+            if segment_spec is not None
+            else DARK_GUTTER_ROW_MEAN_MAX
+        ),
+    )
     # 第 2 步：孤立独白框 / 悬浮小气泡向下吸附合并。
     blocks = merge_standalone_text_boxes(blocks, canvas, img_width=canvas_width)
+    # Patch v4.44：动作风格把孤立拟声字 / 特效碎片并入紧邻的主动作画面。
+    if segment_spec is not None and segment_spec.merge_sfx_fragments:
+        blocks = merge_sfx_fragment_blocks(blocks, img_width=canvas_width)
 
     def slice_numbers(top: int, bottom: int) -> tuple[int, int]:
         """面板覆盖的原始切片区间（1 起）。"""
@@ -986,6 +1014,48 @@ def find_separator_gaps(gray: np.ndarray, *, min_gap: int) -> list[tuple[int, in
     return gaps
 
 
+def find_dark_gutter_gaps(
+    gray: np.ndarray,
+    *,
+    min_gap: int,
+    dark_row_mean_max: float = DARK_GUTTER_ROW_MEAN_MAX,
+) -> list[tuple[int, int]]:
+    """找出**暗色低方差的连续过渡带**（Patch v4.44 动作风格）。
+
+    黑底漫画（热血动作漫）的画格之间没有白留白，而是靠一整条深黑 / 深灰的
+    过渡带分隔。基线判据（``row_std < 8.0 且 row_diff < 5.0``）对这种过渡带
+    太苛刻：黑底上残留一点压缩噪点，行间差就超阈值，整条带认不出来，
+    于是几十个画格被粘成一块巨图。
+
+    本函数的判据更贴合「暗色过渡带」：
+
+    * 行均值 <= ``dark_row_mean_max``（够暗）；
+    * 行标准差 < :data:`DARK_GUTTER_ROW_STD_MAX`（够平）。
+
+    返回的带子**还要经过调用方的 :func:`_has_local_structure` 保护**，
+    深黑底 + 高亮对白框的高潮格绝不能被当成过渡带切开。
+    """
+    if gray is None or gray.size == 0 or gray.ndim != 2:
+        return []
+    rows = gray.astype(np.float32)
+    row_mean = rows.mean(axis=1)
+    row_std = rows.std(axis=1)
+    mask = (row_mean <= float(dark_row_mean_max)) & (
+        row_std < DARK_GUTTER_ROW_STD_MAX
+    )
+    if not bool(mask.any()):
+        return []
+    padded = np.concatenate(([False], mask, [False])).astype(np.int8)
+    changes = np.diff(padded)
+    starts = np.nonzero(changes == 1)[0]
+    ends = np.nonzero(changes == -1)[0]
+    return [
+        (int(start), int(end))
+        for start, end in zip(starts, ends)
+        if int(end) - int(start) >= int(min_gap)
+    ]
+
+
 def find_uniform_gaps(gray: np.ndarray, *, min_gap: int) -> list[tuple[int, int]]:
     """找出所有长度 ``>= min_gap`` 的**单色均匀带**（白 / 黑 / 灰都算）。
 
@@ -1120,11 +1190,17 @@ def cut_atomic_blocks(
     min_gap: int | None = None,
     margin: int = PANEL_WHITE_MARGIN_PX,
     max_height: int = MAX_ATOMIC_BLOCK_HEIGHT,
+    allow_dark_gutter: bool = False,
+    dark_row_mean_max: float = DARK_GUTTER_ROW_MEAN_MAX,
 ) -> list[tuple[int, int]]:
     """在长卷上按**单色均匀带**切出原子块，并裁掉多余边距。
 
     * 切点取「两块内容之间」的单色带中点（白留白、黑底过渡带、灰底过渡带都算）；
       长卷首尾的纯色边距不算分隔带——那是边距，交给裁边处理；
+    * **Patch v4.44**：``allow_dark_gutter=True`` 时额外探测「暗色低方差连续
+      过渡带」（黑底漫画的画格分隔带），并对每条带子做
+      :func:`_has_local_structure` 保护——深黑底 + 高亮对白框的高潮格绝不能
+      被当成过渡带切开；
     * 每块首尾的纯色边距被裁掉（每侧保留 ``margin`` 像素）；
     * 单块仍超过 ``max_height`` 时由 :func:`_split_oversized` 兜底切分。
 
@@ -1137,6 +1213,19 @@ def cut_atomic_blocks(
     cuts = [
         (start + end) // 2 for start, end in find_separator_gaps(gray, min_gap=gap)
     ]
+    if allow_dark_gutter:
+        # Patch v4.44：动作风格额外认「暗色低方差过渡带」。
+        for start, end in find_dark_gutter_gaps(
+            gray, min_gap=gap, dark_row_mean_max=dark_row_mean_max
+        ):
+            band = gray[start:end]
+            if band.size == 0:
+                continue
+            # 高亮框保护：带子里有清晰局部结构（亮框 / 人脸轮廓）→ 不切。
+            if _has_local_structure(band):
+                continue
+            cuts.append((start + end) // 2)
+    cuts = sorted(set(cuts))
     bounds = [0, *cuts, height]
     blocks: list[tuple[int, int]] = []
     for index in range(len(bounds) - 1):
@@ -1440,3 +1529,78 @@ def merge_standalone_text_boxes(
             continue
         trimmed.append((top + local_top, top + local_bottom))
     return trimmed
+
+
+def merge_sfx_fragment_blocks(
+    blocks: list[tuple[int, int]],
+    *,
+    img_width: int,
+    fragment_height_ratio: float = SFX_FRAGMENT_MAX_HEIGHT_RATIO,
+    gap_ratio: float = SFX_FRAGMENT_MAX_GAP_RATIO,
+    max_height_ratio: float = TEXT_BOX_MERGE_MAX_HEIGHT_RATIO,
+) -> list[tuple[int, int]]:
+    """把孤立拟声字 / 特效碎片并入紧邻的主动作画面（Patch v4.44 动作风格）。
+
+    动作漫画里拟声字（「轰」「铛」）与拳风特效往往独立成一小块落在画格之间，
+    基线会把它们当独立分镜送去识图，既浪费 VLM 额度，成片里也会多出一张
+    只有两个字的废镜头。
+
+    判据（三条同时成立才合并）：
+
+    1. 碎片高度 < ``fragment_height_ratio * img_width``（默认 0.45）；
+    2. 与相邻主动作画面的间距 < ``gap_ratio * img_width``（默认 0.30）；
+    3. 合并后高度 <= ``min(MAX_ATOMIC_BLOCK_HEIGHT, max_height_ratio * img_width)``。
+
+    合并方向：优先并入**上方**已合并的块（那通常是主动作画面）；若首块就是
+    碎片，则并入紧随其后的动作画面。合并后保留中间间距（与
+    :func:`merge_standalone_text_boxes` 的口径一致）。
+    """
+    if len(blocks) < 2:
+        return list(blocks)
+    width = max(1, int(img_width))
+    fragment_max_height = width * float(fragment_height_ratio)
+    gap_limit = width * float(gap_ratio)
+    max_merged_height = min(MAX_ATOMIC_BLOCK_HEIGHT, int(width * float(max_height_ratio)))
+
+    pending = list(blocks)
+    merged: list[tuple[int, int]] = []
+    total = len(pending)
+
+    def _is_fragment(block: tuple[int, int]) -> bool:
+        return (block[1] - block[0]) < fragment_max_height
+
+    index = 0
+    while index < total:
+        if not _is_fragment(pending[index]):
+            merged.append(pending[index])
+            index += 1
+            continue
+        # 收集连续碎片段 [index, end)
+        end = index
+        while end < total and _is_fragment(pending[end]):
+            end += 1
+        run_top = pending[index][0]
+        run_bottom = pending[end - 1][1]
+        # 上方主动作画面 / 下方主动作画面，谁更近就并谁（上方优先）。
+        target: tuple[int, tuple[int, int]] | None = None
+        if merged:
+            prev = merged[-1]
+            gap_up = run_top - prev[1]
+            if 0 <= gap_up < gap_limit:
+                target = (0, (prev[0], run_bottom))
+        if target is None and end < total:
+            nxt = pending[end]
+            gap_down = nxt[0] - run_bottom
+            if 0 <= gap_down < gap_limit:
+                target = (1, (run_top, nxt[1]))
+        if target is not None and (target[1][1] - target[1][0]) <= max_merged_height:
+            if target[0] == 0:
+                merged[-1] = target[1]
+                index = end
+                continue
+            merged.append(target[1])
+            index = end + 1
+            continue
+        merged.extend(pending[index:end])
+        index = end
+    return merged

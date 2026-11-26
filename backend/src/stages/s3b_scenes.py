@@ -31,6 +31,7 @@ from core.schemas import (
     VisionWindowOutput,
     save_model,
 )
+from core.style_profiles import StyleProfileSpec
 from providers.image_utils import encode_pil_data_url, load_image
 from providers.llm_base import ChatMessage, ContentPart, LLMClient, parse_json_response
 from stages import s3_vision
@@ -317,6 +318,8 @@ def _build_scene(
 def _rebalance_scenes(
     scene_panel_ids: list[list[str]],
     panels: dict[str, PanelVisionInfo],
+    *,
+    max_scene_panels: int = MAX_SCENE_PANELS,
 ) -> list[list[str]]:
     """把幕数拉进目标区间（5~10）。
 
@@ -351,7 +354,7 @@ def _rebalance_scenes(
                 if neighbour < 0 or neighbour >= len(scenes):
                     continue
                 combined = scenes[min(index, neighbour)] + scenes[max(index, neighbour)]
-                if len(combined) > MAX_SCENE_PANELS:
+                if len(combined) > max_scene_panels:
                     continue
                 low, high = sorted((index, neighbour))
                 scenes[low : high + 1] = [combined]
@@ -367,6 +370,8 @@ def _rebalance_scenes(
 def auto_build_storyboard(
     episode_id: str,
     vision: VisionWindowOutput,
+    *,
+    style_profile: StyleProfileSpec | None = None,
 ) -> EpisodeStoryboard:
     """把整话分镜自动聚类成连续镜头组（幕）。
 
@@ -383,6 +388,13 @@ def auto_build_storyboard(
     """
     all_panels = sorted(vision.panels, key=lambda item: panel_sort_key(item.panel_id))
     panels = {panel.panel_id: panel for panel in all_panels}
+
+    #: Patch v4.44：单幕格数上限（风格可调；基线 = 12，与 4.43 等价）。
+    max_scene_panels = (
+        int(style_profile.montage.max_scene_panels)
+        if style_profile is not None
+        else MAX_SCENE_PANELS
+    )
 
     # Patch v4.20：整话都被判成纯文字卡属于异常素材（正常漫画至少有几格剧情），
     # 这时退回未过滤口径，避免切出空编排。
@@ -425,7 +437,7 @@ def auto_build_storyboard(
         if location and not current_location:
             current_location = location
 
-        if len(current) >= MAX_SCENE_PANELS:
+        if len(current) >= max_scene_panels:
             point = _split_at_dialogue_end(current[:-1], panels)
             if point <= 0 or point >= len(current):
                 point = len(current)
@@ -457,14 +469,16 @@ def auto_build_storyboard(
             if (
                 not keep_tail
                 and scene_panel_ids
-                and len(scene_panel_ids[-1]) + len(current) <= MAX_SCENE_PANELS
+                and len(scene_panel_ids[-1]) + len(current) <= max_scene_panels
             ):
                 scene_panel_ids[-1].extend(current)
                 current = []
         if current:
             scene_panel_ids.append(current)
 
-    scene_panel_ids = _rebalance_scenes(scene_panel_ids, panels)
+    scene_panel_ids = _rebalance_scenes(
+        scene_panel_ids, panels, max_scene_panels=max_scene_panels
+    )
 
     scenes = [
         _build_scene(index, panel_ids, panels)
@@ -641,6 +655,7 @@ async def semantic_build_storyboard(
     vision: VisionWindowOutput,
     model: str = "",
     template: str | None = None,
+    style_profile: StyleProfileSpec | None = None,
 ) -> EpisodeStoryboard:
     """用 LLM 通看整话分镜摘要做**语义切幕**（Patch v4.19）。
 
@@ -658,7 +673,7 @@ async def semantic_build_storyboard(
     """
 
     def _fallback() -> EpisodeStoryboard:
-        return auto_build_storyboard(episode_id, vision)
+        return auto_build_storyboard(episode_id, vision, style_profile=style_profile)
 
     if client is None or not model:
         return _fallback()
@@ -1095,6 +1110,7 @@ def load_or_build_storyboard(
     storyboard_path: str | Path | None,
     *,
     reset: bool = False,
+    style_profile: StyleProfileSpec | None = None,
 ) -> EpisodeStoryboard:
     """加载或构建镜头编排清单。
 
@@ -1119,7 +1135,9 @@ def load_or_build_storyboard(
             # Patch v4.20：既有编排里的纯文字卡剔掉（分镜页与成片口径一致）。
             return strip_text_cards_from_storyboard(existing, vision)
 
-    storyboard = auto_build_storyboard(episode_id, vision)
+    storyboard = auto_build_storyboard(
+        episode_id, vision, style_profile=style_profile
+    )
     if path is not None:
         save_storyboard(storyboard, path)
     return storyboard
@@ -1134,6 +1152,7 @@ async def resolve_or_build_storyboard(
     model: str = "",
     reset: bool = False,
     template: str | None = None,
+    style_profile: StyleProfileSpec | None = None,
 ) -> EpisodeStoryboard:
     """加载或**语义构建**镜头编排清单（Patch v4.19）。
 
@@ -1171,6 +1190,7 @@ async def resolve_or_build_storyboard(
                     vision=vision,
                     model=model,
                     template=template,
+                    style_profile=style_profile,
                 )
                 if path is not None:
                     save_storyboard(upgraded, path)
@@ -1184,6 +1204,7 @@ async def resolve_or_build_storyboard(
         vision=vision,
         model=model,
         template=template,
+        style_profile=style_profile,
     )
     if path is not None:
         save_storyboard(storyboard, path)
